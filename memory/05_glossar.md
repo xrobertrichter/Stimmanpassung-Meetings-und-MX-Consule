@@ -1,0 +1,22 @@
+# Glossar
+
+- **dBFS**: Dezibel relativ zur Vollaussteuerung (0 dBFS = maximaler digitaler Pegel).
+- **dBTP**: True-Peak-Pegel; berücksichtigt Zwischenabtastwerte durch Oversampling.
+- **LUFS / LU**: Loudness Units relativ Full Scale (absolut) bzw. Loudness Units (relativ), nach ITU-R BS.1770.
+- **K-Bewertung**: Frequenzgewichtung aus BS.1770 (Hochpass + Höhenshelf), nähert Gehörempfinden an.
+- **High-Pass (HPF)**: Filter, das tiefe Frequenzen unterhalb der Grenzfrequenz dämpft.
+- **Downward Expander**: Dynamikprozessor, senkt Signale unterhalb einer Schwelle weiter ab (sanftes Gate).
+- **De-Esser**: frequenzselektiver Kompressor für Zischlaute (5–10 kHz).
+- **EQ (Equalizer)**: Frequenzgangkorrektur mit Shelf- und Glockenfiltern (Biquads).
+- **Compressor**: senkt Pegel über der Schwelle mit Verhältnis (Ratio) ab; Attack/Release = Reaktionszeiten.
+- **Knee**: weicher Übergang um die Schwelle (Soft Knee) in dB.
+- **Makeup Gain**: Ausgleichsverstärkung nach der Kompression.
+- **Normalizer (AGC)**: langsame automatische Verstärkungsregelung auf Ziel-Lautheit.
+- **Limiter**: Begrenzer mit Lookahead, verhindert Überschreiten eines Ceilings.
+- **Lookahead**: Verzögerung, damit der Limiter Spitzen vor ihrem Eintreffen absenken kann.
+- **BlackHole**: virtueller macOS-Audiotreiber (Loopback), leitet Audio zwischen Programmen weiter.
+- **Aggregate Device**: in Audio-MIDI-Setup zusammengefasstes Gerät aus mehreren Audiogeräten.
+- **Rauschteppich (Noise Floor)**: Pegel des Grundrauschens in Sprechpausen.
+- **Zischanteil (Sibilance Ratio)**: Energie im Zischband relativ zum Sprachkernband.
+- **Hysterese**: Totzone, die Hin-und-Her-Regeln bei kleinen Schwankungen verhindert.
+- **Lazy Coding**: Platzhalter, Stubs, stumme Fehler, Tests ohne Aussage, unbegründete Konstanten.
