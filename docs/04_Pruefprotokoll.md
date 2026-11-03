@@ -118,5 +118,38 @@ Berichte: `docs/pruefungen/04_product_owner_runde2.md`, `05_software_runde2.md`,
 | PO-22 / PO-10 Rest / BL-6 / BL-8 / BL-9 | niedrig | Doku-Reste (docs/01:270 Treiber-Dialog, SIGUSR1 in docs/03, „bestanden" vs. „ja", −6/−3 dBFS, Ratio-Bereich, Python-Beschaffung im README, interne Prüfnummern in Code-Kommentaren) | Bereinigen; Prüfnummern in Kommentaren durch fachliche Begründung ersetzen | INT, KAL, DSP |
 | §6.3/§6.4 | — | PO-Klarstellungen (20 LU Mindestwert, Raumänderung im Betrieb) | Beauftragung ergänzt | PL (erledigt) |
 
+## Nacharbeit Runde 3 und PO-Abschlussprüfung (Runde 3, 2026-11-03)
+
+Nacharbeit Runde 3 (Commits adc6d5d INT, 20baefc KAL, d277ce7 DSP): alle Befunde der Tabelle oben
+bearbeitet; Gesamtsuite 325 Tests grün, Selftest 12/12.
+
+PO-Abschlussprüfung Runde 3 (`docs/pruefungen/07_product_owner_runde3.md`): **nicht abnehmbar**
+auf Stand d277ce7. PO-16 bis PO-19, PO-21, PO-22 behoben; PO-15 nur für +8 dB Raumänderung,
+bei +12 dB lief der Normalizer-Gain in Pausen erneut hoch (PO-23, hoch: Klemmung des
+Teppich-Schätzers auf Sprachreferenz − 15 LU). Weitere Befunde: PO-24 (mittel, Expander-Kappe
+entfällt bei leisem Sprecher), PO-25 (mittel, Zischkriterium ohne Hysterese), PO-26 bis PO-28
+(niedrig). Rate-Empfehlung: Aufwärtsrate 1 dB/s beibehalten (Systemmessung: Rate ist nicht der
+begrenzende Faktor).
+
+Entscheidung Projektleitung: §6.4 zweistufig präzisiert (bis +8 dB voller Abstand ≥ 15 LU; darüber
+Einfrieren des Gains, Einsatz ≤ +1,5 dB, Abstandsverlust ≤ 5 LU, Ereignis „Störabstand zu
+gering“), da der Expander Pausen bei Störabstand unter ca. 16 dB nicht weiter absenken kann, ohne
+Sprache abzuschneiden.
+
+## Nacharbeit Runde 4 (Commits 2c5cc6b KAL, 6fc21ab DSP)
+
+| Nr | Änderung | Nachweis |
+|----|----------|----------|
+| PO-23 | Teppich-Schätzer ohne Klemmung (Plateau-Statistik, 0,5-s-Fenster ≤ 3 LU Spanne, Minimum über 10 s); Zustand `low_snr` (Eintritt 15 LU, Austritt 17 LU): Gain eingefroren, keine Referenz gelernt | Systemtreuer Test rosa/weiß, +8/+12 dB: Gain-Anstieg in Pause 0,00–0,16 dB, Einsatz +0,18…+0,52 dB; +8 dB rosa 20,9 LU Abstand; weiß +12 dB Abstand 2,2 LU (Eingang 6,7), keine Pause auf Sprachlautheit |
+| PO-24 | Kappe „Expander ≤ Sprache − 12“ bleibt ab Dynamik 10 dB | leiser Sprecher −28 dBFS im −46-Raum: Expander −38,0 |
+| PO-25 | Zischkriterium mit Hysterese und Grenzstimmen-Zweig | Grenzstimme −12,4 dB besteht; zischende Stimme +0,5 dB fällt durch |
+| PO-26 | LiveAnalyzer-Teppich aus inaktiven Rahmen (5. Perzentil) | dichter Vortrag 10 % Pausen: Teppich ± 1,5 dB, 0 Expander-Schritte in 300 s |
+| §6.4 b / PO-27 | Ereignis `low_snr` mit Hinweistext, höchstens alle 30 s; docs/02 §7 systemtreu, docs/03 §8/§11 ehrlich (synthetische Nachweise, Hördurchlauf nötig) | Test: Ereignisse bei 30/60/90 s |
+| PO-28 | Synthese mit Obertönen bis 8 kHz | High-Shelf-Band liest −28,7 dB (Referenz −29,6) |
+| SW-17 Nachtrag | Referenz klingt nur in steigenden/stetigen Intervallen ab | Sprecher 20 dB leiser: Ziel ± 2,5 LU in < 40 s |
+
+Stand nach Runde 4: 336 Tests grün, 1 übersprungen (Rechte-Test unter root), Selftest 12/12,
+0,43 ms je 256er-Block.
+
 ## Abschlussreview
-_wird nach Abschluss ergänzt_
+_wird nach der PO-Schlussverifikation ergänzt_
