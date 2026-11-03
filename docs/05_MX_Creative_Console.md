@@ -97,7 +97,10 @@ die Kette `ok: false` „am Anschlag" mit dem wirksamen Wert.
 - Grenzen: Jeder Offset ist geklemmt (Tabellen oben). Am Anschlag antwortet die Kette mit
   „abgelehnt" bzw. dem unveränderten Wert, die Mitteilung sagt das.
 - Die Sprach-Kappe des Expanders (Schwelle höchstens Sprachpegel − 12 dB) gilt auch mit Offset:
-  „Weniger Raum" kann nie in die leisen Silben schneiden.
+  „Weniger Raum" kann nie in die leisen Silben schneiden. Einschränkung: Die Kappe setzt die
+  Regelung durch. Ohne Regelung (`run --no-adaptive`) und während der Lernphase (die ersten 30 s
+  nach Start oder „Neu lernen") gelten für den Offset zunächst nur die harten Bounds; die Regelung
+  holt eine zu hohe Schwelle ab ihrer ersten Entscheidung auf Sprachpegel − 12 dB zurück.
 
 ## 5. Reset, Neu lernen und Snapshot
 
@@ -126,9 +129,9 @@ die Kette `ok: false` „am Anschlag" mit dem wirksamen Wert.
   `/Users/<name>/Documents/…` überschreitet das leicht; `/tmp` ist kurz, pro Nutzer benannt,
   mit Rechten 0600 geschützt und unabhängig davon, wo das Repository liegt. `run` und `ctl`
   prüfen die Länge **vor** dem Binden/Verbinden und nennen die Abhilfe (kurzer absoluter Pfad wie
-  `~/.voicechain/ctl.sock`). Hinweis: Die mitgelieferte `config/chain.default.yaml` setzt derzeit
-  `control.socket_path: logs/control.sock`; `ctl` liest denselben Schlüssel, deshalb passen beide
-  zusammen – für lange Repository-Pfade den Eintrag entfernen oder kürzen.
+  `~/.voicechain/ctl.sock`). In der mitgelieferten `config/chain.default.yaml` ist der Eintrag
+  `control.socket_path` nur auskommentiert, es gilt also der Standard `/tmp/voicechain-<user>.sock`;
+  `run` und `ctl` lesen denselben Schlüssel, ein gesetzter Wert gilt daher für beide.
 - Lebenszyklus: Beim Start wird eine vorhandene Socket-Datei **geprüft**: antwortet dort ein
   Server, verweigert `run` den Start („voicechain run läuft bereits"); antwortet niemand (Datei
   eines abgestürzten Laufs), wird sie ersetzt. Beim Beenden (Ctrl-C **oder SIGTERM**, z. B.

@@ -103,10 +103,10 @@ in dieser Reihenfolge:
    Ohne `osascript` (oder ohne Recht) läuft die Aktion trotzdem; die Antwort steht dann nur in der
    Konsole des aufrufenden Programms.
 5. **Socket-Pfad:** Standard `/tmp/voicechain-<user>.sock` (kurz, unabhängig vom Repository-Pfad;
-   Unix-Sockets erlauben auf macOS nur 103 Byte). Setzt die verwendete YAML `control.socket_path`
-   auf etwas anderes (die mitgelieferte `config/chain.default.yaml` tut das), den Skripten
-   `--config DATEI` oder `--socket PFAD` mitgeben (Options+ erlaubt Argumente im Run-Feld); `run`
-   nennt den Pfad beim Start („Control socket: …“).
+   Unix-Sockets erlauben auf macOS nur 103 Byte). In `config/chain.default.yaml` ist
+   `control.socket_path` nur auskommentiert, der Standard gilt. Setzt die verwendete YAML den
+   Schlüssel auf etwas anderes, den Skripten `--config DATEI` oder `--socket PFAD` mitgeben
+   (Options+ erlaubt Argumente im Run-Feld); `run` nennt den Pfad beim Start („Control socket: …“).
 
 ## `--value`
 
