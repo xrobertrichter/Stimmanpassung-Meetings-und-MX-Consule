@@ -217,8 +217,9 @@ class AdaptiveController:
       nicht weiter absenken, ohne Sprache abzuschneiden (Kappe Sprachpegel − 12 dB). Dann gilt:
       der Normalizer-Gain steigt in Pausen um höchstens 1 dB, der nächste Satz setzt höchstens
       +1,5 dB lauter ein, der Abstand Sprache–Pause verringert sich gegenüber dem Eingang um
-      höchstens 5 LU (Kompressor hebt leise Anteile; gemessen −0,3 bis −4,5 LU, nur bei weißem
-      Rauschen und +12 dB nennenswert), und die Regelung protokolliert ein Ereignis
+      höchstens 7 LU vor und 5 LU nach der Nachführung der Expander-Schwelle (ca. 1,5 min;
+      Ursache: der auf den Sprecher kalibrierte Kompressor hebt leise Anteile; gemessen
+      −4,5 bis −6,9 LU bei +12 dB, rosa wie weiß), und die Regelung protokolliert ein Ereignis
       „Störabstand zu gering“ mit dem
       Hinweis, den Raum zu verbessern oder neu zu kalibrieren. Der Zustand ist in der Statuszeile
       sichtbar. Eine Pause auf Sprachlautheit (Fehlerbild PO-1) darf in keinem Fall entstehen.
