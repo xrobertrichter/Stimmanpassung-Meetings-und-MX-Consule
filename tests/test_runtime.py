@@ -808,3 +808,29 @@ def test_db_floor_matches_stage_meters():
 
     engine = LiveEngine(base_cfg(), RecordingChain([]))
     assert "in {:6.1f} dBFS".format(DB_FLOOR_DBFS) in engine.status_line()
+
+
+@pytest.mark.parametrize(
+    "normalizer_meters, expected, forbidden",
+    [
+        ({"gain_db": 1.0, "low_snr": 1.0, "snr_lu": 12.5}, "SNR LOW (12.5 LU)", (" | snr ",)),
+        ({"gain_db": 1.0, "low_snr": 0.0, "snr_lu": 24.0}, " | snr 24.0 LU", ("SNR LOW",)),
+        ({"gain_db": 1.0, "low_snr": 1}, "SNR LOW (n/a)", (" | snr ",)),
+        ({"gain_db": 1.0}, "", ("SNR LOW", " | snr ")),  # chain without the SNR meters: no marker at all
+    ],
+)
+def test_status_line_shows_normalizer_snr_state(fake_sd, normalizer_meters, expected, forbidden):
+    chain = RecordingChain([])
+    base = chain.get_meters
+
+    def meters_with_snr():
+        meters = base()
+        meters["normalizer"] = dict(normalizer_meters)
+        return meters
+
+    chain.get_meters = meters_with_snr
+    line = LiveEngine(base_cfg(), chain).status_line()
+    if expected:
+        assert expected in line
+    for text in forbidden:
+        assert text not in line  # case-sensitive: "SNR LOW" and "snr" are different states

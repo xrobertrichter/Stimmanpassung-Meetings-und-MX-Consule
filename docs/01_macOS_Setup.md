@@ -249,7 +249,11 @@ Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
 3. `python -m voicechain run --config config/chain.calibrated.yaml` starten. In der Statuszeile
    muss beim Sprechen `in` sichtbar ausschlagen (typisch −30 … −15 dBFS) und `out` um −20 … −6
    dBFS liegen; `xruns` und `nonfinite` bleiben 0, `adaptive on` (bzw. `FROZEN`, wenn
-   eingefroren).
+   eingefroren). Der Störabstand des Normalizers steht als `snr 24.0 LU` in der Zeile; der
+   Marker **`SNR LOW (12.5 LU)`** bedeutet: Störabstand zwischen Sprache und Pausen zu gering.
+   Die Kette schützt dann vor dem Hochziehen der Pausen (die Sprache wird nicht weiter
+   angehoben), die Pausen bleiben aber hörbarer. Maßnahme: Raum verbessern (Lüfter aus, näher
+   ans Mikrofon, Popschutz) oder mit einem neuen Sample neu kalibrieren.
    Freeze im laufenden Betrieb umschalten (zweites Terminal): `kill -USR1 $(pgrep -f "voicechain run")`.
    Hinweis zum Nachmessen: Das Ziel −18 LUFS gilt für die **Mono**-Messung; voicechain legt das
    Mono-Signal identisch auf beide BlackHole-Kanäle (Dual-Mono). Ein Stereo-Lautheitsmesser in

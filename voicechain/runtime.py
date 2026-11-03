@@ -509,6 +509,19 @@ class LiveEngine:
                 "{:6.1f}".format(float(floor_lufs)) if floor_lufs is not None else "  -- ",
                 "{:6.1f}".format(float(gate_lufs)) if gate_lufs is not None else "  -- ",
             )
+        # Normalizer SNR state: ``low_snr`` (0/1) means the speech-to-pause distance
+        # is too small for the normalizer to lift speech without lifting the pauses;
+        # shown as a loud marker so the user notices. Missing keys: no marker.
+        snr_lu = normalizer_meters.get("snr_lu")
+        low_snr = normalizer_meters.get("low_snr")
+        snr_text = ""
+        if snr_lu is not None or low_snr is not None:
+            snr_value = "{:.1f} LU".format(float(snr_lu)) if snr_lu is not None else "n/a"
+            if low_snr is not None and float(low_snr) >= 1.0:
+                snr_text = " | SNR LOW ({})".format(snr_value)
+            else:
+                snr_text = " | snr {}".format(snr_value)
+        gate_text += snr_text
         if self.controller is None:
             mode = "off"
         elif self.frozen:

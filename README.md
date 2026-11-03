@@ -115,7 +115,12 @@ Python-Pakete (siehe `requirements.txt`): numpy, scipy, soundfile, sounddevice, 
    (oder `scripts/run_live.sh --config config/chain.calibrated.yaml`). Beim ersten Start fragt
    macOS nach der Mikrofonberechtigung für das Terminal – erlauben. Jede Sekunde erscheint eine
    Statuszeile mit Pegeln, Gain-Reduction je Stufe, Xruns, Zähler nicht-finiter Eingangsblöcke,
-   Zustand der adaptiven Regelung (`on`/`FROZEN`/`off`) und der letzten adaptiven Änderung.
+   Zustand der adaptiven Regelung (`on`/`FROZEN`/`off`), dem Störabstand des Normalizers
+   (`snr 24.0 LU`) und der letzten adaptiven Änderung. Erscheint stattdessen der Marker
+   **`SNR LOW (12.5 LU)`**, ist der Abstand zwischen Sprache und Sprechpausen zu gering: Der
+   Normalizer hebt die Sprache dann bewusst nicht weiter an (sonst würden die Pausen mit
+   hochgezogen), die Pausen bleiben aber hörbarer als gewünscht. Abhilfe: Raum leiser machen
+   (Lüfter, Fenster, Abstand zum Mikrofon verringern) oder mit einem neuen Sample kalibrieren.
    Die Regelung lässt sich im laufenden Betrieb einfrieren und wieder freigeben (z. B. vor
    einer Präsentation), aus einem zweiten Terminal:
    ```bash
