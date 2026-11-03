@@ -154,7 +154,10 @@ def test_offset_steps_move_one_step_and_stop_with_ok_false_at_the_range_end(name
     assert lc.offsets[name] >= lo - 1e-9
     assert lc.handle({"cmd": "set_offset", "name": name, "value": 0})["ok"]
     assert lc.offsets[name] == 0.0
-    assert lc.handle({"cmd": "set_offset", "name": name, "value": 0})["ok"] is False   # no change = stop
+    # set_offset to the value already in effect is not a stop but "unverändert".
+    r = lc.handle({"cmd": "set_offset", "name": name, "value": 0})
+    assert r["ok"] is True and "unverändert" in r["message"]
+    assert lc.handle({"cmd": "offset", "name": name, "delta": 0})["ok"] is False      # a zero step is a stop
 
 
 def test_loudness_offset_moves_the_target_within_minus24_minus14():
@@ -177,6 +180,57 @@ def test_loudness_offset_moves_the_target_within_minus24_minus14():
     r = lc3.handle({"cmd": "set_offset", "name": "loudness_lu", "value": -6.0})
     assert r["ok"] and lc3.chain.get_param("normalizer", "target_lufs") == LOUDNESS_TARGET_BOUNDS_LUFS[0]
     assert lc3.offsets["loudness_lu"] == pytest.approx(-4.0)
+
+
+def test_set_offset_to_the_active_value_answers_unveraendert():
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    r = lc.handle({"cmd": "set_offset", "name": "loudness_lu", "value": 0})     # dial press at 0 LU
+    assert r["ok"] is True and r["message"] == "Lautheit unverändert (Lautheit +0 LU, Ziel -18 LUFS)"
+    assert chain.history == []
+    lc.handle({"cmd": "offset", "name": "loudness_lu", "delta": 0.5})
+    r = lc.handle({"cmd": "set_offset", "name": "loudness_lu", "value": 0.5})
+    assert r["ok"] and "unverändert" in r["message"] and "-17,5 LUFS" in r["message"]
+    r = lc.handle({"cmd": "set_offset", "name": "loudness_lu", "value": 0})
+    assert r["ok"] and "unverändert" not in r["message"] and r["state"]["target_lufs"] == -18.0
+    for name in ("room_db", "deess_db", "intensity", "tone_db"):
+        r = lc.handle({"cmd": "set_offset", "name": name, "value": 0})
+        assert r["ok"] is True and "unverändert" in r["message"], name
+
+
+def test_speech_cap_has_a_half_db_deadzone_and_shrinks_the_stored_room_offset():
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    chain.set_param("expander", "threshold_db", -37.0)
+    finish_learning(ctrl, floor=-45.0, speech=-25.0)                    # floor rule -35, cap -37 binds
+    # Threshold on the cap, speech level jittering +-0.1 dB: no steps, no log noise.
+    chain.history.clear()
+    for k in range(20):
+        speech = -25.0 + (0.1 if k % 2 else -0.1)
+        changes = ctrl.update(meters_dict(floor=-45.0, speech=speech), now=LEARN_S + 2.0 + k * INTERVAL_S)
+        assert [c for c in changes if c["stage"] == "expander"] == []     # compressor may track the -25 dB speech
+    assert [h for h in chain.history if h[0] == "expander"] == []
+    # 0.6 dB above the cap: one pull of at least the minimum step, then quiet again.
+    chain.set_param("expander", "threshold_db", -36.4)
+    changes = ctrl.update(meters_dict(floor=-45.0, speech=-25.0), now=LEARN_S + 50.0)
+    assert [c["reason"] for c in changes] == ["speech_cap"]
+    assert -36.4 - changes[0]["new"] >= adaptive.SPEECH_CAP_MIN_STEP_DB - 1e-9
+    assert changes[0]["new"] == pytest.approx(-36.4 - STEP_DB)             # one max_step pull: -36.9
+    # Now inside the cap dead zone (-36.9 <= -37 + 0.5): quiet again.
+    changes = ctrl.update(meters_dict(floor=-45.0, speech=-25.0), now=LEARN_S + 52.0)
+    assert [c for c in changes if c["stage"] == "expander"] == []
+    # Offset +4 while the cap sits at -37: steps are taken back to the cap and the stored
+    # room offset follows the effective value (no drift 3,03 vs 2,8).
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    chain.set_param("expander", "threshold_db", -40.0)
+    finish_learning(ctrl, floor=-50.0, speech=-20.0)                    # cap -32: +4 fits -> -36
+    assert lc.handle({"cmd": "set_offset", "name": "room_db", "value": 4.0})["ok"]
+    assert chain.get_param("expander", "threshold_db") == pytest.approx(-36.0)
+    for k in range(10):                                                 # speaker gets 5 dB quieter: cap -37
+        ctrl.update(meters_dict(floor=-50.0, speech=-25.0), now=LEARN_S + 2.0 + k * INTERVAL_S)
+    thr = chain.get_param("expander", "threshold_db")
+    assert thr <= -37.0 + adaptive.SPEECH_CAP_DEADZONE_DB
+    assert ctrl.user_offsets["expander.threshold_db"] == pytest.approx(4.0 - (-36.0 - thr))
+    assert lc.handle({"cmd": "status"})["state"]["offsets"]["room_db"] == pytest.approx(ctrl.user_offsets["expander.threshold_db"])
+    assert lc.offsets["room_db"] < 4.0
 
 
 def test_threshold_offsets_without_controller_apply_to_the_calibrated_values():
@@ -277,10 +331,12 @@ def test_room_offset_respects_the_speech_cap_in_controller_and_immediate_step():
     changes = [c for k in range(8) for c in ctrl.update(meters_dict(floor=-50.0, speech=-25.0),
                                                         now=LEARN_S + 2.0 + k * INTERVAL_S)]
     reasons = [c["reason"] for c in changes if c["stage"] == "expander"]
-    # Pulled to the cap in 0.5 dB steps every interval (no spacing), then the floor rule
-    # (-50 + 10 = -40, below the cap) takes over at the usual pace.
-    assert reasons[:5] == ["speech_cap"] * 5 and set(reasons[5:]) <= {"speech_cap", "noise_floor_track"}
-    assert chain.get_param("expander", "threshold_db") <= -37.0 + 1e-9
+    # Pulled towards the cap in 0.5 dB steps every interval (no spacing) until it sits within
+    # the 0.5 dB cap dead zone, then the floor rule (-50 + 10 = -40, below the cap) takes over.
+    first_track = reasons.index("noise_floor_track")
+    assert first_track >= 3 and set(reasons[:first_track]) == {"speech_cap"}
+    assert set(reasons[first_track:]) == {"noise_floor_track"}
+    assert chain.get_param("expander", "threshold_db") <= -37.0 + adaptive.SPEECH_CAP_DEADZONE_DB
     # The controller target is min(floor + 10 + offset, speech - 12): offset +6 on -40 = -34,
     # capped at -37 -> the threshold sits at or below the cap, never 4-7 dB above it.
     cfg2, chain2, ctrl2, lc2, _ = fake_setup()

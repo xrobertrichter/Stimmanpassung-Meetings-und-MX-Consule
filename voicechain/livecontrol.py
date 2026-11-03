@@ -171,6 +171,7 @@ class LiveControl:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def state(self) -> dict:
+        self._sync_room_offset()
         meters = self.chain.peek_meters()
         norm = meters.get("normalizer", {}) if isinstance(meters, dict) else {}
         controller = self.controller
@@ -225,6 +226,7 @@ class LiveControl:
     # ----------------------------------------------------------------- offsets
     def _cmd_offset(self, cmd: dict) -> dict:
         name = self._offset_name(cmd)
+        self._sync_room_offset()
         lo, hi, step = OFFSETS[name]
         delta = _finite(cmd.get("delta"), "delta")
         # One key press moves by at most one step; the result stays inside the range.
@@ -233,8 +235,16 @@ class LiveControl:
 
     def _cmd_set_offset(self, cmd: dict) -> dict:
         name = self._offset_name(cmd)
+        self._sync_room_offset()
         lo, hi, _ = OFFSETS[name]
-        return self._apply_offset(name, clamp(_finite(cmd.get("value"), "value"), lo, hi))
+        return self._apply_offset(name, clamp(_finite(cmd.get("value"), "value"), lo, hi), absolute=True)
+
+    def _sync_room_offset(self) -> None:
+        """Take over the room offset the controller may have shrunk through speech_cap
+        steps, so the stored value never drifts from the effective one."""
+        if self.controller is not None:
+            self.offsets["room_db"] = float(self.controller.user_offsets.get("expander.threshold_db",
+                                                                              self.offsets["room_db"]))
 
     @staticmethod
     def _offset_name(cmd: dict) -> str:
@@ -243,19 +253,28 @@ class LiveControl:
             raise ValueError(f"Unbekannter Offset: {name!r}; bekannt: {', '.join(OFFSETS)}")
         return name
 
-    def _apply_offset(self, name: str, requested: float) -> dict:
+    def _apply_offset(self, name: str, requested: float, absolute: bool = False) -> dict:
         """Apply ``requested`` (already inside the range); the stored offset becomes the
-        value that really took effect. No change at all -> ``ok: False`` "am Anschlag"."""
+        value that really took effect. No change at all: a step (``offset``) is a stop ->
+        ``ok: False`` "am Anschlag"; a ``set_offset`` to the value already in effect is a
+        normal answer "unverändert" (the "back to default" press)."""
         if name == "intensity":
             requested = float(round(requested))
         previous = self.offsets[name]
+
+        def unchanged(effect: str, value_text: str, limit: str = "") -> dict:
+            if absolute:
+                return self._ok(f"{OFFSET_LABELS[name]} unverändert ({OFFSET_LABELS[name]} {value_text}, {effect})")
+            return self._error(f"{OFFSET_LABELS[name]} am Anschlag (wirksam: {effect}, {OFFSET_LABELS[name]} {value_text})"
+                               + (f" – {limit}" if limit else ""))
+
         if name == "loudness_lu":
             target = clamp(self.base["target_lufs"] + requested, *LOUDNESS_TARGET_BOUNDS_LUFS)
             effective = target - self.base["target_lufs"]
             effect = f"Ziel {_fmt(target, 'LUFS', signed=False)}"
             limit = f"Ziel-Lautheit auf {_fmt(target, 'LUFS', signed=False)} begrenzt" if abs(effective - requested) > EPS else ""
             if abs(effective - previous) <= EPS:
-                return self._error(f"{OFFSET_LABELS[name]} am Anschlag (wirksam: {effect}, {_fmt(effective, 'LU')})")
+                return unchanged(effect, _fmt(effective, "LU"))
             self.chain.set_param("normalizer", "target_lufs", target)
             self.offsets[name] = effective
             text = f"{OFFSET_LABELS[name]} {_fmt(effective, 'LU')} ({effect})"
@@ -264,7 +283,7 @@ class LiveControl:
             effective = tilt - self.base["tilt_db"]
             limit = f"Tilt auf {_fmt(tilt)} begrenzt" if abs(effective - requested) > EPS else ""
             if abs(effective - previous) <= EPS:
-                return self._error(f"Klang am Anschlag (wirksam: Tilt {_fmt(tilt)}, {_fmt(effective)})")
+                return unchanged(f"Tilt {_fmt(tilt)}", _fmt(effective))
             try:
                 self.chain.set_param("eq", "tilt_db", tilt)
             except (KeyError, ValueError) as exc:
@@ -277,9 +296,7 @@ class LiveControl:
                 stage, param = THRESHOLD_OF[name]
                 value = _fmt(self.chain.get_param(stage, param), 'dBFS', signed=False)
                 unit = "" if name == "intensity" else "dB"
-                return self._error(f"{OFFSET_LABELS[name]} am Anschlag (wirksam: {STAGE_LABELS[stage]} {value}, "
-                                   f"{OFFSET_LABELS[name]} {_fmt(effective, unit)})"
-                                   + (f" – {limit}" if limit else ""))
+                return unchanged(f"{STAGE_LABELS[stage]} {value}", _fmt(effective, unit), limit)
             self.offsets[name] = effective
             text = self._threshold_text(name, effective)
         if limit:

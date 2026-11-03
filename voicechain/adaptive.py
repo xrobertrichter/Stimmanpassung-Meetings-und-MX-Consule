@@ -161,6 +161,12 @@ LIMITER_PROTECT_RELEASE_GR_DB = 1.5
 #: means speech is being cut; the expander threshold is lowered immediately.
 #: Task specification: 6 dB.
 SPEECH_CUT_GR_DB = 6.0
+#: Speech cap rule: the threshold may sit up to this much above speech - 12 dB
+#: before it is pulled down (the speech level estimate jitters by ~0.1 dB; 0.5 dB
+#: is inaudible and keeps the log quiet), and a pull is never smaller than
+#: SPEECH_CAP_MIN_STEP_DB. Assumptions.
+SPEECH_CAP_DEADZONE_DB = 0.5
+SPEECH_CAP_MIN_STEP_DB = 0.25
 #: The expander's interval maximum counts as "during speech" only when at least
 #: this share of the interval's 50 ms frames were speech: a pause that ends
 #: within the first 100 ms of an interval still leaves the gate closed (12-14 dB)
@@ -768,12 +774,14 @@ class AdaptiveController:
             room_offset = self._user_offsets.get(("expander", "threshold_db"), 0.0)
             self.last_expander_cap = (speech - EXPANDER_SPEECH_MARGIN_DB) if speech_present else None
             current = float(self.chain.get_param("expander", "threshold_db"))
-            if self.last_expander_cap is not None and current > self.last_expander_cap + EPS:
+            if (self.last_expander_cap is not None
+                    and current > self.last_expander_cap + SPEECH_CAP_DEADZONE_DB):
                 # The cap is a protection, not a setpoint: a threshold above it (quieter
-                # speaker, live offset) is pulled down every interval, dead zone and
-                # spacing do not apply, until it sits on the cap.
-                proposals.append({"stage": "expander", "name": "threshold_db",
-                                  "step": -min(self.max_step_db, current - self.last_expander_cap),
+                # speaker, live offset) is pulled down every interval, regular dead zone
+                # and spacing do not apply; a small cap dead zone keeps the estimate's
+                # jitter (+-0.1 dB) out of the log.
+                step = min(self.max_step_db, max(SPEECH_CAP_MIN_STEP_DB, current - self.last_expander_cap))
+                proposals.append({"stage": "expander", "name": "threshold_db", "step": -step,
                                   "reason": "speech_cap", "immediate": True, "target": self.last_expander_cap})
             else:
                 p = self._track("expander", "threshold_db",
@@ -845,6 +853,13 @@ class AdaptiveController:
                 continue
             self.chain.set_param(key[0], key[1], new)
             self._last_change_t[key] = now
+            if p["reason"] == "speech_cap":
+                # A positive room offset the cap has taken back is no longer in effect:
+                # shrink it by the pulled amount (never below 0) so the stored offset
+                # equals the effective one.
+                offset = self._user_offsets.get(key, 0.0)
+                if offset > 0.0:
+                    self._user_offsets[key] = max(0.0, offset - (old - new))
             self._log(entry)
             changes.append(entry)
         return changes
