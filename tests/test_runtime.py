@@ -495,3 +495,260 @@ def test_engine_validates_configuration():
         LiveEngine(base_cfg(output={"device": "x", "channels": 0}), RecordingChain([]))
     with pytest.raises(ValueError):
         LiveEngine(base_cfg(input={"device": "x", "channel": -1}), RecordingChain([]))
+
+
+# ------------------------------------------------------------- freeze via SIGUSR1
+def test_sigusr1_handler_toggles_freeze_on_service_side(fake_sd):
+    controller = RecordingController()
+    controller.frozen = False
+    engine = LiveEngine(base_cfg(), RecordingChain([]), controller=controller)
+    assert engine.frozen is False
+    assert "adaptive on:" in engine.status_line()
+
+    engine.handle_sigusr1(10, None)  # what the signal module would call
+    assert controller.frozen is False  # the handler itself does not touch the controller
+    assert engine.apply_pending_requests() == 1
+    assert controller.frozen is True
+    assert engine.frozen is True
+    assert "adaptive FROZEN:" in engine.status_line()
+    assert "FROZEN by request" in engine.status_line()
+
+    engine.handle_sigusr1()  # second toggle releases
+    engine.apply_pending_requests()
+    assert controller.frozen is False
+    assert "adaptive on:" in engine.status_line()
+
+    # two toggles between service ticks cancel each other
+    engine.handle_sigusr1()
+    engine.handle_sigusr1()
+    assert engine.apply_pending_requests() == 2
+    assert controller.frozen is False
+    assert engine.apply_pending_requests() == 0
+
+
+def test_engine_without_controller_reports_adaptive_off(fake_sd):
+    engine = LiveEngine(base_cfg(), RecordingChain([]))
+    assert "adaptive off:" in engine.status_line()
+    engine.handle_sigusr1()
+    engine.apply_pending_requests()  # nothing to freeze, must not fail
+    assert "adaptive off:" in engine.status_line()
+
+
+def test_engine_starts_frozen_when_controller_is_frozen(fake_sd):
+    controller = RecordingController()
+    controller.frozen = True
+    engine = LiveEngine(base_cfg(), RecordingChain([]), controller=controller)
+    assert engine.frozen is True
+    assert "adaptive FROZEN:" in engine.status_line()
+
+
+def test_install_signal_handlers_registers_sigusr1(fake_sd):
+    import signal
+
+    engine = LiveEngine(base_cfg(), RecordingChain([]), controller=RecordingController())
+    previous = signal.getsignal(signal.SIGUSR1)
+    try:
+        assert engine.install_signal_handlers() is True
+        assert signal.getsignal(signal.SIGUSR1) == engine.handle_sigusr1
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+
+def test_status_line_shows_nonfinite_counter(fake_sd):
+    chain = RecordingChain([])
+    base = chain.get_meters
+
+    def meters_with_input():
+        meters = base()
+        meters["input"] = {"peak_dbfs": -20.0, "rms_dbfs": -30.0, "nonfinite_blocks": 3}
+        return meters
+
+    chain.get_meters = meters_with_input
+    engine = LiveEngine(base_cfg(), chain)
+    assert "nonfinite 3" in engine.status_line()
+    # without the counter in the meters the field is omitted, not shown as garbage
+    assert "nonfinite" not in LiveEngine(base_cfg(), RecordingChain([])).status_line()
+
+
+def test_find_device_treats_non_ascii_digits_as_name_not_index(fake_sd):
+    devices = list_devices()
+    # Superscript ones: isdigit() is True but int() would fail. Folded to "111" they
+    # are an ordinary (unmatched) name, reported as such, not as a ValueError.
+    with pytest.raises(DeviceNotFoundError) as excinfo:
+        find_device("¹¹¹", "input", devices)
+    assert "No input device matches" in str(excinfo.value)
+    # Full-width "2" folds to "2" and matches the name "BlackHole 2ch" (index 3),
+    # whereas index 2 would be the Rode's headphone output.
+    assert find_device("２", "output", devices) == IDX_BH2
+
+
+# ------------------------------------------------------------------- recording
+class CallbackStop(Exception):
+    """Stands in for sounddevice.CallbackStop."""
+
+
+class FakeInputStream:
+    """Feeds a prepared signal to the callback from a thread, like PortAudio would."""
+
+    signal_source: np.ndarray | None = None
+    interrupt_after_s: float | None = None
+    instances: list["FakeInputStream"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.callback = kwargs["callback"]
+        self.stopped = False
+        self.closed = False
+        self.delivered = 0
+        FakeInputStream.instances.append(self)
+
+    def start(self):
+        block = self.kwargs["blocksize"]
+        channels = self.kwargs["channels"]
+        source = self.signal_source
+        limit = None if self.interrupt_after_s is None else int(self.interrupt_after_s * SAMPLE_RATE)
+
+        def feeder():
+            import _thread
+
+            pos = 0
+            while pos < len(source):
+                frames = min(block, len(source) - pos)
+                indata = np.zeros((frames, channels), dtype=np.float32)
+                indata[:, channels - 1] = source[pos : pos + frames]
+                try:
+                    self.callback(indata, frames, None, FakeStatus())
+                except CallbackStop:
+                    return
+                pos += frames
+                self.delivered += frames
+                time.sleep(0.0005)  # pace a little, PortAudio delivers in real time
+                if limit is not None and pos >= limit:
+                    _thread.interrupt_main()
+                    return
+
+        threading.Thread(target=feeder, daemon=True).start()
+
+    def stop(self):
+        self.stopped = True
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_sd_record(fake_sd):
+    FakeInputStream.instances = []
+    FakeInputStream.interrupt_after_s = None
+    fake_sd.InputStream = FakeInputStream
+    fake_sd.CallbackStop = CallbackStop
+    return fake_sd
+
+
+def test_record_wav_writes_24bit_mono_and_reports_peak(fake_sd_record, tmp_path):
+    import soundfile as sf
+
+    seconds = 2.0
+    t = np.arange(int(seconds * SAMPLE_RATE)) / SAMPLE_RATE
+    FakeInputStream.signal_source = (0.25 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)  # -12 dBFS peak
+    progress: list[tuple] = []
+    out = tmp_path / "sample.wav"
+
+    result = runtime.record_wav(base_cfg(), out, seconds, on_progress=lambda r, p, hot: progress.append((r, p, hot)))
+
+    info = sf.info(str(out))
+    assert info.samplerate == SAMPLE_RATE and info.channels == 1 and info.subtype == "PCM_24"
+    assert info.frames == int(seconds * SAMPLE_RATE)
+    data, _ = sf.read(str(out), dtype="float32")
+    assert abs(float(np.max(np.abs(data))) - 0.25) < 1e-3
+    assert result["samples"] == info.frames
+    assert abs(result["peak_dbfs"] - (-12.04)) < 0.1
+    assert result["overflows"] == 0 and result["stopped_early"] is False
+    stream = FakeInputStream.instances[-1]
+    assert stream.kwargs["device"] == IDX_RODE
+    assert stream.kwargs["channels"] == 1 and stream.kwargs["samplerate"] == SAMPLE_RATE
+    assert stream.stopped and stream.closed
+    # progress carries the remaining time and the peak, no clip warning at -12 dBFS
+    assert progress, "progress callback was never called"
+    assert all(not hot for _, _, hot in progress)
+    assert all(0.0 <= remaining <= seconds for remaining, _, _ in progress)
+    assert any(abs(peak - (-12.04)) < 0.2 for _, peak, _ in progress)
+
+
+def test_record_wav_warns_when_too_hot_and_uses_configured_channel(fake_sd_record, tmp_path):
+    seconds = 1.5
+    FakeInputStream.signal_source = np.full(int(seconds * SAMPLE_RATE), 0.9, dtype=np.float32)  # -0.9 dBFS
+    progress: list[tuple] = []
+    cfg = base_cfg(input={"device": "Rode+BlackHole", "channel": 2})
+    result = runtime.record_wav(cfg, tmp_path / "hot.wav", seconds, on_progress=lambda r, p, hot: progress.append(hot))
+    assert FakeInputStream.instances[-1].kwargs["channels"] == 3  # channel 2 -> 3 channels opened
+    assert FakeInputStream.instances[-1].kwargs["device"] == IDX_AGG
+    assert result["peak_dbfs"] > runtime.RECORD_CLIP_WARN_DBFS
+    assert any(progress)
+
+
+def test_record_wav_ctrl_c_keeps_partial_recording(fake_sd_record, tmp_path):
+    import soundfile as sf
+
+    FakeInputStream.signal_source = np.full(10 * SAMPLE_RATE, 0.1, dtype=np.float32)
+    FakeInputStream.interrupt_after_s = 1.5
+    out = tmp_path / "partial.wav"
+    result = runtime.record_wav(base_cfg(), out, 10.0)
+    assert result["stopped_early"] is True
+    assert 1.4 <= result["seconds"] <= 2.5
+    assert sf.info(str(out)).frames == result["samples"]
+
+
+def test_record_wav_rejects_too_short_recording(fake_sd_record, tmp_path):
+    FakeInputStream.signal_source = np.full(10 * SAMPLE_RATE, 0.1, dtype=np.float32)
+    FakeInputStream.interrupt_after_s = 0.2
+    out = tmp_path / "short.wav"
+    with pytest.raises(RuntimeError) as excinfo:
+        runtime.record_wav(base_cfg(), out, 10.0)
+    assert "nothing written" in str(excinfo.value)
+    assert not out.exists()
+
+
+def test_record_wav_validates_arguments(fake_sd_record, tmp_path):
+    with pytest.raises(ValueError):
+        runtime.record_wav(base_cfg(), tmp_path / "x.wav", 0.0)
+    with pytest.raises(DeviceNotFoundError):
+        runtime.record_wav(base_cfg(), tmp_path / "x.wav", 1.0, input_device="Shure SM7B")
+
+
+def test_service_thread_reads_meters_once_per_adaptive_interval(fake_sd):
+    """get_meters() drains accumulators: with a controller the chain is read only
+    at adaptive ticks and the status line reuses that reading."""
+    cfg = base_cfg(adaptive={"enabled": True, "learn_s": 0.0, "interval_s": 0.2})
+    chain = RecordingChain([])
+    controller = RecordingController()
+    status_lines: list[str] = []
+    engine = LiveEngine(cfg, chain, controller=controller, on_status=status_lines.append)
+    engine.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while len(controller.calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        engine.stop()
+    assert len(controller.calls) >= 3
+    # status lines were produced from the cached reading, not from extra reads
+    assert chain.meter_calls == len(controller.calls)
+    assert all("exp   3.0" in line for line in status_lines)
+
+
+def test_status_line_uses_shared_meters_and_adaptive_tick_accepts_them(fake_sd):
+    chain = RecordingChain([])
+    controller = RecordingController()
+    engine = LiveEngine(base_cfg(), chain, controller=controller)
+    meters = engine.read_meters()
+    assert chain.meter_calls == 1
+    engine.adaptive_tick(meters)
+    engine.status_line(meters)
+    engine.status_line()  # cached reading, no new call
+    assert chain.meter_calls == 1
+    assert controller.calls[0] is meters
+    # without a cached reading the status line reads once itself
+    fresh = LiveEngine(base_cfg(), RecordingChain([]))
+    assert "exp   3.0" in fresh.status_line()
+    assert fresh.chain.meter_calls == 1

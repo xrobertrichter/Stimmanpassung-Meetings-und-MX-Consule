@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import _thread
 import importlib.abc
+import os
 import importlib.machinery
 import sys
 import threading
@@ -95,6 +96,45 @@ def _make_fake_sd(blocks_to_feed: int) -> types.ModuleType:
             self.closed = True
 
     module.Stream = Stream
+
+    class CallbackStop(Exception):
+        """Stands in for sounddevice.CallbackStop."""
+
+    module.CallbackStop = CallbackStop
+    module.record_source = np.zeros(0, dtype=np.float32)
+
+    class InputStream:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            module.input_stream = self
+
+        def start(self):
+            block = self.kwargs["blocksize"]
+            channels = self.kwargs["channels"]
+            source = module.record_source
+
+            def feeder():
+                pos = 0
+                while pos < len(source):
+                    frames = min(block, len(source) - pos)
+                    indata = np.zeros((frames, channels), dtype=np.float32)
+                    indata[:, channels - 1] = source[pos : pos + frames]
+                    try:
+                        self.kwargs["callback"](indata, frames, None, None)
+                    except CallbackStop:
+                        return
+                    pos += frames
+
+            threading.Thread(target=feeder, daemon=True).start()
+
+        def stop(self):
+            self.closed = False  # stop precedes close; nothing else to release in the fake
+
+        def close(self):
+            self.closed = True
+
+    module.InputStream = InputStream
     return module
 
 
@@ -163,22 +203,32 @@ def test_process_writes_output_of_same_length_and_prints_measurements(tmp_path, 
     assert "written" in out
 
 
-def test_process_accepts_other_sample_rate_and_stereo(tmp_path, capsys):
-    rate = 44100
-    mono = make_speech_like(3.0, rate, seed=2)
+def test_process_mixes_stereo_to_mono(tmp_path, capsys):
+    mono = make_speech_like(3.0, SAMPLE_RATE, seed=2)
     stereo = np.stack([mono, np.zeros_like(mono)], axis=1)
-    src = tmp_path / "stereo44.wav"
-    dst = tmp_path / "out44.wav"
-    _write_wav(src, stereo, rate)
+    src = tmp_path / "stereo.wav"
+    dst = tmp_path / "out.wav"
+    _write_wav(src, stereo, SAMPLE_RATE)
     assert main(["process", "--in", str(src), "--out", str(dst)]) == EXIT_OK
     y, out_rate = sf.read(str(dst), dtype="float32")
-    assert out_rate == rate
+    assert out_rate == SAMPLE_RATE
     assert len(y) == len(mono)
-    assert np.max(np.abs(y)) > 0.01  # channel 0 (the configured input channel) was used
+    assert np.max(np.abs(y)) > 0.01
     captured = capsys.readouterr()
-    assert "44100 Hz differs" in captured.err
     assert "speech statistics skipped" in captured.out  # 3 s is too short for noise-floor statistics
     assert captured.out.count("rms") == 2
+
+
+def test_process_rejects_other_sample_rate_with_message(tmp_path, capsys):
+    rate = 44100
+    src = tmp_path / "in44.wav"
+    _write_wav(src, make_speech_like(3.0, rate, seed=2), rate)
+    code = main(["process", "--in", str(src), "--out", str(tmp_path / "o.wav")])
+    captured = capsys.readouterr()
+    assert code == EXIT_ERROR
+    assert "44100" in captured.err and "48000" in captured.err
+    assert "Traceback" not in captured.err
+    assert not (tmp_path / "o.wav").exists()
 
 
 def test_process_missing_input_is_reported(tmp_path, capsys):
@@ -186,6 +236,119 @@ def test_process_missing_input_is_reported(tmp_path, capsys):
     assert code == EXIT_ERROR
     err = capsys.readouterr().err
     assert "not found" in err and "Traceback" not in err
+
+
+@pytest.mark.parametrize("command", ["process", "calibrate"])
+def test_non_wav_input_is_reported_without_traceback(tmp_path, capsys, command):
+    text = tmp_path / "text.wav"
+    text.write_text("this is not audio", encoding="utf-8")
+    if command == "process":
+        code = main(["process", "--in", str(text), "--out", str(tmp_path / "o.wav")])
+    else:
+        code = main(["calibrate", "--wav", str(text), "--out", str(tmp_path / "c.yaml"), "--report", str(tmp_path / "r.md")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert "text.wav" in err
+    assert "Traceback" not in err
+
+
+def test_empty_file_is_reported(tmp_path, capsys):
+    empty = tmp_path / "empty.wav"
+    empty.write_bytes(b"")
+    code = main(["process", "--in", str(empty), "--out", str(tmp_path / "o.wav")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and "empty.wav" in err and "Traceback" not in err
+
+
+def test_directory_as_input_is_reported(tmp_path, capsys):
+    folder = tmp_path / "folder.wav"
+    folder.mkdir()
+    code = main(["process", "--in", str(folder), "--out", str(tmp_path / "o.wav")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and "directory" in err and "Traceback" not in err
+    code = main(["calibrate", "--wav", str(folder)])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and "Traceback" not in err
+
+
+@pytest.mark.parametrize("command", ["process", "make-sample", "selftest-report"])
+def test_unwritable_output_path_is_reported(tmp_path, capsys, command):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("I am a file, not a directory", encoding="utf-8")
+    target = blocker / "sub" / "out.wav"
+    if command == "process":
+        src = tmp_path / "in.wav"
+        _write_wav(src, make_speech_like(2.0, SAMPLE_RATE, seed=5), SAMPLE_RATE)
+        code = main(["process", "--in", str(src), "--out", str(target)])
+    elif command == "make-sample":
+        code = main(["make-sample", "--out", str(target)])
+    else:
+        code = main(["selftest", "--report", str(blocker / "report.md")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert "blocker" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_permission_denied_output_is_reported(tmp_path, capsys):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        code = main(["make-sample", "--out", str(locked / "x.wav")])
+    finally:
+        locked.chmod(0o700)
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and "PermissionError" in err and "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------- record
+def test_record_writes_48k_24bit_wav_and_shows_progress(monkeypatch, tmp_path, capsys):
+    fake_sd = _make_fake_sd(0)
+    seconds = 2.0
+    t = np.arange(int(seconds * SAMPLE_RATE)) / SAMPLE_RATE
+    fake_sd.record_source = (0.5 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)  # -6 dBFS
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    out = tmp_path / "rec" / "sample.wav"
+
+    code = main(["record", "--out", str(out), "--seconds", str(seconds)])
+    captured = capsys.readouterr()
+    assert code == EXIT_OK, captured.err
+    info = sf.info(str(out))
+    assert info.samplerate == SAMPLE_RATE and info.channels == 1 and info.subtype == "PCM_24"
+    assert info.frames == int(seconds * SAMPLE_RATE)
+    assert fake_sd.input_stream.kwargs["device"] == 0  # RØDE from the config
+    assert fake_sd.input_stream.closed
+    assert "10 s still" in captured.err  # recording instructions
+    assert "rest " in captured.err and "peak " in captured.err
+    assert "ZU LAUT" not in captured.err
+    assert "recorded 2.0 s" in captured.out and "peak -6.0 dBFS" in captured.out
+
+
+def test_record_warns_when_too_hot_and_accepts_device_override(monkeypatch, tmp_path, capsys):
+    fake_sd = _make_fake_sd(0)
+    fake_sd.record_source = np.full(int(1.5 * SAMPLE_RATE), 0.95, dtype=np.float32)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    code = main(["record", "--out", str(tmp_path / "hot.wav"), "--seconds", "1.5", "--input-device", "blackhole 2ch"])
+    captured = capsys.readouterr()
+    assert code == EXIT_OK, captured.err
+    assert fake_sd.input_stream.kwargs["device"] == 1
+    assert "ZU LAUT" in captured.err
+    assert "warning: peak above -3 dBFS" in captured.err
+
+
+def test_record_without_portaudio_reports_error(no_portaudio, tmp_path, capsys):
+    code = main(["record", "--out", str(tmp_path / "x.wav"), "--seconds", "1"])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and "PortAudio" in err and "Traceback" not in err
+
+
+def test_record_rejects_non_positive_seconds(monkeypatch, tmp_path, capsys):
+    monkeypatch.setitem(sys.modules, "sounddevice", _make_fake_sd(0))
+    code = main(["record", "--out", str(tmp_path / "x.wav"), "--seconds", "0"])
+    assert code == EXIT_ERROR
+    assert "--seconds" in capsys.readouterr().err
 
 
 # -------------------------------------------------------------------------- selftest
@@ -295,14 +458,23 @@ def test_run_with_unknown_device_override_is_reported(monkeypatch, capsys):
 
 # ------------------------------------------------------------------------------ paths
 def test_relative_paths_resolve_against_repo_root(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    assert cli.resolve_input_path("config/chain.default.yaml") == cli.REPO_ROOT / "config" / "chain.default.yaml"
+    fake_root = tmp_path / "repo"
+    (fake_root / "config").mkdir(parents=True)
+    (fake_root / "config" / "chain.default.yaml").write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli, "REPO_ROOT", fake_root)
+    workdir = tmp_path / "elsewhere"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    assert cli.resolve_input_path("config/chain.default.yaml") == fake_root / "config" / "chain.default.yaml"
     # an existing file relative to the current directory is still found
-    local = tmp_path / "local.wav"
+    local = workdir / "local.wav"
     local.write_bytes(b"")
     assert cli.resolve_input_path("local.wav") == local
+    # a missing relative file resolves to the repo root (for the error message)
+    assert cli.resolve_input_path("nope.wav") == fake_root / "nope.wav"
     out = cli.resolve_output_path(str(Path("logs") / "sub" / "x.jsonl"))
-    assert out == cli.REPO_ROOT / "logs" / "sub" / "x.jsonl"
+    assert out == fake_root / "logs" / "sub" / "x.jsonl"
     assert out.parent.is_dir()
     absolute = cli.resolve_output_path(str(tmp_path / "a" / "b.txt"))
     assert absolute == tmp_path / "a" / "b.txt" and absolute.parent.is_dir()
@@ -313,5 +485,5 @@ def test_help_lists_all_commands(capsys):
         main(["--help"])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    for command in ("devices", "run", "calibrate", "process", "selftest", "make-sample"):
+    for command in ("devices", "record", "run", "calibrate", "process", "selftest", "make-sample"):
         assert command in out

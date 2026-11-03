@@ -58,7 +58,29 @@ Zuordnung: DSP = Agent DSP-Kette, KAL = Agent Kalibrierung/Regelung, INT = Agent
 | PO-14 | niedrig | −18 LUFS gilt mono; Dual-Mono misst stereo +3 LU | Dokumentieren (docs/02, docs/01) | DSP, INT |
 
 ## Nacharbeit (Runde 1)
-_wird nach Abschluss der Nacharbeit ergänzt_
+
+Alle Befunde aus der Tabelle wurden von den ursprünglichen Umsetzenden bearbeitet
+(Commits 455b78f DSP, 91b2894 Kalibrierung/Regelung, nachfolgender Commit Integration).
+Stand nach Nacharbeit, von der Projektleitung selbst geprüft:
+
+| Prüfung | Ergebnis |
+|---------|----------|
+| `pytest -q` | 302 bestanden, 1 übersprungen (Rechte-Test unter root) |
+| `python -m voicechain selftest` | 12/12 bestanden, Exit 0; Störabstandsgewinn +9,5 dB, Pausenlautheit −48,3 LUFS (Grenze −38), −18,3 LUFS, True Peak −1,95 dBTP, 0,42 ms je Block |
+| make-sample → calibrate → process | Exit 0; SNR 22,1 → 32,8 dB, Gate aus Pausenlautheit abgeleitet |
+| Suchlauf TODO/Stubs/importorskip | keine Treffer |
+
+Wesentliche Änderungen: Normalizer-Gate auf Momentary- plus relative Lautheit (PO-1);
+Plausibilitätsprüfung und Ruhe-Rückkehr der Regelung (PO-2); EQ-Shelves nur als Absenkung mit
+Grundfrequenzmessung (PO-3); De-Esser-Schwelle aus Band-Spitzenpegel (PO-4); Intervallmeter
+(PO-5); Kommando `record` statt QuickTime (PO-6); NaN-Schutz (SW-1); CLI-Fehlerpfade (SW-2);
+echte Reihenfolge- und Nebenläufigkeitstests (SW-3, SW-9); eine Konfigurationsquelle (SW-4);
+Regelschleifen-Integrationstest (SW-5).
+
+Abweichung von einer PO-Vorgabe, fachlich begründet durch den DSP-Agenten: „Pausen-RMS am
+Ausgang ≤ Eingang − 6 dB“ ist bei gleichzeitiger Anhebung der Sprache um 8 dB nicht erreichbar;
+geprüft wird stattdessen Störabstandsgewinn ≥ 6 dB und Pausenlautheit ≤ Ziel − 20 LU (§6.3 neu).
+Zur Bestätigung an den PO in Runde 2.
 
 ## Prüfung der Nacharbeit (Runde 2)
 _wird nach Abschluss ergänzt_

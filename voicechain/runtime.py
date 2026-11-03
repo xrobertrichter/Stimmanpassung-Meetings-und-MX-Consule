@@ -6,15 +6,21 @@ Design rules (see docs/00_Beauftragung.md, section 4.3):
   module of the package, and the whole test suite, works in a container without
   any audio library.
 * The PortAudio callback does nothing but copy, analyze, process and copy back.
-  It never allocates large buffers, never logs and never touches the adaptive
-  controller.
+  It allocates no large buffers (the mono work buffer is pre-allocated; the
+  chain's small per-block temporaries stay well inside the 1 ms budget, see
+  docs/04 SW-13), never logs and never touches the adaptive controller.
 * The adaptive controller and the console status line run in a separate
-  service thread (``threading``), decoupled from the audio thread.
+  service thread (``threading``), decoupled from the audio thread. The same
+  thread applies a freeze toggle requested by SIGUSR1.
+* ``record_wav`` captures a calibration sample from the configured input
+  device without the chain (24-bit WAV, 48 kHz mono).
 """
 
 from __future__ import annotations
 
 import math
+import os
+import signal
 import sys
 import threading
 import time
@@ -173,7 +179,9 @@ def find_device(name_substring: str, kind: str, devices: list[dict] | None = Non
     candidates = [d for d in devices if d[channel_key] > 0]
 
     query = str(name_substring).strip()
-    if query.isdigit():
+    # isdecimal() + isascii(): plain 0-9 only; isdigit() would also accept "¹" or
+    # full-width digits, which int() then rejects with a confusing ValueError.
+    if query.isdecimal() and query.isascii():
         index = int(query)
         for dev in candidates:
             if dev["index"] == index:
@@ -286,6 +294,12 @@ class LiveEngine:
         self._stop_event = threading.Event()
         self._service_thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Freeze state of the adaptive controller as seen by the status line, and the
+        # number of SIGUSR1 toggles not yet applied by the service thread.
+        self.frozen = bool(getattr(controller, "frozen", False)) if controller is not None else False
+        self._freeze_toggle_requests = 0
+        self._signal_handlers_installed = False
+        self._last_meters: dict | None = None
 
     # ------------------------------------------------------------------ devices
     def resolve_devices(self, devices: list[dict] | None = None) -> tuple[int, int]:
@@ -372,12 +386,63 @@ class LiveEngine:
                 raise abort() from exc
             raise
 
+    # ------------------------------------------------------------------ freeze
+    def handle_sigusr1(self, signum=None, frame=None) -> None:
+        """Signal handler: request a freeze toggle. Only increments a counter; the
+        service thread applies it (``apply_pending_requests``), so the handler is
+        safe to run at any point of the main thread."""
+        self._freeze_toggle_requests += 1
+
+    def install_signal_handlers(self) -> bool:
+        """Install the SIGUSR1 handler when running on the main thread; returns success."""
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        if not hasattr(signal, "SIGUSR1"):
+            return False
+        signal.signal(signal.SIGUSR1, self.handle_sigusr1)
+        self._signal_handlers_installed = True
+        return True
+
+    def set_frozen(self, on: bool) -> None:
+        """Freeze/unfreeze the adaptive controller and remember the state for the status line."""
+        self.frozen = bool(on)
+        if self.controller is not None:
+            self.controller.freeze(self.frozen)
+        with self._lock:
+            self.last_change_text = "FROZEN by request" if self.frozen else "released (adaptive active)"
+
+    def apply_pending_requests(self) -> int:
+        """Apply freeze toggles requested by SIGUSR1 since the last call; returns their number."""
+        count = self._freeze_toggle_requests
+        if count:
+            self._freeze_toggle_requests -= count
+            if count % 2 == 1:
+                self.set_frozen(not self.frozen)
+        return count
+
     # ----------------------------------------------------------------- service
-    def adaptive_tick(self) -> list[dict]:
-        """One adaptive evaluation: meters (+ analysis) -> controller.update()."""
+    def read_meters(self) -> dict:
+        """Read the chain meters once and cache them.
+
+        ``Chain.get_meters()`` drains the per-stage accumulators
+        (``gain_reduction_mean_db`` / ``gain_reduction_max_db`` since the previous
+        read), so the service thread reads once per adaptive interval and the
+        status line reuses that reading instead of calling the chain again.
+        """
+        meters = self.chain.get_meters() or {}
+        with self._lock:
+            self._last_meters = meters
+        return meters
+
+    def adaptive_tick(self, meters: dict | None = None) -> list[dict]:
+        """One adaptive evaluation: meters (+ analysis) -> controller.update().
+
+        ``meters`` is the shared reading from :meth:`read_meters`; when omitted a
+        fresh reading is taken."""
         if self.controller is None:
             return []
-        meters = self.chain.get_meters()
+        if meters is None:
+            meters = self.read_meters()
         if self.analyzer is not None:
             meters["analysis"] = self.analyzer.snapshot()
         changes = self.controller.update(meters)
@@ -401,8 +466,11 @@ class LiveEngine:
             values = "{}->{}".format(old, new)
         return "{}.{} {}{}".format(stage, name, values, " ({})".format(reason) if reason else "")
 
-    def status_line(self) -> str:
-        """Build the one-second console status line and reset the peak holds."""
+    def status_line(self, meters: dict | None = None) -> str:
+        """Build the one-second console status line and reset the peak holds.
+
+        ``meters`` is the shared reading from :meth:`read_meters`; when omitted the
+        cached reading is used (fresh one if nothing was read yet)."""
         in_peak = self._in_peak
         out_peak = self._out_peak
         if self._in_rms_blocks > 0:
@@ -414,7 +482,11 @@ class LiveEngine:
         self._in_rms_acc = 0.0
         self._in_rms_blocks = 0
 
-        meters = self.chain.get_meters() or {}
+        if meters is None:
+            with self._lock:
+                meters = self._last_meters
+            if meters is None:
+                meters = self.read_meters()
 
         def gr(stage: str, key: str = "gain_reduction_db") -> str:
             value = meters.get(stage, {}).get(key)
@@ -424,9 +496,17 @@ class LiveEngine:
 
         with self._lock:
             change_text = self.last_change_text
+        nonfinite = meters.get("input", {}).get("nonfinite_blocks")
+        nonfinite_text = " | nonfinite {}".format(int(nonfinite)) if nonfinite is not None else ""
+        if self.controller is None:
+            mode = "off"
+        elif self.frozen:
+            mode = "FROZEN"
+        else:
+            mode = "on"
         return (
             "in {:6.1f} dBFS (rms {:6.1f}) | out {:6.1f} dBFS | GR exp {} des {} comp {} "
-            "norm {} lim {} | xruns {} | blocks {} | adaptive: {}"
+            "norm {} lim {} | xruns {}{} | blocks {} | adaptive {}: {}"
         ).format(
             _to_dbfs(in_peak),
             _to_dbfs(in_rms),
@@ -437,7 +517,9 @@ class LiveEngine:
             gr("normalizer", "gain_db"),
             gr("limiter"),
             self.xruns,
+            nonfinite_text,
             self.blocks_processed,
+            mode,
             change_text,
         )
 
@@ -456,10 +538,20 @@ class LiveEngine:
             if wait_s > 0 and self._stop_event.wait(wait_s):
                 break
             now = time.monotonic()
+            try:
+                self.apply_pending_requests()
+            except Exception as exc:  # noqa: BLE001 - report, keep audio running
+                print("freeze toggle error: {!r}".format(exc), file=sys.stderr, flush=True)
+            # One meter reading per wake-up, shared by controller and status line.
+            # With a controller the chain is read only at adaptive ticks, so its
+            # mean/max statistics cover the whole interval; without one the status
+            # line reads every second.
+            meters = None
             if now >= next_adaptive:
                 next_adaptive += self.adaptive_interval_s
                 try:
-                    self.adaptive_tick()
+                    meters = self.read_meters()
+                    self.adaptive_tick(meters)
                 except Exception as exc:  # noqa: BLE001 - report, keep audio running
                     print("adaptive controller error: {!r}".format(exc), file=sys.stderr, flush=True)
                     with self._lock:
@@ -467,7 +559,9 @@ class LiveEngine:
             if now >= next_status:
                 next_status += STATUS_INTERVAL_S
                 try:
-                    self.on_status(self.status_line())
+                    if meters is None and self.controller is None:
+                        meters = self.read_meters()
+                    self.on_status(self.status_line(meters))
                 except Exception as exc:  # noqa: BLE001 - a broken console must not stop audio
                     print("status callback error: {!r}".format(exc), file=sys.stderr, flush=True)
 
@@ -546,18 +640,23 @@ class LiveEngine:
         return "block {:.1f} ms".format(1000.0 * self.block_size / self.sample_rate)
 
     def run_forever(self) -> None:
-        """Start, block until Ctrl-C or a callback error, then stop."""
+        """Start, block until Ctrl-C or a callback error, then stop.
+
+        SIGUSR1 toggles the freeze state of the adaptive controller while running
+        (``kill -USR1 <pid>``)."""
         self.start()
         try:
+            signals_ok = self.install_signal_handlers() if self.controller is not None else False
             print(
                 "voicechain running: input #{} channel {} -> output #{} ({} ch), {} Hz, {}. "
-                "Press Ctrl-C to stop.".format(
+                "Press Ctrl-C to stop.{}".format(
                     self.resolved_input_index,
                     self.input_channel,
                     self.resolved_output_index,
                     self.output_channels,
                     self.sample_rate,
                     self.latency_info(),
+                    " Send SIGUSR1 to toggle freeze (kill -USR1 {}).".format(os.getpid()) if signals_ok else "",
                 ),
                 file=sys.stderr,
                 flush=True,
@@ -570,7 +669,133 @@ class LiveEngine:
             print("\nstopping ...", file=sys.stderr, flush=True)
         finally:
             self.stop()
+            if self._signal_handlers_installed:
+                signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+                self._signal_handlers_installed = False
         if self.last_error is not None:
             raise RuntimeError(
                 "audio callback failed after {} blocks: {!r}".format(self.blocks_processed, self.last_error)
             ) from self.last_error
+
+
+# ------------------------------------------------------------------- recording
+# Peak level above which the recording is considered too hot for calibration:
+# 3 dB below full scale leaves no headroom for louder passages in the seminar.
+RECORD_CLIP_WARN_DBFS = -3.0
+# How often the progress callback is called while recording.
+RECORD_PROGRESS_INTERVAL_S = 0.5
+# Shortest recording worth keeping when the user stops early with Ctrl-C.
+RECORD_MIN_KEEP_S = 1.0
+
+
+def record_wav(
+    cfg: dict,
+    out_path,
+    seconds: float,
+    input_device: str | int | None = None,
+    on_progress: Callable[[float, float, bool], None] | None = None,
+) -> dict:
+    """Record ``seconds`` of mono audio from the configured input device to a 24-bit WAV.
+
+    The chain is not applied: the recording is the raw microphone signal that
+    ``calibrate`` needs. ``on_progress(remaining_s, peak_dbfs, too_hot)`` is called
+    every RECORD_PROGRESS_INTERVAL_S with the peak since the previous call.
+    Ctrl-C stops early and keeps what was recorded (if at least RECORD_MIN_KEEP_S).
+    Returns {"path", "seconds", "samples", "peak_dbfs", "overflows", "stopped_early"}.
+    """
+    if seconds <= 0:
+        raise ValueError("seconds must be > 0, got {}".format(seconds))
+    sd = _import_sounddevice()
+    sample_rate = int(cfg["sample_rate"])
+    block_size = int(cfg["block_size"])
+    channel = int(cfg["input"]["channel"])
+    devices = list_devices()
+    query = input_device if input_device is not None else cfg["input"]["device"]
+    in_index = find_device(str(query), "input", devices)
+    in_dev = next(d for d in devices if d["index"] == in_index)
+    if channel >= in_dev["max_input_channels"]:
+        raise DeviceNotFoundError(
+            "input.channel={} but device {!r} has only {} input channel(s).".format(
+                channel, in_dev["name"], in_dev["max_input_channels"]
+            )
+        )
+
+    n_total = int(round(seconds * sample_rate))
+    buffer = np.zeros(n_total, dtype=np.float32)
+    state = {"pos": 0, "peak": 0.0, "overall_peak": 0.0, "overflows": 0}
+    done = threading.Event()
+
+    def callback(indata, frames, time_info, status) -> None:
+        if status and getattr(status, "input_overflow", False):
+            state["overflows"] += 1
+        pos = state["pos"]
+        n = min(frames, n_total - pos)
+        if n > 0:
+            x = indata[:n, channel]
+            buffer[pos : pos + n] = x
+            peak = float(np.max(np.abs(x)))
+            if peak > state["peak"]:
+                state["peak"] = peak
+            if peak > state["overall_peak"]:
+                state["overall_peak"] = peak
+            state["pos"] = pos + n
+        if state["pos"] >= n_total:
+            done.set()
+            raise sd.CallbackStop()
+
+    try:
+        sd.check_input_settings(device=in_index, channels=channel + 1, dtype="float32", samplerate=sample_rate)
+        stream = sd.InputStream(
+            device=in_index,
+            channels=channel + 1,
+            samplerate=sample_rate,
+            blocksize=block_size,
+            dtype="float32",
+            callback=callback,
+        )
+    except Exception as exc:
+        raise AudioBackendError(
+            "Could not open input device {!r} at {} Hz: {}".format(in_dev["name"], sample_rate, exc)
+        ) from exc
+
+    def report_progress() -> None:
+        if on_progress is None:
+            return
+        peak = state["peak"]
+        state["peak"] = 0.0
+        peak_dbfs = _to_dbfs(peak)
+        remaining = max(0.0, (n_total - state["pos"]) / sample_rate)
+        on_progress(remaining, peak_dbfs, peak_dbfs > RECORD_CLIP_WARN_DBFS)
+
+    stopped_early = False
+    try:
+        # start() inside the try: a Ctrl-C arriving while the stream spins up must
+        # also end up as "stopped early", not as a traceback.
+        stream.start()
+        while not done.wait(RECORD_PROGRESS_INTERVAL_S):
+            report_progress()
+        report_progress()  # final line: remaining 0.0 s and the last peak
+    except KeyboardInterrupt:
+        stopped_early = True
+    finally:
+        stream.stop()
+        stream.close()
+
+    recorded = buffer[: state["pos"]]
+    if recorded.shape[0] < RECORD_MIN_KEEP_S * sample_rate:
+        raise RuntimeError(
+            "recording stopped after {:.2f} s; at least {:.0f} s are needed, nothing written".format(
+                recorded.shape[0] / sample_rate, RECORD_MIN_KEEP_S
+            )
+        )
+    import soundfile as sf
+
+    sf.write(str(out_path), recorded, sample_rate, subtype="PCM_24")
+    return {
+        "path": str(out_path),
+        "seconds": recorded.shape[0] / sample_rate,
+        "samples": int(recorded.shape[0]),
+        "peak_dbfs": _to_dbfs(state["overall_peak"]),
+        "overflows": state["overflows"],
+        "stopped_early": stopped_early,
+    }

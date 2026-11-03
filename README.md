@@ -1,9 +1,9 @@
 # voicechain – Sprachaufbereitung Rode NT-USB → BlackHole → Zoom/Teams
 
 voicechain ist eine Python-Echtzeit-Verarbeitungskette für Sprache in Webseminaren. Sie nimmt das
-Signal eines **Rode NT-USB** entgegen, bereitet es in sieben Stufen auf (Input Trim, High-Pass,
-Downward Expander, De-Esser, EQ, Compressor mit Loudness-Normalizer, Limiter) und gibt es an das
-virtuelle Audiokabel **BlackHole 2ch** weiter. In Zoom oder Microsoft Teams wählt man dann
+Signal eines **Rode NT-USB** entgegen, bereitet es in acht Stufen auf (0 Input Trim, 1 High-Pass,
+2 Downward Expander, 3 De-Esser, 4 EQ, 5 Compressor, 5b Loudness-Normalizer, 6 Limiter) und gibt
+es an das virtuelle Audiokabel **BlackHole 2ch** weiter. In Zoom oder Microsoft Teams wählt man dann
 „BlackHole 2ch" als Mikrofon. Die anderen Teilnehmenden hören eine gleichmäßig laute, von
 Raumrauschen und Zischlauten befreite Stimme.
 
@@ -82,24 +82,40 @@ Python-Pakete (siehe `requirements.txt`): numpy, scipy, soundfile, sounddevice, 
    python -m voicechain selftest
    ```
    Alle Zeilen müssen „bestanden" zeigen.
-7. **Sprachsample aufnehmen** (30–120 s, normale Seminarstimme, mit Pausen von einigen
-   Sekunden, am gewohnten Platz) – z. B. mit QuickTime Player (Neue Audioaufnahme, Quelle
-   RØDE NT-USB) und als WAV exportieren, oder mit einem beliebigen Recorder. Ohne eigenes
-   Sample lässt sich der Ablauf mit `python -m voicechain make-sample --out samples/demo.wav`
-   proben.
+7. **Sprachsample aufnehmen** (am gewohnten Platz, mit dem eingebauten Kommando; kein
+   zusätzliches Programm nötig)
+   ```bash
+   python -m voicechain record --out samples/sample.wav --seconds 60
+   ```
+   Ablauf während der 60 s: **zuerst 10 s still sein** (nur Raumgeräusch), dann in normaler
+   Seminarlautstärke sprechen, **in der Mitte eine Pause von mindestens 5 s** machen, dann
+   weitersprechen. Das Kommando zeigt Restzeit und Spitzenpegel; steht dort „ZU LAUT", Abstand
+   vergrößern und wiederholen. Es entsteht ein 48-kHz-Mono-WAV (24 Bit) ohne jede Bearbeitung.
+   Liegt bereits eine Aufnahme als `.m4a` vor, wandelt das macOS-Bordmittel
+   `afconvert -f WAVE -d LEI24@48000 aufnahme.m4a sample.wav` sie um (verlustbehaftete
+   Zwischenformate möglichst vermeiden, sie verfälschen den Rauschteppich). Ohne Mikrofon lässt
+   sich der Ablauf mit `python -m voicechain make-sample --out samples/demo.wav` proben.
 8. **Kalibrieren**
    ```bash
    python -m voicechain calibrate --wav pfad/zum/sample.wav
    ```
-   Erzeugt `config/chain.calibrated.yaml` und einen Bericht unter `reports/`. Der Bericht
-   zeigt Messwerte vorher/nachher und ob die Akzeptanzkriterien erfüllt sind.
+   Erzeugt `config/chain.calibrated.yaml` und den Bericht `reports/calibration_report.md`
+   (Pfade über `--out`/`--report` änderbar). Der Bericht zeigt Messwerte vorher/nachher und ob
+   die Akzeptanzkriterien erfüllt sind.
 9. **Live starten**
    ```bash
    python -m voicechain run --config config/chain.calibrated.yaml
    ```
    (oder `scripts/run_live.sh --config config/chain.calibrated.yaml`). Beim ersten Start fragt
    macOS nach der Mikrofonberechtigung für das Terminal – erlauben. Jede Sekunde erscheint eine
-   Statuszeile mit Pegeln, Gain-Reduction je Stufe, Xruns und der letzten adaptiven Änderung.
+   Statuszeile mit Pegeln, Gain-Reduction je Stufe, Xruns, Zähler nicht-finiter Eingangsblöcke,
+   Zustand der adaptiven Regelung (`on`/`FROZEN`/`off`) und der letzten adaptiven Änderung.
+   Die Regelung lässt sich im laufenden Betrieb einfrieren und wieder freigeben (z. B. vor
+   einer Präsentation), aus einem zweiten Terminal:
+   ```bash
+   kill -USR1 $(pgrep -f "voicechain run")
+   ```
+   Jeder Aufruf schaltet um; die Statuszeile zeigt dann `adaptive FROZEN`.
 10. **Zoom/Teams einstellen:** Mikrofon „BlackHole 2ch", Rauschunterdrückung aus bzw. Original-
     Ton/High-Fidelity an, automatische Lautstärkeanpassung aus, Lautsprecher = Kopfhörer am Rode.
     Vor dem Seminar einen Zoom-Testanruf bzw. Teams-Testanruf machen (`docs/01_macOS_Setup.md`,
@@ -113,9 +129,10 @@ sonst bleibt es still.
 | Kommando | Zweck |
 |----------|-------|
 | `python -m voicechain devices` | Audiogeräte mit Index, Kanälen und Samplerate auflisten |
-| `python -m voicechain run [--config PFAD] [--input-device NAME] [--output-device NAME] [--no-adaptive] [--freeze]` | Live-Betrieb Rode → BlackHole |
+| `python -m voicechain record --out PFAD [--seconds 60] [--input-device NAME] [--config PFAD]` | Kalibriersample aufnehmen (rohes Mikrofonsignal, 48 kHz mono, 24-Bit-WAV), mit Restzeit und Pegelanzeige |
+| `python -m voicechain run [--config PFAD] [--input-device NAME] [--output-device NAME] [--no-adaptive] [--freeze]` | Live-Betrieb Rode → BlackHole; `kill -USR1 <pid>` schaltet Freeze um |
 | `python -m voicechain calibrate --wav PFAD [--config BASIS] [--out NEU.yaml] [--report BERICHT.md]` | Sprachsample analysieren → Konfigurationsvorschlag + Bericht |
-| `python -m voicechain process --in PFAD --out PFAD [--config PFAD]` | WAV offline durch die Kette (A/B-Hören), Messzeile vorher/nachher |
+| `python -m voicechain process --in PFAD --out PFAD [--config PFAD]` | WAV (48 kHz) offline durch die Kette (A/B-Hören), Messzeilen vorher/nachher |
 | `python -m voicechain selftest [--config PFAD] [--report PFAD]` | Synthetische Signale durch die Kette, Prüftabelle Soll/Ist, Exit-Code 1 bei Nichtbestehen |
 | `python -m voicechain make-sample --out PFAD` | Synthetisches Sprach-WAV erzeugen, um den Kalibrierablauf ohne Mikrofon zu proben |
 

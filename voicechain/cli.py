@@ -53,6 +53,9 @@ DEFAULT_CALIBRATION_REPORT = Path("reports") / "calibration_report.md"
 # 6 dB criterion cannot be met by any chain on such a signal.
 SELFTEST_DURATION_S = 20.0
 SELFTEST_NOISE_FLOOR_DBFS = -50.0
+# Section 6.3 requires a pause >= 5 s for the pause-loudness criterion; 6 s in the
+# middle of the signal leaves 7 s of speech on either side.
+SELFTEST_LONG_PAUSE_S = 6.0
 SELFTEST_SPEECH_LEVEL_DBFS = -26.0
 SELFTEST_SIBILANCE_BOOST_DB = 6.0
 SELFTEST_SEED = 20261102  # fixed seed: the self-test must be reproducible
@@ -78,15 +81,21 @@ SINE_LEVEL_DBFS = 0.0  # full scale: the hardest case for the limiter
 # Names of the mandatory report rows; tests check for them.
 SELFTEST_ROWS = (
     "Rauschteppich-Absenkung (relativ zur Sprache)",
+    "Pausenlautheit nach der Kette",
     "Sprachpegel",
     "Zischanteil-Absenkung",
     "Lautheit (integriert; Short-Term max)",
     "True Peak",
+    "Nicht-finite Eingangsbloecke (Sprachsignal)",
+    "NaN-Block -> gezaehlt, Ausgang endlich und still",
     "Rechenzeit je 256er-Block",
     "Limiter-Ceiling bei Vollaussteuerungs-Sinus",
     "Limiter-Ceiling bei Impulsen",
     "Stille -> Stille",
 )
+# A block containing NaN must be counted, muted and must not poison the chain:
+# after this many clean silent blocks the output has to be silent again.
+NAN_RECOVERY_BLOCKS = 200  # ~1 s at 256/48 kHz, longer than every release time
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -131,26 +140,18 @@ def _load_config(arg: str | None) -> tuple[dict, Path]:
     return load_config(str(path)), path
 
 
-def _read_wav_mono(path: Path, channel: int) -> tuple[np.ndarray, int]:
-    """Read a WAV as float32 mono. Multichannel files use ``channel`` (fallback 0)."""
-    import soundfile as sf
+def read_input_wav(path: Path, expected_sr: int) -> np.ndarray:
+    """Read a WAV as float32 mono via the shared reader ``calibrate.read_mono_wav``
+    (multichannel files are mixed down; wrong sample rate, unreadable or empty
+    files raise ValueError with the path, which ``main()`` reports without a
+    traceback). A directory is reported as such instead of "file not found".
+    """
+    from voicechain.calibrate import read_mono_wav
 
-    if not path.exists():
-        raise FileNotFoundError("WAV file not found: {}".format(path))
-    data, rate = sf.read(str(path), dtype="float32", always_2d=True)
-    if data.shape[1] > 1:
-        if channel >= data.shape[1]:
-            print(
-                "note: file has {} channels, channel {} does not exist, using channel 0".format(
-                    data.shape[1], channel
-                ),
-                file=sys.stderr,
-            )
-            channel = 0
-        mono = np.ascontiguousarray(data[:, channel])
-    else:
-        mono = np.ascontiguousarray(data[:, 0])
-    return mono.astype(np.float32, copy=False), int(rate)
+    if path.is_dir():
+        raise IsADirectoryError("{} is a directory, not a WAV file".format(path))
+    mono, _ = read_mono_wav(str(path), expected_sr=expected_sr, channel=None)
+    return mono
 
 
 def process_blockwise(chain, x: np.ndarray, block_size: int) -> np.ndarray:
@@ -203,14 +204,6 @@ def format_analysis_line(label: str, meas: dict) -> str:
         meas["sibilance_ratio_db"],
         meas["short_term_lufs_max"],
     )
-
-
-def _clone_cfg_with_rate(cfg: dict, sample_rate: int) -> dict:
-    import copy
-
-    clone = copy.deepcopy(cfg)
-    clone["sample_rate"] = int(sample_rate)
-    return clone
 
 
 # ---------------------------------------------------------------------------- commands
@@ -270,6 +263,57 @@ def cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+RECORD_INSTRUCTIONS = (
+    "Aufnahme fuer die Kalibrierung: zuerst 10 s still sein (Raumgeraeusch), dann normal und in "
+    "Seminarlautstaerke sprechen, in der Mitte eine Pause von mindestens 5 s machen, dann weitersprechen."
+)
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    from voicechain.runtime import RECORD_CLIP_WARN_DBFS, record_wav
+
+    cfg, _ = _load_config(args.config)
+    out_path = resolve_output_path(args.out)
+    if args.seconds <= 0:
+        raise ValueError("--seconds must be > 0")
+    print(RECORD_INSTRUCTIONS, file=sys.stderr)
+    print(
+        "recording {:.0f} s at {} Hz mono from {!r} -> {} (Ctrl-C stops early and keeps the recording)".format(
+            args.seconds,
+            cfg["sample_rate"],
+            args.input_device if args.input_device is not None else cfg["input"]["device"],
+            out_path,
+        ),
+        file=sys.stderr,
+    )
+
+    def on_progress(remaining_s: float, peak_dbfs: float, too_hot: bool) -> None:
+        warning = "  ZU LAUT (> {:.0f} dBFS): Abstand vergroessern".format(RECORD_CLIP_WARN_DBFS) if too_hot else ""
+        print("rest {:5.1f} s | peak {:6.1f} dBFS{}".format(remaining_s, peak_dbfs, warning), file=sys.stderr, flush=True)
+
+    result = record_wav(cfg, out_path, float(args.seconds), input_device=args.input_device, on_progress=on_progress)
+    print(
+        "recorded {:.1f} s ({} samples), peak {:.1f} dBFS, {} overflows{} -> {}".format(
+            result["seconds"],
+            result["samples"],
+            result["peak_dbfs"],
+            result["overflows"],
+            " (stopped early)" if result["stopped_early"] else "",
+            result["path"],
+        )
+    )
+    if result["peak_dbfs"] > RECORD_CLIP_WARN_DBFS:
+        print(
+            "warning: peak above {:.0f} dBFS; the recording may be clipped, repeat it with more distance".format(
+                RECORD_CLIP_WARN_DBFS
+            ),
+            file=sys.stderr,
+        )
+    if result["overflows"]:
+        print("warning: {} input overflows (dropouts) during the recording".format(result["overflows"]), file=sys.stderr)
+    return EXIT_OK
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     from voicechain.calibrate import run_calibration
 
@@ -305,14 +349,8 @@ def cmd_process(args: argparse.Namespace) -> int:
     cfg, _ = _load_config(args.config)
     in_path = resolve_input_path(args.infile)
     out_path = resolve_output_path(args.outfile)
-    x, rate = _read_wav_mono(in_path, int(cfg["input"]["channel"]))
-    if rate != int(cfg["sample_rate"]):
-        print(
-            "note: file sample rate {} Hz differs from config {} Hz; the chain is built for {} Hz "
-            "for this run".format(rate, cfg["sample_rate"], rate),
-            file=sys.stderr,
-        )
-        cfg = _clone_cfg_with_rate(cfg, rate)
+    rate = int(cfg["sample_rate"])
+    x = read_input_wav(in_path, rate)
     chain = Chain.from_config(cfg)
     block_size = int(cfg["block_size"])
 
@@ -358,6 +396,8 @@ def _selftest_speech_signal(sample_rate: int) -> np.ndarray:
         noise_floor_dbfs=SELFTEST_NOISE_FLOOR_DBFS,
         sibilance_db=SELFTEST_SIBILANCE_BOOST_DB,
         seed=SELFTEST_SEED,
+        long_pause_s=SELFTEST_LONG_PAUSE_S,
+        long_pause_at_s=(SELFTEST_DURATION_S - SELFTEST_LONG_PAUSE_S) / 2.0,
     )
     return np.asarray(x, dtype=np.float32)
 
@@ -418,12 +458,14 @@ def run_selftest(cfg: dict) -> list[dict]:
         ),
         noise["passed"],
     )
+    pause = criteria["pause_loudness"]
+    add(SELFTEST_ROWS[1], pause["target"], "{} ({})".format(pause["actual"], pause.get("note", "")), pause["passed"])
     speech_ok = (
         math.isfinite(after["speech_level_dbfs"])
         and after["speech_level_dbfs"] > after["noise_floor_dbfs"] + SPEECH_ABOVE_FLOOR_MIN_DB
     )
     add(
-        SELFTEST_ROWS[1],
+        SELFTEST_ROWS[2],
         "messbar, > Rauschteppich + {:.0f} dB".format(SPEECH_ABOVE_FLOOR_MIN_DB),
         "{:.1f} -> {:.1f} dBFS (SNR {:.1f} -> {:.1f} dB)".format(
             before["speech_level_dbfs"], after["speech_level_dbfs"], before["snr_db"], after["snr_db"]
@@ -431,10 +473,10 @@ def run_selftest(cfg: dict) -> list[dict]:
         speech_ok,
     )
     sibilance = criteria["sibilance_reduced"]
-    add(SELFTEST_ROWS[2], sibilance["target"], sibilance["actual"], sibilance["passed"])
+    add(SELFTEST_ROWS[3], sibilance["target"], sibilance["actual"], sibilance["passed"])
     loudness = criteria["loudness_in_target"]
     add(
-        SELFTEST_ROWS[3],
+        SELFTEST_ROWS[4],
         loudness["target"],
         "{}; Short-Term max {:.1f} LUFS (vorher integriert {:.1f})".format(
             loudness["actual"], after["short_term_lufs_max"], before["integrated_lufs"]
@@ -443,16 +485,49 @@ def run_selftest(cfg: dict) -> list[dict]:
     )
     true_peak = criteria["true_peak_below_ceiling"]
     add(
-        SELFTEST_ROWS[4],
+        SELFTEST_ROWS[5],
         true_peak["target"],
         "{} (vorher {:.2f} dBTP)".format(true_peak["actual"], before["true_peak_dbtp"]),
         true_peak["passed"],
+    )
+    nonfinite_speech = int(chain.get_meters()["input"]["nonfinite_blocks"])
+    add(SELFTEST_ROWS[6], "0", str(nonfinite_speech), nonfinite_speech == 0)
+
+    # --- one NaN block must be counted and muted, the chain must recover -----------
+    chain_nan = Chain.from_config(cfg)
+    nan_block = np.full(block_size, np.nan, dtype=np.float32)
+    y_nan = np.asarray(chain_nan.process(nan_block), dtype=np.float32)
+    silent_block = np.zeros(block_size, dtype=np.float32)
+    tail_peak = 0.0
+    tail_finite = True
+    for _ in range(NAN_RECOVERY_BLOCKS):
+        y_tail = np.asarray(chain_nan.process(silent_block), dtype=np.float32)
+        if not np.all(np.isfinite(y_tail)):
+            tail_finite = False
+            break
+        tail_peak = max(tail_peak, float(np.max(np.abs(y_tail))))
+    nonfinite_counted = int(chain_nan.get_meters()["input"]["nonfinite_blocks"])
+    nan_ok = (
+        nonfinite_counted == 1
+        and bool(np.all(np.isfinite(y_nan)))
+        and tail_finite
+        and (tail_peak == 0.0 or 20.0 * math.log10(tail_peak) <= SILENCE_LIMIT_DBFS)
+    )
+    add(
+        SELFTEST_ROWS[7],
+        "Zaehler 1, Ausgang endlich, danach Stille <= {:.0f} dBFS".format(SILENCE_LIMIT_DBFS),
+        "Zaehler {}, NaN-Block {}, danach Spitze {} dBFS".format(
+            nonfinite_counted,
+            "endlich" if np.all(np.isfinite(y_nan)) else "NaN/inf",
+            "-inf" if tail_peak == 0.0 else "{:.1f}".format(20.0 * math.log10(tail_peak)) if tail_finite else "NaN/inf",
+        ),
+        nan_ok,
     )
 
     # --- compute budget ---------------------------------------------------------------
     per_block_ms = _time_per_block_ms(Chain.from_config(cfg), sample_rate, COMPUTE_BUDGET_BLOCK)
     add(
-        SELFTEST_ROWS[5],
+        SELFTEST_ROWS[8],
         "< {:.1f} ms".format(COMPUTE_BUDGET_MS),
         "{:.3f} ms".format(per_block_ms),
         per_block_ms < COMPUTE_BUDGET_MS,
@@ -466,7 +541,7 @@ def run_selftest(cfg: dict) -> list[dict]:
     y_sine = process_blockwise(chain_sine, sine, block_size)
     tp_sine = float(m.true_peak_dbfs(y_sine, sample_rate))
     add(
-        SELFTEST_ROWS[6],
+        SELFTEST_ROWS[9],
         "<= {:.1f} dBTP".format(ceiling),
         "{:.2f} dBTP".format(tp_sine),
         tp_sine <= ceiling + TRUE_PEAK_TOLERANCE_DB and np.all(np.isfinite(y_sine)),
@@ -482,7 +557,7 @@ def run_selftest(cfg: dict) -> list[dict]:
     y_imp = process_blockwise(chain_imp, impulses, block_size)
     tp_imp = float(m.true_peak_dbfs(y_imp, sample_rate))
     add(
-        SELFTEST_ROWS[7],
+        SELFTEST_ROWS[10],
         "<= {:.1f} dBTP".format(ceiling),
         "{:.2f} dBTP".format(tp_imp),
         tp_imp <= ceiling + TRUE_PEAK_TOLERANCE_DB and np.all(np.isfinite(y_imp)),
@@ -496,7 +571,7 @@ def run_selftest(cfg: dict) -> list[dict]:
     peak = float(np.max(np.abs(y_sil))) if finite else float("inf")
     peak_dbfs = 20.0 * math.log10(peak) if peak > 0.0 else -float("inf")
     add(
-        SELFTEST_ROWS[8],
+        SELFTEST_ROWS[11],
         "Spitze <= {:.0f} dBFS, keine NaN".format(SILENCE_LIMIT_DBFS),
         "{} dBFS, {}".format(
             "-inf" if peak == 0.0 else "{:.1f}".format(peak_dbfs), "finite" if finite else "NaN/inf"
@@ -513,9 +588,13 @@ def format_selftest_table(rows: list[dict], cfg_path: Path) -> str:
     lines = [
         "voicechain selftest ({})".format(cfg_path),
         "Testsignal: {:.0f} s synthetische Sprache, Rauschteppich {:.0f} dBFS, Sprachpegel {:.0f} dBFS, "
-        "Zischen {:+.0f} dB; Schwellen der Kette dafuer per calibrate.recommend abgeleitet, "
+        "Zischen {:+.0f} dB, Pause {:.0f} s in der Mitte; Schwellen der Kette dafuer per calibrate.recommend abgeleitet, "
         "Kriterien nach Abschnitt 6.3 per calibrate.evaluate bewertet.".format(
-            SELFTEST_DURATION_S, SELFTEST_NOISE_FLOOR_DBFS, SELFTEST_SPEECH_LEVEL_DBFS, SELFTEST_SIBILANCE_BOOST_DB
+            SELFTEST_DURATION_S,
+            SELFTEST_NOISE_FLOOR_DBFS,
+            SELFTEST_SPEECH_LEVEL_DBFS,
+            SELFTEST_SIBILANCE_BOOST_DB,
+            SELFTEST_LONG_PAUSE_S,
         ),
         "",
         "| {:<{}} | {:<{}} | {:<{}} | {} |".format("Kriterium", name_w, "Soll", target_w, "Ist", actual_w, "bestanden"),
@@ -579,6 +658,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--freeze", action="store_true", help="run the adaptive controller frozen (log only, no changes)")
     p_run.set_defaults(func=cmd_run)
 
+    p_rec = sub.add_parser("record", help="record a calibration sample (raw microphone, 48 kHz mono, 24-bit WAV)")
+    p_rec.add_argument("--out", required=True, help="output WAV path")
+    p_rec.add_argument("--seconds", type=float, default=60.0, help="recording length in seconds (default 60)")
+    p_rec.add_argument("--input-device", help="input device name substring or index (overrides config)")
+    p_rec.add_argument("--config", help="YAML configuration (default: config/chain.default.yaml)")
+    p_rec.set_defaults(func=cmd_record)
+
     p_cal = sub.add_parser("calibrate", help="analyze a speech sample and write a new configuration + report")
     p_cal.add_argument("--wav", required=True, help="speech sample (WAV, 30-120 s, speech with pauses)")
     p_cal.add_argument("--config", help="base configuration (default: config/chain.default.yaml)")
@@ -614,11 +700,21 @@ def main(argv: list[str] | None = None) -> int:
     except DeviceNotFoundError as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return EXIT_ERROR
-    except FileNotFoundError as exc:
-        print("error: {}".format(exc), file=sys.stderr)
+    except OSError as exc:
+        # FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError,
+        # FileExistsError (a parent of an output path is a file): report with the path.
+        detail = str(exc)
+        if exc.filename and str(exc.filename) not in detail:
+            detail = "{} ({})".format(detail, exc.filename)
+        print("error: {}: {}".format(type(exc).__name__, detail), file=sys.stderr)
         return EXIT_ERROR
     except (ValueError, KeyError, TypeError) as exc:
-        # Typically an invalid configuration (validate_config) or a malformed WAV.
+        # Typically an invalid configuration (validate_config), a malformed or
+        # unreadable WAV, or a wrong sample rate.
+        print("error: {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
+        return EXIT_ERROR
+    except RuntimeError as exc:
+        # soundfile.LibsndfileError (unreadable audio file) or a failed audio callback.
         print("error: {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
         return EXIT_ERROR
     except KeyboardInterrupt:

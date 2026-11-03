@@ -43,9 +43,10 @@ brew install blackhole-2ch portaudio
   Installationsbefehl.
 - Nach der BlackHole-Installation **abmelden und wieder anmelden** (oder Neustart). Erst danach
   erscheint „BlackHole 2ch" in Audio-MIDI-Setup und in den Systemeinstellungen → Ton.
-- Homebrew kann beim Installieren von BlackHole darauf hinweisen, dass eine Systemerweiterung
-  bzw. ein Treiber erlaubt werden muss; dem Hinweis folgen (Systemeinstellungen →
-  Datenschutz & Sicherheit → „Erlauben").
+- Homebrew installiert BlackHole über ein Installationspaket und fragt dabei nach dem
+  **Mac-Passwort** (Administrator). Das ist normal. Ein Sicherheitsdialog unter
+  Datenschutz & Sicherheit ist **nicht** nötig: BlackHole ist ein CoreAudio-HAL-Plug-in
+  (`/Library/Audio/Plug-Ins/HAL`), keine Systemerweiterung.
 
 Kontrolle: Audio-MIDI-Setup öffnen (Programme → Dienstprogramme → Audio-MIDI-Setup oder per
 Spotlight „Audio-MIDI-Setup"). In der linken Geräteliste müssen „BlackHole 2ch" und – bei
@@ -173,8 +174,9 @@ Empfehlung, BlackHole nach oben zu ziehen.
 Pfade nach Kenntnisstand (siehe Hinweis oben): **Zoom → Einstellungen (⌘,) → Audio**.
 
 1. **Mikrofon:** „BlackHole 2ch". Den Haken „Mikrofonlautstärke automatisch anpassen"
-   **entfernen**, Mikrofonlautstärke auf ca. 75–100 % stellen. Die Pegelregelung macht
-   voicechain (Normalizer).
+   **entfernen**, Mikrofonlautstärke auf **100 %** stellen. Der Regler ist ein Pegelsteller vor
+   dem Codec; bei 75 % käme das von voicechain auf −18 LUFS normalisierte Signal 2–3 dB leiser
+   an und die Normalisierung liefe ins Leere. Die Pegelregelung macht voicechain (Normalizer).
 2. **Lautsprecher:** „RØDE NT-USB" (Kopfhörer am Mikrofon) oder ein anderes Gerät mit Kopfhörer.
    Keine offenen Lautsprecher (siehe Echo unten).
 3. **Hintergrundgeräusche unterdrücken / Audioprofil:** auf **„Niedrig"** stellen (oder
@@ -195,7 +197,8 @@ Pfade nach Kenntnisstand (siehe Hinweis oben): **Zoom → Einstellungen (⌘,) �
 Pfade nach Kenntnisstand (siehe Hinweis oben): **Teams → „…" (neben dem Profilbild) →
 Einstellungen → Geräte**.
 
-1. **Mikrofon:** „BlackHole 2ch".
+1. **Mikrofon:** „BlackHole 2ch". Ist ein Mikrofon-Lautstärkeregler sichtbar, auf 100 %
+   (gleiche Begründung wie bei Zoom).
 2. **Lautsprecher:** „RØDE NT-USB" (Kopfhörer am Mikrofon).
 3. **Mikrofonempfindlichkeit automatisch anpassen:** **aus** (falls vorhanden).
 4. **Rauschunterdrückung:** auf **„Aus"** stellen (Optionen sind je nach Version „Automatisch /
@@ -208,6 +211,32 @@ Einstellungen → Geräte**.
 6. **Testanruf:** In den Geräteeinstellungen „Testanruf tätigen" – Teams spielt die eigene
    Aufnahme zurück.
 
+## 6a. Kalibriersample aufnehmen
+
+Das Sample für `calibrate` nimmt man mit dem eingebauten Kommando auf, ohne weiteres Programm:
+
+```bash
+python -m voicechain record --out samples/sample.wav --seconds 60
+```
+
+Das Kommando nutzt dieselbe Geräteauswahl wie `run` (`input.device` aus der YAML oder
+`--input-device`), nimmt das **rohe** Mikrofonsignal mit 48 kHz mono auf und schreibt ein
+24-Bit-WAV. Während der Aufnahme werden Restzeit und Spitzenpegel angezeigt; bei Spitzen über
+−3 dBFS erscheint „ZU LAUT" – dann Abstand vergrößern und wiederholen. `Ctrl-C` beendet
+vorzeitig und behält das bis dahin Aufgenommene. Ablauf siehe README, Schritt 7 (10 s Stille,
+normal sprechen, Pause ≥ 5 s in der Mitte).
+
+Liegt schon eine Aufnahme aus QuickTime Player oder Sprachmemos vor (`.m4a`, AAC), wandelt das
+macOS-Bordmittel `afconvert` sie ohne Zusatzinstallation um:
+
+```bash
+afconvert -f WAVE -d LEI24@48000 aufnahme.m4a sample.wav
+```
+
+Verlustbehaftete Zwischenformate (AAC, MP3) verändern den Rauschteppich und das Band oberhalb
+von 16 kHz; die Messwerte sind dann weniger aussagekräftig als bei einer direkten Aufnahme.
+Details zur Auswertung: `docs/03_Betrieb_und_Kalibrierung.md`.
+
 ## 7. Testen vor dem Seminar
 
 Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
@@ -217,7 +246,13 @@ Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
    synthetischen Signalen und braucht kein Mikrofon.
 3. `python -m voicechain run --config config/chain.calibrated.yaml` starten. In der Statuszeile
    muss beim Sprechen `in` sichtbar ausschlagen (typisch −30 … −15 dBFS) und `out` um −20 … −6
-   dBFS liegen; `xruns` bleibt 0.
+   dBFS liegen; `xruns` und `nonfinite` bleiben 0, `adaptive on` (bzw. `FROZEN`, wenn
+   eingefroren).
+   Freeze im laufenden Betrieb umschalten (zweites Terminal): `kill -USR1 $(pgrep -f "voicechain run")`.
+   Hinweis zum Nachmessen: Das Ziel −18 LUFS gilt für die **Mono**-Messung; voicechain legt das
+   Mono-Signal identisch auf beide BlackHole-Kanäle (Dual-Mono). Ein Stereo-Lautheitsmesser in
+   einem anderen Programm (z. B. auf einer Meeting-Aufzeichnung) zeigt nach BS.1770 daher etwa
+   **+3 LU**, also −15 LUFS – das ist kein Fehler.
 4. **Zoom:** Einstellungen → Audio → „Mikrofon testen" (oder `zoom.us/test` für ein
    Testmeeting). **Teams:** Einstellungen → Geräte → „Testanruf tätigen". Eigene Stimme
    aufnehmen und anhören: gleichmäßig laut, kein Rauschen in Pausen, Zischlaute weich,
@@ -242,7 +277,9 @@ Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
 | Ton klingt „unter Wasser", stark verzerrt oder zu tief/hoch | Samplerate der Geräte ≠ 48 kHz (CoreAudio resampelt oder Takt stimmt nicht) | In Audio-MIDI-Setup Rode und BlackHole auf 48.000 Hz; `run` neu starten |
 | Regelmäßiges Knacken alle paar Sekunden | Aggregate Device ohne Drift-Korrektur | Drift-Korrektur bei BlackHole anhaken, Taktquelle = Rode |
 | Die anderen hören sich selbst (Echo) | Lautsprecher offen und Echounterdrückung durch Originalton/Musikmodus aus | Kopfhörer am Rode benutzen; oder Echounterdrückung in Zoom wieder einschalten |
-| Stimme pumpt, wird in Pausen hörbar leiser/lauter | Expander/Kompressor zu scharf, kein Popschutz, Abstand schwankt | Neu kalibrieren mit realistischem Sample; Popschutz; `--freeze` setzen, wenn die adaptive Regelung nachführt, während man testet |
+| Stimme pumpt, wird in Pausen hörbar leiser/lauter | Expander/Kompressor zu scharf, kein Popschutz, Abstand schwankt | Neu kalibrieren mit realistischem Sample; Popschutz; Regelung einfrieren (`--freeze` beim Start oder `kill -USR1 <pid>` im Betrieb), wenn sie nachführt, während man testet |
+| `record` zeigt „ZU LAUT" oder `calibrate` meldet Übersteuerung | Mikrofon zu nah oder zu laut gesprochen | 20–25 cm Abstand, Popschutz, Aufnahme wiederholen |
+| Statuszeile zeigt `nonfinite` > 0 | Ungültige Samples (NaN/Inf) vom Eingang, z. B. nach Geräte-Umstecken | Kette hat den Block stummgeschaltet und sich zurückgesetzt; häufen sich die Zähler, `run` neu starten und USB-Verbindung prüfen |
 | Pegel in Zoom springt | Zooms/Teams' automatische Lautstärkeanpassung noch aktiv | Haken entfernen (Abschnitt 5/6), Rauschunterdrückung aus |
 | Hohe Latenz, man hört sich im Kopfhörer verzögert | Kopfhörer am Mac statt am Rode, oder Zoom-Rückkanal mit eigenem Mikro | Kopfhörer am Rode, Direktmonitoring per Mix-Regler; in Zoom keine „Mikrofon abhören"-Funktion |
 | `run` bricht mit „audio callback failed" ab | Fehler in der Kette (z. B. ungültige YAML-Werte) | Fehlermeldung lesen, YAML mit `python -m voicechain selftest --config <datei>` prüfen |
