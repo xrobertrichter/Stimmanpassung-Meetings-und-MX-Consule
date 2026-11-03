@@ -54,7 +54,7 @@ Klangfarbe (wärmer/heller) ist seltener nötig und wandert auf Ebene 2.
 | K1 | Wärmer | Klang-Tilt −1 dB (Low-Shelf 250 Hz +½, High-Shelf 4 kHz −½) | Tilt −3…+3 dB |
 | K2 | Heller | Klang-Tilt +1 dB | |
 | K3 | Mehr Zischen | De-Esser-Schwelle höher (De-Esser zurücknehmen) | +2 dB je Druck |
-| K4 | Lautheit zurück | Lautheits-Offset 0 (Ziel wieder Kalibrierwert) | |
+| K4 | Verarbeitung an/aus (Kill-Switch) | Kette wirklich abschalten: nur Input Trim + Limiter werden gerechnet, Analyzer und Regelung pausieren; spart Prozessorlast. Wiedereinschalten setzt die Stufen zurück und blendet 30 ms ein | Toggle, Statuszeile OFF; `Lautheit zurück` bleibt als CLI-Kommando `loudness-reset` |
 | K5 | Neu lernen | Regelung: Lernphase neu starten (nach Platz- oder Raumwechsel), Offsets bleiben | |
 | K6 | Snapshot speichern | aktuelle Basiswerte + Offsets als `config/chain.live.yaml` schreiben (mit Zeitstempel im Kommentar) | |
 | K7 | Bypass A/B | Kette umgehen (nur Input Trim + Limiter) zum Vergleich; Blende 30 ms | Toggle, Statuszeile BYPASS |
@@ -76,6 +76,10 @@ Dial auf Ebene 2: identisch zu Ebene 1 (Lautheit / Mute), damit der häufigste G
   (INT): Kommandos siehe §4; `--notify` zeigt die Antwort als macOS-Mitteilung (osascript), Exit 0/1/2.
 - Runtime (INT): Mute-Blende im Audio-Callback (Ausgangsgain-Rampe 30 ms), Bypass über
   `Chain.set_bypass`, Statuszeile mit MUTE/BYPASS/Offsets-Kurzform.
+- DSP: `Chain.set_processing(on)` / `get_processing()`: aus = nur Input Trim → Limiter werden gerechnet
+  (mittlere Stufen werden nicht aufgerufen; Rechenzeit je Block muss messbar auf < 25 % fallen);
+  Ausblenden 30 ms vor dem Abschalten, beim Einschalten Stufen zurücksetzen (recover) und 30 ms
+  einblenden; Meter `chain.processing` 0/1.
 - DSP: `Equalizer` erhält optionalen Parameter `tilt_db` (−3…+3, Default 0, zwei zusätzliche
   Shelves 250 Hz / 4 kHz, knackfrei); `Chain.set_bypass(on)` mit 30-ms-Crossfade, Bypass =
   Input Trim + Limiter; Validator kennt `eq.tilt_db` optional und `control.socket_path` optional.
@@ -106,6 +110,7 @@ Kommandos (JSON-Objekt je Zeile, Antwort JSON-Objekt je Zeile):
 | `snapshot` | `path` (optional) | YAML schreiben |
 | `marker` | `text` | Logeintrag |
 | `status` | — | Zustand |
+| `processing` | `on`: true/false/"toggle" | Kill-Switch (Ergänzung 2026-11-03 auf Nutzerwunsch) |
 
 Offset-Namen und Bereiche: `loudness_lu` (−6…+6, Schritt 0,5), `room_db` (−6…+6, Schritt 2;
 positiv = weniger Raum = Expander-Schwelle höher), `deess_db` (−6…+6, Schritt 2; negativ =
@@ -118,7 +123,7 @@ bypass, low_snr, snr_lu, loudness_lufs, adaptive_enabled.
 
 CLI-Kommandonamen (1:1 zu den Tasten): `louder`, `quieter`, `mute`, `room-less`, `room-more`,
 `deess-more` (weniger Zischen), `deess-less`, `natural`, `dense`, `freeze`, `reset`, `status`,
-`warmer`, `brighter`, `loudness-reset`, `relearn`, `snapshot`, `bypass`, `marker`.
+`warmer`, `brighter`, `loudness-reset`, `relearn`, `snapshot`, `bypass`, `marker`, `power` (Kill-Switch).
 
 ## 5. Qualitätsregeln
 
@@ -138,6 +143,8 @@ Antwortzeit `ctl` < 300 ms auf dem Mac (Python-Start eingerechnet; messen und do
    bleibt Ziel + 4 ± Totzone).
 5. Reset stellt den Kalibrierzustand wieder her (alle Parameter identisch mit der geladenen Konfig,
    Regelung auf rest-Werten).
+6a. Kill-Switch: Rechenzeit je Block im Aus-Zustand < 25 % des Normalbetriebs (gemessen), Aus- und
+   Einschalten knackfrei (Rampen), Regelung und Analyzer pausieren, Reset schaltet wieder ein.
 6. Mute und Bypass sind knackfrei (kein Sprung > 0,5 dB je Block außerhalb der 30-ms-Rampe) und
    werden in der Statuszeile angezeigt.
 7. PO-, Software- und Blindprüfung nach `memory/01_rolle_routinen.md`.
