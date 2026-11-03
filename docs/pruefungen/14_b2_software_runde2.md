@@ -102,3 +102,46 @@ Ergänzungen:
   liegt nichts davon.
 - Alle Mutationen wurden rückgängig gemacht; `mut2/` ist nach dem Lauf wieder byte-gleich mit ae522ec (`git show HEAD:` je Datei), der Arbeitsbaum des Repos
   wurde von mir nicht angefasst (`git status` zeigt ausschließlich die drei fremden, unversionierten Änderungen aus SW2-17).
+
+## 6. Ergänzung nach Commit b8efd3c (Wiederholung N1a, N1b, N4; Neubewertung SW2-16)
+
+Kopie `r2/mut3/` aus dem Arbeitsbaum; `voicechain/adaptive.py`, `voicechain/livecontrol.py`, `tests/test_livecontrol.py`, `tests/test_adaptive.py` byte-gleich mit
+`git show b8efd3c:` (verifiziert). Hinweis: der Arbeitsbaum enthielt zu diesem Zeitpunkt bereits weitere unversionierte Änderungen (`README.md`, `tests/test_control.py`,
+`tests/test_runtime.py`, `voicechain/control.py`, neu `docs/pruefungen/14_b2_software_runde2.md`); sie berühren die hier geprüften Module und Tests nicht.
+Patcher `r2/mutations3/apply.py`, Logs `r2/mutations3/*.log`, Zusammenfassung `r2/mutations3/summary.txt`, Nachweis-Skripte `r2/n1a_demo.py`, `r2/n1a_assert_proto.py`.
+
+| Nr. | Mutation (b8efd3c) | Gefangen | Fehlschlagende Tests | `test_speech_cap_has_a_half_db_deadzone_…` | `test_set_offset_to_the_active_value_answers_unveraendert` |
+|---|---|---|---|---|---|
+| N1a | Kappe vor Offset im Regler entfernt (`adaptive.py:788-789`: `floor` statt `floor + room_offset`, `include_offset=True`) | **nein** | test_adaptive + test_livecontrol grün (87 s) | grün (fängt nicht) | grün (fängt nicht) |
+| N1b | Sofort-Schritt ignoriert Sprach-Kappe (`livecontrol.py:340`) | **ja** | test_livecontrol :: test_room_offset_respects_the_speech_cap_in_controller_and_immediate_step, test_quiet_speaker_with_room_offset_stays_under_the_speech_cap | grün | grün |
+| N4 | Anschlag-/Unverändert-Prüfungen deaktiviert (`livecontrol.py:276/285/295`) | **ja** | 10 Tests, u. a. test_offset_steps_move_one_step_and_stop_with_ok_false_at_the_range_end (5×), test_loudness_offset_… | grün | **rot (fängt)** |
+| N4b | `unchanged()` antwortet immer `ok` (`livecontrol.py` `if absolute:` → `if True:`) – Anschlag liefert ok=true | **ja** | 10 Tests (dieselben Anschlag-Tests) | grün | grün (der Mutant liefert dort das erwartete `ok`) |
+
+**Neubewertung SW2-16 – die Suite fängt N1a weiterhin nicht.** Das Verhalten des Mutanten hat sich durch die neue Kappen-Totzone geändert: er
+flattert nicht mehr, sondern **parkt die Expander-Schwelle dauerhaft 0,5 dB über der Sprach-Kappe** (−36,5 dBFS bei Kappe −37; Original −39) und
+**schrumpft den gespeicherten Raum-Offset von 6,0 auf 5,5** (`n1a_demo.py`). Beide vorhandenen Zusicherungen lassen das durch:
+`tests/test_adaptive.py:342` erlaubt `≤ −37 + EXPANDER_DEADZONE_DB` (= −35), `tests/test_livecontrol.py` (neuer Test, letzter Block) erlaubt
+`≤ −37 + SPEECH_CAP_DEADZONE_DB` (= −36,5, dort fachlich richtig, weil die Schwelle in diesem Szenario *von oben* an die Kappe gezogen wird).
+
+**Konkreter Zusatz-Assert (verifiziert mit `r2/n1a_assert_proto.py`: Original alle drei wahr, Mutant alle drei falsch):**
+Datei `tests/test_adaptive.py`, Test `test_room_offset_enters_the_floor_rule_before_the_speech_cap`, erster Block (Zeilen 339–343) – den Rückgabewert
+von `run()` auffangen und die erste Zusicherung ersetzen bzw. ergänzen:
+
+```python
+    changes = run(ctrl, lambda i: meters_dict(floor=-50.0, speech=-25.0), 40)
+    # Offset vor der Kappe: das Ziel liegt von Anfang an unter der Kappe, also wird die
+    # Schwelle nie darüber geführt, die Kappe muss nie zurückziehen und der Offset bleibt
+    # vollständig gespeichert (ein Regler, der den Offset nach der Kappe addiert, steigt auf
+    # -36,5, braucht einen speech_cap-Schritt und schrumpft den Offset auf 5,5).
+    assert chain.get_param("expander", "threshold_db") <= -37.0 + 1e-9                 # A: Endwert <= Kappe
+    assert all(c["reason"] != "speech_cap" for c in changes if c["stage"] == "expander")  # B: kein Rückzug nötig
+    assert ctrl.user_offsets["expander.threshold_db"] == pytest.approx(6.0)             # C: Offset unangetastet
+```
+
+Schärfer (empfohlen), weil A allein nur den Endwert sieht: zusätzlich den Verlauf prüfen, z. B. über `chain.history`
+(`max(v for s, n, v in chain.history if s == "expander") <= -37.0 + 1e-9`); der Mutant erreicht zwischenzeitlich −36,0.
+Ergebnis für den Mutanten im Prototyp: Endwert −36,5, Maximum −36,0, 1 `speech_cap`-Schritt, Offset 5,5 → A, B und C schlagen an; das Original
+(Endwert −39,0, 0 `speech_cap`-Schritte, Offset 6,0) besteht alle drei.
+
+Fazit Ergänzung: N1b, N4, N4b gefangen; N1a bleibt überlebend (SW2-16 offen, Schwere N, Testqualität) – mit dem obigen Zusatz-Assert wird er gefangen.
+Die Kopie `mut3/` ist nach dem Lauf wieder auf dem b8efd3c-Stand der geprüften Module; das Repo wurde nicht verändert.
