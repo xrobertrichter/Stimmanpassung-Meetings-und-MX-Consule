@@ -30,3 +30,10 @@
 - **Band-Spitzenpegel p95**: 95. Perzentil der 50-ms-Spitzen im De-Esser-Band über aktive Rahmen.
 - **f0 (Grundfrequenz)**: Tonhöhe der Stimme, per Autokorrelation geschätzt; steuert, ob der Low-Shelf angefasst wird.
 - **Mutationstest**: absichtlicher Codefehler, um zu prüfen, ob die Tests ihn bemerken.
+- **Makro (Live-Offset)**: Bedienfunktion, die ein Symptom korrigiert und intern einen Offset auf kalibrierte Werte legt.
+- **Sprach-Kappe**: Obergrenze der Expander-Schwelle bei Sprachpegel − 12 dB, damit leise Silben nicht abgeschnitten werden.
+- **Bypass**: Kette wird umgangen, Stufen rechnen weiter (A/B-Hören, bitgleiche Rückkehr).
+- **Kill-Switch (DSP an/aus)**: Stufen werden nicht gerechnet, Regelung und Lernuhr pausieren, spart Prozessorlast.
+- **Steuerkanal**: Unix-Domain-Socket, über den `ctl` Kommandos an den laufenden Prozess schickt.
+- **peek_meters**: Meter lesen, ohne die Mittel-/Maximum-Akkumulatoren der Regelung zu leeren.
+- **Snapshot**: hörbaren Ist-Zustand (nachgeführte Werte + Offsets) als neue Konfigurationsdatei sichern.

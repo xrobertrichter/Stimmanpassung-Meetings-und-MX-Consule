@@ -25,3 +25,18 @@
 | Rechenzeit je Block (256 @ 48 kHz) | < 1 ms | — | Beauftragung §4.3 |
 
 Werte sind Startwerte; die Kalibrierung überschreibt sie innerhalb der Grenzen.
+
+## Beauftragung 2: Live-Offsets (MX Creative Console)
+
+| Item | Wert | Grenze | Quelle |
+|------|------|--------|--------|
+| Lautheit (Dial) | ±0,5 LU je Rastung | Ziel −24…−14 LUFS, Offset ±6 | PO B2 |
+| Raum (Expander-Schwelle) | ±2 dB je Druck | Offset ±6 dB; Sprach-Kappe Sprache − 12 dB gilt nach dem Offset | PO B2-1 |
+| Zischen (De-Esser-Schwelle) | ±2 dB je Druck | Offset ±6 dB, Bounds −45…−10 | docs/06 |
+| Intensität (Kompressor-Schwelle) | ∓2 dB je Stufe | Stufe −3…+3; De-Esser nicht gekoppelt | PO B2-7 |
+| Klang-Tilt | ±1 dB je Druck | −3…+3 dB; Shelves 250 Hz / 4 kHz, je ½ | docs/02 |
+| Mute / Bypass / Kill-Switch | Blende 30 ms | Kill-Switch: Rechenzeit 15–16 % des Normalbetriebs | DSP B2 |
+| Steuerkanal | Unix-Socket, JSON-Zeilen, Default `/tmp/voicechain-<user>.sock` | Pfad ≤ 103 Byte (macOS) | SW B2-2 |
+| `ctl`-Antwortzeit | 59–80 ms Median im Container | Mac geschätzt < 300 ms | SW/Blind B2 |
+| Reset | Bedienzustand zurück (Offsets, Lautheit, Tilt, Mute, Bypass, Kill-Switch, Freeze, Normalizer-Deckel) | nachgeführte Schwellen bleiben; Regelung zurück nur über „Neu lernen“ | PO B2-2 |
+| Testsuite | Standard (`-m "not slow"`) 489 Tests ≈ 4,5 min; slow 23 Tests ≈ 4 min | — | Prüfrunde B2 |
