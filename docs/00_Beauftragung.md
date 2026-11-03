@@ -213,7 +213,8 @@ class AdaptiveController:
    a) Wird der Rauschteppich nach der Kalibrierung um bis zu 8 dB lauter, liegt die Pausenlautheit
       nach der Kette mindestens 15 LU unter der Sprachlautheit oder, wenn der Abstand am Eingang
       bereits geringer ist, mindestens so weit wie am Eingang; der nächste Satz setzt nicht
-      lauter als +1,5 dB ein. (Präzisierung nach Runde 5: Standard-Rosa +8 dB ergibt am Eingang
+      lauter als +1,5 dB ein. Der volle Abstand gilt nach Nachführung der Expander-Schwelle durch
+      die Regelung (ca. 1,5 min); davor gilt b). (Präzisierung nach Runde 5: Standard-Rosa +8 dB ergibt am Eingang
       nur 12,3 LU K-bewerteten Abstand; die Kette hält ihn, kann ihn aber ohne Sprachverlust
       nicht auf 15 LU vergrößern.)
    b) Bei größeren Anstiegen (Störabstand am Eingang unter ca. 16 dB) kann der Expander Pausen
