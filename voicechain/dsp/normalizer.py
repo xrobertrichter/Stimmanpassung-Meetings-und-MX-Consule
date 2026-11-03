@@ -12,13 +12,23 @@ Control (every ``UPDATE_INTERVAL_MS`` on an absolute sample grid, hence
 independent of the block size), using the momentary loudness ``L_m`` at the end
 of the previous interval:
 
-* noise-floor estimate ``L_floor``: minimum of ``L_m`` over the last
-  ``FLOOR_WINDOW_S``, allowed to rise by at most ``FLOOR_RISE_LU_PER_S`` (unless
-  the estimate has not been confirmed by any value for a whole window, then the
-  window minimum is accepted) and never closer than ``FLOOR_BELOW_SPEECH_LU`` to
-  the speech loudness. It follows a room that gets quieter at once and a room
-  that gets louder within seconds, and it is kept across a non-finite-input
-  recovery (``recover``);
+* noise-floor estimate ``L_floor``: evidence for the room floor is a *plateau*,
+  i.e. ``PLATEAU_S`` of 10 ms interval loudness values whose range stays within
+  ``PLATEAU_RANGE_LU`` (stationary noise: white < 2 LU, pink mostly < 3 LU; speech,
+  even a dense lecture with 0.2 s gaps and even after the compressor, > 4 LU
+  because of its syllabic modulation). The floor is the minimum of the plateau levels seen in the last
+  ``FLOOR_WINDOW_S``; it follows a quieter room at once, a louder one by at most
+  ``FLOOR_RISE_LU_PER_S`` (or outright once the old value is unconfirmed for a
+  whole window). Without any plateau - a speaker who talks without pauses - the
+  estimate simply keeps its last value, so dense speech can never masquerade as
+  a loud room. The estimate is kept across a non-finite-input recovery;
+* low-SNR state: if the floor lies less than ``LOW_SNR_ENTER_LU`` under the
+  speech reference, the room is too loud to be gated. The stage then freezes
+  the gain (decreases for too-loud speech stay allowed), learns no reference
+  and lets none decay, and keeps the gate at floor + margin; it leaves the state
+  with hysteresis once the floor is again ``LOW_SNR_EXIT_LU`` under the
+  reference. Meters ``low_snr`` and ``snr_lu`` expose it so the controller can
+  log it and the status line can show it;
 * effective gate ``G = max(gate_lufs, L_floor + gate_margin_lu)`` once speech has
   been learnt (before that only ``gate_lufs``, so a signal without any dips can
   still start the regulation);
@@ -34,7 +44,7 @@ of the previous interval:
   floor is what the meter ``noise_floor_lufs`` reports);
 * otherwise the gain target is ``clip(target_lufs - L_speech, min_gain_db,
   min(max_gain_db, target_lufs - PAUSE_HEADROOM_LU - L_floor))``: the gain may
-  never lift the noise floor closer than 15 LU to the target; while ``L_m`` is
+  never lift a gateable noise floor closer than 15 LU to the target; while ``L_m`` is
   falling faster than ``FALLING_LU_PER_S`` below the speech loudness (a decaying
   word or sentence end) the target may not lie above the current gain;
 * the applied gain ramps towards the target by at most ``rate_db_per_s``
@@ -72,19 +82,28 @@ FALLING_LU_PER_S = 10.0
 # few dB/s (0.3 dB per interval even at the maximum release rate of 30 dB/s); the
 # applied gain ramps per sample anyway.
 UPDATE_INTERVAL_MS = 10.0
-# Noise-floor estimate: sliding minimum over 10 s. Spoken sentences are 2-5 s long, so
-# the window always contains a pause or at least an inter-word gap in which the
-# momentary loudness drops to the room; a shorter window would read syllable dips of
-# a long sentence as "floor", a longer one would follow a room that gets quieter only
-# after that time.
+# Noise-floor evidence: a plateau of 0.5 s of 10 ms interval loudness within 3 LU.
+# Measured ranges over 0.5 s at the normaliser's input (after the compressor): white
+# noise 1.0-1.9 LU, pink noise median 2.7 LU (some windows up to 4.7 are simply not
+# counted), synthetic speech with only 6 dB syllabic modulation compressed 3:1 still
+# 4.4 LU, real speech far more. 3 LU accepts most noise windows and no speech window;
+# 0.5 s is short enough that a loud room is recognised within the first second of a
+# pause (the gain can rise at most ~0.5 dB before the stage freezes).
+PLATEAU_S = 0.5
+PLATEAU_RANGE_LU = 3.0
+# Sliding minimum of the plateau levels over 10 s: sentences are 2-5 s long, so a room
+# that is audible in pauses shows up within the window; a longer window would follow a
+# room that gets quieter only after that time.
 FLOOR_WINDOW_S = 10.0
 # The estimate follows a louder room at 1 LU/s (a fan that switches on is tracked in
-# ~10 s) but cannot run up to the speech within a sentence.
+# ~10-20 s) so that a single mis-detected plateau cannot jump it.
 FLOOR_RISE_LU_PER_S = 1.0
-# A "floor" less than 15 LU below the speech is not a floor the chain can gate; the
-# same 15 LU are the pause headroom the gain cap guarantees below the target
-# (Beauftragung 6.4: pause loudness <= speech loudness - 15 LU).
-FLOOR_BELOW_SPEECH_LU = 15.0
+# A floor less than 15 LU below the speech cannot be gated without cutting speech
+# (Beauftragung 6.4 b): the stage enters the low-SNR state below 15 LU and leaves it
+# above 17 LU (2 LU hysteresis against flicker on a fluctuating floor). The same 15 LU
+# are the pause headroom the gain cap keeps below the target.
+LOW_SNR_ENTER_LU = 15.0
+LOW_SNR_EXIT_LU = 17.0
 PAUSE_HEADROOM_LU = 15.0
 # While only the relative gate blocks, the speech reference decays at 2 LU/s: a speaker
 # who became 20 LU quieter is re-referenced within 10 s; five times slower than the
@@ -123,13 +142,20 @@ class Normalizer(StageBase):
         self._up_step = 0.0
         self._down_step = 0.0
         self._speech_coef = 0.0
+        self._plateau_ring = np.full(max(1, int(round(PLATEAU_S / self._interval_s))), np.nan)
+        self._plateau_index = 0
+        self._plateau_count = 0
+        self._interval_index = 0                 # intervals since the last (re)start of the signal path
         self._floor_ring = np.full(max(1, int(round(FLOOR_WINDOW_S / self._interval_s))), np.inf)
         self._floor_index = 0
-        self._floor_raw_db = DB_FLOOR_DBFS       # measured: sliding minimum with slow rise
-        self._floor_db = DB_FLOOR_DBFS           # used for gate and cap: never closer than 15 LU to the speech
+        self._floor_db = DB_FLOOR_DBFS           # sliding minimum of plateau levels, slow rise
         self._floor_known = False
         self._floor_stale = 0
+        self._low_snr = False
+        self._modulated_seen = False             # speech (modulated signal) has been learnt at least once
         self._effective_gate = self.gate_lufs
+        self._interval_sum = 0.0                 # K-weighted power accumulated over the running interval
+        self._interval_count = 0
         self._pos = 0                    # absolute sample index since reset (bias correction + grid)
         self._gain_db = 0.0
         self._target_db = 0.0
@@ -160,12 +186,27 @@ class Normalizer(StageBase):
     # -- measurement -------------------------------------------------------------------
     def momentary_curve(self, x: np.ndarray) -> np.ndarray:
         """Per-sample momentary loudness in LUFS; advances the meter state and position."""
+        return self._measure(np.asarray(x, dtype=np.float64))[0]
+
+    def _measure(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (momentary loudness per sample, K-weighted power per sample); advances position."""
         weighted = self._kfilter.process(x)
-        averaged = self._momentary.process(np.square(weighted))
+        power = np.square(weighted)
+        averaged = self._momentary.process(power)
         idx = np.arange(self._pos + 1, self._pos + x.size + 1, dtype=np.float64)
         bias = -np.expm1(-idx / self._momentary_tau)       # 1 - a**(n+1), never 0 for n >= 0
         self._pos += x.size
-        return LOUDNESS_OFFSET_DB + power_to_db(averaged / bias)
+        return LOUDNESS_OFFSET_DB + power_to_db(averaged / bias), power
+
+    def _interval_loudness(self, power_segment: np.ndarray) -> float:
+        """Loudness of the interval that just ended (partial sums carried across blocks)."""
+        total = self._interval_sum + float(np.sum(power_segment))
+        count = self._interval_count + power_segment.size
+        self._interval_sum = 0.0
+        self._interval_count = 0
+        if count == 0:
+            return DB_FLOOR_DBFS
+        return LOUDNESS_OFFSET_DB + float(power_to_db(total / count))
 
     def speech_loudness(self) -> float:
         """Smoothed loudness of the un-gated intervals (DB_FLOOR_DBFS before any speech)."""
@@ -180,42 +221,72 @@ class Normalizer(StageBase):
         self._speech_power = 10.0 ** ((loudness_db - LOUDNESS_OFFSET_DB) / 10.0) * bias
 
     def noise_floor(self) -> float:
-        """Measured floor estimate (sliding minimum of the momentary loudness, slow rise)."""
-        return self._floor_raw_db if self._floor_known else DB_FLOOR_DBFS
+        """Floor estimate in LUFS (DB_FLOOR_DBFS until the first plateau has been seen)."""
+        return self._floor_db if self._floor_known else DB_FLOOR_DBFS
 
-    def _update_floor(self, momentary_db: float) -> None:
-        if momentary_db <= DB_FLOOR_DBFS:
-            return                                   # no signal seen yet (start-up sentinel)
-        self._floor_ring[self._floor_index] = momentary_db
+    def _floor_usable(self) -> bool:
+        """The floor drives gate, cap and low-SNR state only once modulated speech has been learnt.
+
+        A stationary test tone is itself a plateau; without this guard it would be
+        taken for a loud room and gate itself. Real speech is modulated by > 7 LU
+        within a second, so the guard opens with the first learnt syllables.
+        """
+        return self._floor_known and self._modulated_seen and self._speech_count > 0
+
+    def snr_lu(self) -> float:
+        """Speech reference minus floor estimate (inf while one of them is unknown)."""
+        if not self._floor_usable():
+            return math.inf
+        return self.speech_loudness() - self._floor_db
+
+    def _update_floor(self, interval_db: float) -> None:
+        """Feed one 10 ms interval loudness; update the plateau detector and the floor estimate."""
+        self._interval_index += 1
+        self._plateau_ring[self._plateau_index] = interval_db
+        self._plateau_index = (self._plateau_index + 1) % self._plateau_ring.size
+        self._plateau_count = min(self._plateau_count + 1, self._plateau_ring.size)
+        candidate = np.inf
+        if self._plateau_count == self._plateau_ring.size:
+            high = float(np.max(self._plateau_ring))
+            if high - float(np.min(self._plateau_ring)) <= PLATEAU_RANGE_LU:
+                candidate = high                     # stationary for a whole second: room floor
+        self._floor_ring[self._floor_index] = candidate
         self._floor_index = (self._floor_index + 1) % self._floor_ring.size
         window_min = float(np.min(self._floor_ring))
+        if not math.isfinite(window_min):
+            return                                   # no plateau within the window: keep the estimate
         rise = FLOOR_RISE_LU_PER_S * self._interval_s
         if not self._floor_known:
-            floor = window_min
+            self._floor_db = window_min
             self._floor_known = True
             self._floor_stale = 0
-        elif window_min <= self._floor_raw_db + rise:
-            floor = window_min                       # follows a quieter room at once
+        elif window_min <= self._floor_db + rise:
+            self._floor_db = window_min              # follows a quieter room at once
             self._floor_stale = 0
         else:
-            # everything in the window is louder than the estimate: rise slowly, and once
-            # the estimate has been unconfirmed for a whole window it is stale (the pause
-            # it came from left the window) and the window minimum is accepted outright
+            # every plateau in the window is louder than the estimate: rise slowly, and once
+            # the estimate has been unconfirmed for a whole window it is stale (the pause it
+            # came from left the window) and the window minimum is accepted outright
             self._floor_stale += 1
-            floor = window_min if self._floor_stale >= self._floor_ring.size else self._floor_raw_db + rise
-        self._floor_raw_db = floor
-        if self._speech_count > 0:
-            floor = min(floor, self.speech_loudness() - FLOOR_BELOW_SPEECH_LU)
-        self._floor_db = floor
+            if self._floor_stale >= self._floor_ring.size:
+                self._floor_db = window_min
+            else:
+                self._floor_db += rise
 
-    def _grid_update(self, momentary_db: float, gain_db: float) -> None:
+    def _update_low_snr(self) -> None:
+        snr = self.snr_lu()
+        if self._low_snr:
+            self._low_snr = snr < LOW_SNR_EXIT_LU
+        else:
+            self._low_snr = snr < LOW_SNR_ENTER_LU
+
+    def _grid_update(self, momentary_db: float, interval_db: float, gain_db: float) -> None:
         """Gate decision and new gain target at one grid point (``gain_db`` = gain right now)."""
-        self._update_floor(momentary_db)
+        self._update_floor(interval_db)
+        self._update_low_snr()
         gate = self.gate_lufs
-        measured_gate = self.gate_lufs
-        if self._speech_count > 0:
+        if self._floor_usable():
             gate = max(gate, self._floor_db + self.gate_margin_lu)
-            measured_gate = max(measured_gate, self._floor_raw_db + self.gate_margin_lu)
         self._effective_gate = gate
         absolute = momentary_db < gate
         below_reference = self._speech_count > 0 and momentary_db < self.speech_loudness() - RELATIVE_GATE_LU
@@ -224,30 +295,39 @@ class Normalizer(StageBase):
         if falling and self._speech_count > 0 and momentary_db >= self.speech_loudness():
             falling = False   # still above the speech loudness: a syllable, not a decay into a pause
         self._gated = absolute or below_reference
-        if below_reference and momentary_db >= measured_gate:
-            # Clearly above the measured room floor, yet more than 10 LU under the reference:
-            # a speaker who became quieter. Let the reference sink towards the signal (never
-            # below measured gate + 10 LU, so the relative gate stays above the absolute one).
+        if below_reference and momentary_db >= gate and not falling and not self._low_snr:
+            # Steady or rising, above the room floor, yet more than 10 LU under the reference:
+            # a speaker who became quieter (decays into pauses are excluded). Let the reference
+            # sink towards the signal, never below gate + 10 LU (the relative gate stays above
+            # the absolute one).
             decayed = max(momentary_db, self.speech_loudness() - REFERENCE_DECAY_LU_PER_S * self._interval_s,
-                          measured_gate + RELATIVE_GATE_LU)
+                          gate + RELATIVE_GATE_LU)
             self._set_speech_loudness(decayed)
         if self._gated:
             self._target_db = gain_db                # pause: freeze
             return
-        if not falling:
+        if not falling and not self._low_snr:
             # The speech loudness is learnt from rising/steady intervals only: the decay
-            # phases into pauses would drag it down and weaken the relative gate.
+            # phases into pauses would drag it down and weaken the relative gate. In the
+            # low-SNR state nothing is learnt: what passes the gate may be the room.
             power = 10.0 ** ((momentary_db - LOUDNESS_OFFSET_DB) / 10.0)
             self._speech_power = self._speech_coef * self._speech_power + (1.0 - self._speech_coef) * power
             self._speech_count += 1
+            # modulation check only on a full ring that lies behind the filter start-up
+            # transient (the first ring after a (re)start would read the transient as modulation)
+            if (not self._modulated_seen and self._interval_index >= 2 * self._plateau_ring.size
+                    and float(np.max(self._plateau_ring)) - float(np.min(self._plateau_ring)) > PLATEAU_RANGE_LU):
+                self._modulated_seen = True
         if self._speech_count == 0:
             self._target_db = gain_db                # nothing learnt yet (first interval is falling)
             return
-        gain_cap = min(self.max_gain_db, self.target_lufs - PAUSE_HEADROOM_LU - self._floor_db)
+        gain_cap = self.max_gain_db
+        if self._floor_usable() and not self._low_snr:
+            gain_cap = min(gain_cap, self.target_lufs - PAUSE_HEADROOM_LU - self._floor_db)
         gain_cap = max(gain_cap, self.min_gain_db)
         target = float(np.clip(self.target_lufs - self.speech_loudness(), self.min_gain_db, gain_cap))
-        if falling:
-            target = min(target, gain_db)             # never climb on a decaying envelope
+        if falling or self._low_snr:
+            target = min(target, gain_db)             # never climb on a decaying envelope or in a loud room
         self._target_db = target
 
     # -- processing --------------------------------------------------------------------
@@ -257,24 +337,28 @@ class Normalizer(StageBase):
         if n == 0:
             return x
         start = self._pos                     # absolute index of x[0]
-        momentary = self.momentary_curve(x)
+        momentary, power = self._measure(x)
         gains = np.empty(n, dtype=np.float64)
         grid = self._update_samples
         # bypass: measuring continues (gate state, speech loudness), the gain stays where it is
         up_step = self._up_step if self.enabled else 0.0
         down_step = self._down_step if self.enabled else 0.0
         i = 0
+        seg_start = 0
         gain = self._gain_db
         while i < n:
             abs_i = start + i
             if abs_i % grid == 0:
                 reference = momentary[i - 1] if i > 0 else self._last_momentary
-                self._grid_update(float(reference), gain)
+                self._grid_update(float(reference), self._interval_loudness(power[seg_start:i]), gain)
+                seg_start = i
             seg_end = min(n, (abs_i // grid + 1) * grid - start)
             steps = np.arange(1, seg_end - i + 1, dtype=np.float64)
             np.clip(self._target_db, gain - down_step * steps, gain + up_step * steps, out=gains[i:seg_end])
             gain = float(gains[seg_end - 1])
             i = seg_end
+        self._interval_sum += float(np.sum(power[seg_start:]))
+        self._interval_count += n - seg_start
         self._last_momentary = float(momentary[-1])
         self._gain_db = gain
         if not self.enabled:
@@ -289,6 +373,8 @@ class Normalizer(StageBase):
             "momentary_lufs": self._last_momentary,
             "noise_floor_lufs": self.noise_floor(),
             "effective_gate_lufs": float(self._effective_gate),
+            "snr_lu": self.snr_lu(),
+            "low_snr": float(self._low_snr),
             "gated": float(self._gated),
         }
 
@@ -296,6 +382,12 @@ class Normalizer(StageBase):
         self._kfilter.reset()
         self._momentary.reset()
         self._pos = 0
+        self._interval_sum = 0.0
+        self._interval_count = 0
+        self._plateau_ring[...] = np.nan
+        self._plateau_index = 0
+        self._plateau_count = 0
+        self._interval_index = 0
         self._last_momentary = DB_FLOOR_DBFS
         self._prev_momentary = DB_FLOOR_DBFS
         self._gated = True
@@ -313,8 +405,9 @@ class Normalizer(StageBase):
         self._speech_count = 0
         self._floor_ring[...] = np.inf
         self._floor_index = 0
-        self._floor_raw_db = DB_FLOOR_DBFS
         self._floor_db = DB_FLOOR_DBFS
         self._floor_known = False
         self._floor_stale = 0
+        self._low_snr = False
+        self._modulated_seen = False
         self._effective_gate = self.gate_lufs

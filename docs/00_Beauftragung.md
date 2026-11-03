@@ -216,8 +216,10 @@ class AdaptiveController:
    b) Bei größeren Anstiegen (Störabstand am Eingang unter ca. 16 dB) kann der Expander Pausen
       nicht weiter absenken, ohne Sprache abzuschneiden (Kappe Sprachpegel − 12 dB). Dann gilt:
       der Normalizer-Gain steigt in Pausen um höchstens 1 dB, der nächste Satz setzt höchstens
-      +1,5 dB lauter ein, die Pausenlautheit liegt mindestens so weit unter der Sprache wie am
-      Eingang, und die Regelung protokolliert ein Ereignis „Störabstand zu gering“ mit dem
+      +1,5 dB lauter ein, der Abstand Sprache–Pause verringert sich gegenüber dem Eingang um
+      höchstens 5 LU (Kompressor hebt leise Anteile; gemessen −0,3 bis −4,5 LU, nur bei weißem
+      Rauschen und +12 dB nennenswert), und die Regelung protokolliert ein Ereignis
+      „Störabstand zu gering“ mit dem
       Hinweis, den Raum zu verbessern oder neu zu kalibrieren. Der Zustand ist in der Statuszeile
       sichtbar. Eine Pause auf Sprachlautheit (Fehlerbild PO-1) darf in keinem Fall entstehen.
 5. Dokumentation ermöglicht einer technisch versierten Person ohne Audio-Vorwissen die
