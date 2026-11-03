@@ -209,9 +209,17 @@ class AdaptiveController:
    plus absolute Pausenobergrenze._
 4. Adaptive Regelung: in Simulation konvergiert sie innerhalb der Grenzen, oszilliert nicht,
    greift in der Lernphase nicht ein, protokolliert jede Änderung mit Grund. **Raumänderung im
-   Betrieb:** Wird der Rauschteppich nach der Kalibrierung um 8–12 dB lauter (Lüfter, Fenster),
-   darf die Pausenlautheit nach der Kette die Sprachlautheit − 15 LU nicht überschreiten und der
-   nächste Satz nicht lauter als +1,5 dB einsetzen (Ergänzung 2026-11-03, PO Runde 2).
+   Betrieb** (Ergänzung 2026-11-03, PO Runde 2, präzisiert nach PO Runde 3):
+   a) Wird der Rauschteppich nach der Kalibrierung um bis zu 8 dB lauter, darf die Pausenlautheit
+      nach der Kette die Sprachlautheit − 15 LU nicht überschreiten und der nächste Satz nicht
+      lauter als +1,5 dB einsetzen.
+   b) Bei größeren Anstiegen (Störabstand am Eingang unter ca. 16 dB) kann der Expander Pausen
+      nicht weiter absenken, ohne Sprache abzuschneiden (Kappe Sprachpegel − 12 dB). Dann gilt:
+      der Normalizer-Gain steigt in Pausen um höchstens 1 dB, der nächste Satz setzt höchstens
+      +1,5 dB lauter ein, die Pausenlautheit liegt mindestens so weit unter der Sprache wie am
+      Eingang, und die Regelung protokolliert ein Ereignis „Störabstand zu gering“ mit dem
+      Hinweis, den Raum zu verbessern oder neu zu kalibrieren. Der Zustand ist in der Statuszeile
+      sichtbar. Eine Pause auf Sprachlautheit (Fehlerbild PO-1) darf in keinem Fall entstehen.
 5. Dokumentation ermöglicht einer technisch versierten Person ohne Audio-Vorwissen die
    Einrichtung auf dem Mac in unter 30 Minuten.
 6. Die Reihenfolge der Kette entspricht dem Ausgangsbild.
