@@ -248,10 +248,22 @@ def test_longest_pause_prefers_a_pause_after_speech():
     assert span is not None
     assert span[0] == pytest.approx(32.0, abs=0.3)
     assert span[1] == pytest.approx(38.0, abs=0.3)
-    # With only leading silence, that silence is the only candidate.
+    # Leading silence never counts: before the first sentence the chain has not
+    # released or gated anything yet, so nothing is measurable there.
     lead_only = synth.make_speech_like(60.0, SR, seed=3, lead_silence_s=10.0)
-    assert meters.longest_pause(lead_only, SR, 5.0) == pytest.approx((0.0, 10.0), abs=0.3)
+    assert meters.longest_pause(lead_only, SR, 5.0) is None
     assert meters.longest_pause(synth.make_speech_like(30.0, SR, seed=3), SR, 5.0) is None
+    assert meters.longest_pause(np.random.default_rng(1).standard_normal(20 * SR) * 0.01, SR, 5.0) is None
+
+
+def test_band_peak_frames_share_one_core_with_the_percentile_measure():
+    x = synth.make_speech_like(20.0, SR, sibilance_db=0.0, seed=4)
+    peaks = meters.band_peak_frames_dbfs(x, SR, 6500.0, 1.0)
+    assert peaks.shape == (400,)
+    mask, _ = meters.speech_activity(x, SR)
+    assert meters.band_peak_dbfs(x, SR, 6500.0, 1.0) == pytest.approx(np.percentile(peaks[mask], 95.0))
+    frame = np.array([0.0, 0.5, -0.25])
+    assert meters.band_peak_frame_db(frame) == pytest.approx(20 * np.log10(0.5))
 
 
 def test_pause_loudness_measures_the_noise_in_the_pause():

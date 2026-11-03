@@ -36,13 +36,13 @@ from voicechain.dsp.chain import Chain
 # Control-law constants (see docs/03 for the German explanation)
 # --------------------------------------------------------------------------- #
 
-#: Speech RMS after input trim (memory/04: -20 dBFS +-3 dB). Leaves ~14 dB of
-#: headroom for speech peaks (crest factor of speech ~12-15 dB) before the limiter.
+#: Speech RMS after input trim (project reference, docs/02: -20 dBFS +-3 dB). Leaves
+#: ~14 dB of headroom for speech peaks (crest factor of speech ~12-15 dB) before the limiter.
 REFERENCE_SPEECH_LEVEL_DBFS = -20.0
 #: Input trim range: -12 dB catches hot gain settings, +24 dB quiet USB preamps.
 TRIM_BOUNDS_DB = (-12.0, 24.0)
 #: Expander threshold above the noise floor. Common practice for gate/expander
-#: thresholds is 8-12 dB above the noise floor (E1, memory/04): the expander
+#: thresholds is 8-12 dB above the noise floor (docs/02, expander): the expander
 #: stays closed during noise fluctuation (+-3 dB for fan/room noise). 10 dB is
 #: chosen because the chain's static curve (ratio 2.5, knee 6 dB, Giannoulis)
 #: attenuates a signal 10 dB below the threshold by 15 dB, which leaves enough
@@ -61,7 +61,16 @@ SIBILANCE_REFERENCE_DB = -15.0
 #: Minimum gain reduction the de-esser should reach on the loud sibilants
 #: (95th percentile of the band peaks, see meters.band_peak_dbfs).
 DEESSER_MIN_REDUCTION_DB = 4.0
-#: De-esser centre frequency limits (memory/04: 5-9 kHz).
+#: For a voice without a sibilance problem the de-esser rests: its threshold sits
+#: this far *above* the loud sibilants' band peak, so only outliers (a sharp "s"
+#: into the microphone) are touched. Assumption: 2 dB above the 95th percentile
+#: leaves the normal sibilants alone while still catching the rare louder ones.
+DEESSER_REST_MARGIN_DB = 2.0
+#: Frames whose band peak lies within this margin of the loud-sibilant level are
+#: treated as sibilant frames (excluded from the high-shelf timbre measurement,
+#: which must not see the sibilants the de-esser handles). Assumption: 6 dB.
+SIBILANT_FRAME_MARGIN_DB = 6.0
+#: De-esser centre frequency limits (sibilance band of the NT-USB, docs/02: 5-9 kHz).
 DEESSER_FREQ_BOUNDS_HZ = (5000.0, 9000.0)
 #: Band width used by analyze() when no configuration is given; equals the
 #: shipped default so stand-alone analyses match the calibrated chain.
@@ -70,7 +79,7 @@ DEESSER_ANALYSIS_BANDWIDTH_OCT = 1.0
 #: uses a sample-peak detector; syllable peaks of speech lie ~10 dB above the
 #: frame RMS (measured crest of 50 ms frames, see ``speech_crest_db``), so a
 #: threshold *at* the RMS level already reduces the peaks by ~6 dB at 3:1.
-#: 0 dB matches memory/04 (speech -20 dBFS RMS, threshold -20 dBFS). A margin
+#: 0 dB matches the shipped default (speech -20 dBFS RMS, threshold -20 dBFS). A margin
 #: of 6 dB below the RMS (first draft) gave ~10 dB gain reduction and destroyed
 #: the expander's signal-to-noise gain (measured on the real chain: +3 dB instead
 #: of +7 dB), so it was dropped.
@@ -93,6 +102,10 @@ EQ_CORRECTION_FRACTION = 0.5
 EQ_MIN_DEVIATION_DB = 1.0
 #: Hard limit per EQ band (task specification).
 EQ_MAX_GAIN_DB = 4.0
+#: The 10 kHz shelf cut is limited harder: together with the de-esser a deep
+#: top-octave cut makes a voice dull, and the band is dominated by sibilants and
+#: preamp noise that the measurement can only partly exclude. Assumption: 3 dB.
+EQ_HIGH_SHELF_MAX_CUT_DB = 3.0
 #: Default Q values when a band has to be created (RBJ cookbook typical values).
 EQ_SHELF_Q = 0.7
 EQ_PEAK_Q = 1.0
@@ -126,11 +139,12 @@ NORMALIZER_GATE_MIN_LUFS = -40.0
 NORMALIZER_GATE_SPEECH_MARGIN_LU = 15.0
 #: Normalizer gain limit: the pause loudness plus the maximum gain must stay
 #: this far below the target, so the normalizer can never lift room noise to
-#: speech loudness (PO-7).
+#: speech loudness even if its gate failed to close.
 NORMALIZER_PAUSE_HEADROOM_LU = 6.0
 NORMALIZER_MAX_GAIN_LIMIT_DB = 12.0
 
-#: Acceptance criteria (docs/00 section 6.3 and memory/04).
+#: Acceptance criteria (docs/00 section 6.3). TRUE_PEAK_TOLERANCE_DB is the single
+#: source for the CLI/self-test as well.
 NOISE_FLOOR_MIN_REDUCTION_DB = 6.0
 PAUSE_LOUDNESS_MARGIN_LU = 20.0
 MIN_PAUSE_S = 5.0
@@ -243,21 +257,23 @@ def deesser_overshoot_db(ratio: float) -> float:
 
 
 def deesser_threshold_target(band_peak_dbfs: float, sibilance_ratio_db: float,
-                             ratio: float, default_threshold_db: float) -> tuple[float, bool]:
+                             ratio: float) -> tuple[float, bool]:
     """De-esser threshold from the measured band peak level of the loud sibilants.
 
     ``band_peak_dbfs`` is what the de-esser's peak detector sees on the loud
     sibilants (95th percentile of the 50 ms frame peaks of the band-passed
     signal, after the input trim). Returns ``(threshold_db, engaged)``: if the
-    sibilance ratio is at or below the reference, the voice needs no de-essing
-    and the default threshold is returned; otherwise the threshold is placed
+    sibilance ratio is above the reference the threshold is placed
     ``deesser_overshoot_db(ratio)`` below the peak so those sibilants receive
-    at least ``DEESSER_MIN_REDUCTION_DB`` (hard knee: reduction = (L - T) * (1 - 1/R)).
-    Bounds are applied by the caller.
+    at least ``DEESSER_MIN_REDUCTION_DB`` (hard knee: reduction = (L - T) * (1 - 1/R));
+    otherwise the voice needs no de-essing and the threshold rests
+    ``DEESSER_REST_MARGIN_DB`` *above* the peak, touching only outliers. Both
+    branches derive from the same measurement, so the de-esser never works
+    harder on a clean voice than on a sibilant one. Bounds are applied by the caller.
     """
     overshoot = deesser_overshoot_db(ratio)
     if sibilance_ratio_db <= SIBILANCE_REFERENCE_DB:
-        return float(default_threshold_db), False
+        return float(band_peak_dbfs + DEESSER_REST_MARGIN_DB), False
     return float(band_peak_dbfs - overshoot), True
 
 
@@ -377,14 +393,38 @@ def analyze(x: np.ndarray, sample_rate: int, deesser_freq_hz: float | None = Non
     if pause_span is not None:
         pause = meters.pause_loudness_lufs(x, sample_rate, *pause_span)
 
-    def band_info(lo: float, hi: float) -> dict:
-        energy = meters.band_energies_db(x, sample_rate, [lo, hi])[0]
+    # Sibilant frames: active frames whose band peak lies within
+    # SIBILANT_FRAME_MARGIN_DB of the loud-sibilant level. The high-shelf band is
+    # measured without them (the de-esser handles sibilants; the shelf must
+    # describe the timbre of the voice, not its "s" sounds).
+    band_peaks = meters.band_peak_frames_dbfs(x, sample_rate, band_freq, deesser_bandwidth_oct)
+    band_peak_p95 = float(np.percentile(band_peaks[mask], meters.BAND_PEAK_PERCENTILE)) if np.any(mask) \
+        else float(np.percentile(band_peaks, meters.BAND_PEAK_PERCENTILE))
+    sibilance_ratio = meters.sibilance_ratio_db(x, sample_rate)
+    # Only a sibilant voice has frames the de-esser treats; a clean voice's band
+    # peaks are plain speech and stay in the timbre measurement.
+    if sibilance_ratio > SIBILANCE_REFERENCE_DB:
+        sibilant = mask & (band_peaks >= band_peak_p95 - SIBILANT_FRAME_MARGIN_DB)
+    else:
+        sibilant = np.zeros_like(mask)
+    non_sibilant = mask & ~sibilant
+    sibilant_ratio = float(np.sum(sibilant) / max(1, np.sum(mask)))
+
+    def band_info(lo: float, hi: float, frame_mask=None) -> dict:
+        energy = meters.band_energies_db(x, sample_rate, [lo, hi], frame_mask=frame_mask)[0]
         return {"lo_hz": lo, "hi_hz": hi, "centre_hz": math.sqrt(lo * hi),
                 "energy_db": energy, "density_db": energy - 10.0 * math.log10(hi - lo)}
 
     eq_bands = {}
     for kind, fc, lo, hi in _usable_eq_bands(sample_rate):
-        eq_bands[f"{kind}@{fc:.0f}"] = {"type": kind, "freq_hz": fc, **band_info(lo, hi)}
+        info = {"type": kind, "freq_hz": fc}
+        if kind == "high_shelf" and np.any(non_sibilant):
+            info.update(band_info(lo, hi, non_sibilant))
+            info["excluded_sibilant_ratio"] = sibilant_ratio
+        else:
+            info.update(band_info(lo, hi))
+            info["excluded_sibilant_ratio"] = 0.0
+        eq_bands[f"{kind}@{fc:.0f}"] = info
     return {
         "duration_s": x.size / sample_rate,
         "sample_rate": int(sample_rate),
@@ -401,11 +441,12 @@ def analyze(x: np.ndarray, sample_rate: int, deesser_freq_hz: float | None = Non
         "speech_activity_ratio": float(np.mean(mask)) if mask.size else 0.0,
         "f0_hz": f0,
         "voiced_ratio": voiced_ratio,
-        "sibilance_ratio_db": meters.sibilance_ratio_db(x, sample_rate),
+        "sibilance_ratio_db": sibilance_ratio,
         "sibilance_centroid_hz": centroid,
-        "sibilant_band_peak_dbfs": meters.band_peak_dbfs(x, sample_rate, band_freq, deesser_bandwidth_oct),
+        "sibilant_band_peak_dbfs": band_peak_p95,
         "sibilant_band_freq_hz": band_freq,
         "sibilant_band_width_oct": float(deesser_bandwidth_oct),
+        "sibilant_frame_ratio": sibilant_ratio,
         "spectral_tilt_db_per_oct": meters.spectral_tilt_db_per_oct(x, sample_rate),
         "integrated_lufs": meters.integrated_lufs(x, sample_rate),
         "short_term_lufs_max": float(np.max(st_series)) if st_series.size else DB_FLOOR,
@@ -488,9 +529,8 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
         f"Schwerpunkt der Zischenergie 4–10 kHz bei {centroid:.0f} Hz, begrenzt auf "
         f"{DEESSER_FREQ_BOUNDS_HZ[0]:.0f}…{DEESSER_FREQ_BOUNDS_HZ[1]:.0f} Hz → {de_freq:.0f} Hz.")
     de_ratio = float(de["ratio"])
-    de_default = float(de["threshold_db"])
     band_peak_after = float(m["sibilant_band_peak_dbfs"]) + trim
-    de_raw, engaged = deesser_threshold_target(band_peak_after, sib, de_ratio, de_default)
+    de_raw, engaged = deesser_threshold_target(band_peak_after, sib, de_ratio)
     de_thr = clamp(de_raw, de_lo, de_hi)
     de["threshold_db"] = round(de_thr, 2)
     if engaged:
@@ -503,8 +543,10 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
             f"Grenzen {de_lo:.0f}…{de_hi:.0f} → {de_thr:.1f} dBFS.")
     else:
         reasons["chain.deesser.threshold_db"] = (
-            f"Zischanteil {sib:.1f} dB liegt nicht über der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB (Annahme); "
-            f"Standardschwelle {de_default:.1f} dBFS bleibt (Grenzen {de_lo:.0f}…{de_hi:.0f} → {de_thr:.1f}).")
+            f"Zischanteil {sib:.1f} dB liegt nicht über der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB (Annahme): "
+            f"kein Zischproblem. Der De-Esser bleibt in Ruhe: Schwelle = Spitzenpegel der lauten Zischlaute im "
+            f"De-Esser-Band nach Trim {band_peak_after:.1f} dBFS + {DEESSER_REST_MARGIN_DB:.0f} dB (Annahme) = "
+            f"{de_raw:.1f}, nur Ausreißer werden angefasst; Grenzen {de_lo:.0f}…{de_hi:.0f} → {de_thr:.1f} dBFS.")
 
     # 4. EQ: the measured correction is *added* to the base value of the matching
     # band. The base value describes the intended voicing for the codec
@@ -556,15 +598,19 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
             created = False
         base_gain = float(band.get("gain_db", 0.0))
         hi_gain = 0.0 if cut_only else EQ_MAX_GAIN_DB
-        gain = clamp(base_gain + correction, -EQ_MAX_GAIN_DB, hi_gain)
+        lo_gain = -EQ_HIGH_SHELF_MAX_CUT_DB if kind == "high_shelf" else -EQ_MAX_GAIN_DB
+        gain = clamp(base_gain + correction, lo_gain, hi_gain)
         band["gain_db"] = round(gain, 2)
+        excluded = float(info.get("excluded_sibilant_ratio", 0.0))
         reasons[key] = prefix + (
             f"Korrektur {EQ_CORRECTION_FRACTION:.0%} davon, Totzone ±{EQ_MIN_DEVIATION_DB:.0f} dB"
             + (", Shelf nur als Absenkung" if cut_only else "")
+            + (f", gemessen ohne Zischrahmen ({excluded:.0%} der aktiven Rahmen ausgeschlossen)"
+               if kind == "high_shelf" else "")
             + f" → {correction:+.1f} dB "
             + (f"auf neues Band bei {fc:.0f} Hz" if created
                else f"zum Basiswert {base_gain:+.1f} dB des Bands bei {label_freq:.0f} Hz")
-            + f"; Grenze {-EQ_MAX_GAIN_DB:+.0f}…{hi_gain:+.0f} dB → {gain:+.1f} dB.")
+            + f"; Grenze {lo_gain:+.0f}…{hi_gain:+.0f} dB → {gain:+.1f} dB.")
 
     # 5. Compressor
     comp = chain["compressor"]
@@ -590,7 +636,7 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
     norm = chain["normalizer"]
     reasons["chain.normalizer.target_lufs"] = (
         f"Bleibt bei {float(norm['target_lufs']):.0f} LUFS (Zielwert aus Konfiguration, "
-        "memory/04: −18 LUFS ± 2 LU für Konferenz, E3).")
+        "Praxiswert −18 LUFS ± 2 LU für Konferenzsysteme, E3).")
     reasons["chain.limiter.ceiling_dbfs"] = (
         f"Bleibt bei {float(chain['limiter']['ceiling_dbfs']):.0f} dBTP (True-Peak-Obergrenze, E3).")
 
@@ -604,7 +650,9 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
 
 def refine_normalizer(cfg: dict, after_measurements: dict) -> dict:
     """Set ``normalizer.gate_lufs`` and ``normalizer.max_gain_db`` from the pause
-    loudness measured after a first pass through the chain (PO-1 d / PO-7).
+    loudness measured after a first pass through the chain *with the normalizer
+    disabled* (the pause level the normalizer's gate and gain limit must be
+    designed for is the one at its input, without its own gain).
 
     ``after_measurements["pause"]`` must exist (``analyze`` of the processed
     sample with a pause >= MIN_PAUSE_S). Returns a deep copy with reasons added
@@ -624,8 +672,8 @@ def refine_normalizer(cfg: dict, after_measurements: dict) -> dict:
     norm["max_gain_db"] = round(max_gain, 2)
     reasons = out.setdefault("_calibration", {}).setdefault("reasons", {})
     reasons["chain.normalizer.gate_lufs"] = (
-        f"Pausenlautheit nach Kette (Median der Momentary-Lautheit in der Pause "
-        f"{pause['start_s']:.1f}–{pause['end_s']:.1f} s, erster Durchlauf) {pause_lufs:.1f} LUFS + "
+        f"Pausenlautheit nach Kette ohne Normalizer-Gain (Median der Momentary-Lautheit in der Pause "
+        f"{pause['start_s']:.1f}–{pause['end_s']:.1f} s, erster Durchlauf mit abgeschaltetem Normalizer) {pause_lufs:.1f} LUFS + "
         f"{NORMALIZER_GATE_MARGIN_DB:.0f} dB Abstand (Annahme) = {pause_lufs + NORMALIZER_GATE_MARGIN_DB:.1f}; "
         f"mindestens {NORMALIZER_GATE_MIN_LUFS:.0f} LUFS, höchstens Ziel {target:.0f} − "
         f"{NORMALIZER_GATE_SPEECH_MARGIN_LU:.0f} LU → {gate:.1f} LUFS. Unterhalb hält der Normalizer den Gain, "
@@ -702,13 +750,19 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
         sib_pass = sib_delta < 0.0
         note = "De-Esser aktiv, Zischanteil muss sinken."
     else:
-        sib_pass = sib_delta <= SIBILANCE_MAX_INCREASE_DB
+        # A clean voice stays clean: the chain may shift the band ratio a little
+        # (compression acts more on the loud voiced peaks than on soft fricatives),
+        # as long as the result stays below the sibilance reference, or it may not
+        # get worse by more than SIBILANCE_MAX_INCREASE_DB.
+        sib_pass = (after["sibilance_ratio_db"] <= SIBILANCE_REFERENCE_DB
+                    or sib_delta <= SIBILANCE_MAX_INCREASE_DB)
         note = (f"Zischanteil lag mit {before['sibilance_ratio_db']:.1f} dB unter der Referenz "
-                f"{SIBILANCE_REFERENCE_DB:.0f} dB, De-Esser nicht erforderlich; Kriterium: nicht schlechter "
-                f"als +{SIBILANCE_MAX_INCREASE_DB:.0f} dB.")
+                f"{SIBILANCE_REFERENCE_DB:.0f} dB, De-Esser ruht; Kriterium: nachher weiterhin unter der Referenz "
+                f"oder nicht schlechter als +{SIBILANCE_MAX_INCREASE_DB:.0f} dB.")
     criteria["sibilance_reduced"] = {
         "passed": bool(sib_pass),
-        "target": "Zischanteil ↓" if deesser_needed else f"Zischanteil ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB",
+        "target": ("Zischanteil ↓" if deesser_needed
+                   else f"Zischanteil ≤ {SIBILANCE_REFERENCE_DB:.0f} dB oder ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB"),
         "actual": f"{sib_delta:+.1f} dB ({before['sibilance_ratio_db']:.1f} → {after['sibilance_ratio_db']:.1f} dB)",
         "note": note + (f" Zischspitzen im De-Esser-Band {before['sibilant_band_peak_dbfs']:.1f} → "
                         f"{after['sibilant_band_peak_dbfs']:.1f} dBFS."),
@@ -844,7 +898,12 @@ def run_calibration(wav_path, base_cfg_path, out_cfg_path, report_path, processo
         return y
 
     cfg_first = recommend(measurements, base_cfg)
-    y_first = run_chain(cfg_first)
+    # First pass without the normalizer: the gate and the gain limit are designed
+    # for the pause level at the normalizer's input, not for a level already
+    # lifted by an uncalibrated AGC.
+    cfg_probe = copy.deepcopy(cfg_first)
+    cfg_probe["chain"]["normalizer"]["enabled"] = False
+    y_first = run_chain(cfg_probe)
     de = cfg_first["chain"]["deesser"]
     after_first = analyze(y_first, sr, float(de["freq_hz"]), float(de["bandwidth_oct"]))
     if after_first["pause"] is None:
@@ -899,6 +958,7 @@ _MEASUREMENT_ROWS = (
     ("sibilance_ratio_db", "Zischanteil (5–10 kHz − 0,3–3 kHz)", "{:.1f} dB"),
     ("sibilance_centroid_hz", "Schwerpunkt Zischenergie 4–10 kHz", "{:.0f} Hz"),
     ("sibilant_band_peak_dbfs", "Zischspitzen im De-Esser-Band (95. Perzentil)", "{:.1f} dBFS"),
+    ("sibilant_frame_ratio", "Anteil Zischrahmen an den aktiven Rahmen", "{:.0%}"),
     ("spectral_tilt_db_per_oct", "Spektrale Neigung 200 Hz–8 kHz", "{:.1f} dB/Okt"),
     ("integrated_lufs", "Lautheit integriert (gated)", "{:.1f} LUFS"),
     ("short_term_lufs_max", "Lautheit Short-Term maximal", "{:.1f} LUFS"),
@@ -1019,16 +1079,17 @@ def render_report(wav_path, base_cfg: dict, cfg: dict, measurements: dict,
         "",
         "## 5. Annahmen und Grenzen",
         "",
-        f"- Referenz-Sprachpegel {REFERENCE_SPEECH_LEVEL_DBFS:.0f} dBFS RMS nach Trim (Praxiswert, memory/04).",
+        f"- Referenz-Sprachpegel {REFERENCE_SPEECH_LEVEL_DBFS:.0f} dBFS RMS nach Trim (Praxiswert, docs/02).",
         f"- Zischanteil-Referenz {SIBILANCE_REFERENCE_DB:.0f} dB ist eine Annahme aus dem Langzeit-Sprachspektrum; "
         "die De-Esser-Schwelle wird aus dem gemessenen Spitzenpegel der Zischlaute im De-Esser-Band abgeleitet.",
         f"- EQ-Referenzkurve: flach bis {EQ_REFERENCE_KNEE_HZ:.0f} Hz, {EQ_REFERENCE_SLOPE_MID_DB_PER_OCT:+.0f} dB/Okt bis "
         f"{EQ_REFERENCE_KNEE_HIGH_HZ / 1000:.0f} kHz, darüber {EQ_REFERENCE_SLOPE_HIGH_DB_PER_OCT:+.0f} dB/Okt (Annahme: "
         f"typisches Langzeit-Sprachspektrum fällt oberhalb 4 kHz steiler); nur {EQ_CORRECTION_FRACTION:.0%} der Abweichung "
-        f"werden korrigiert, maximal ±{EQ_MAX_GAIN_DB:.0f} dB; Shelves nur als Absenkung; Low-Shelf nur bei Grundfrequenz "
+        f"werden korrigiert, maximal ±{EQ_MAX_GAIN_DB:.0f} dB; Shelves nur als Absenkung (High-Shelf höchstens "
+        f"−{EQ_HIGH_SHELF_MAX_CUT_DB:.0f} dB, gemessen ohne Zischrahmen); Low-Shelf nur bei Grundfrequenz "
         f"≤ {EQ_LOW_SHELF_MAX_F0_HZ:.0f} Hz.",
-        f"- Normalizer-Gate und -Gainbegrenzung stammen aus der Pausenlautheit nach dem ersten Durchlauf "
-        f"(Abstände {NORMALIZER_GATE_MARGIN_DB:.0f} dB bzw. {NORMALIZER_PAUSE_HEADROOM_LU:.0f} LU, Annahmen).",
+        f"- Normalizer-Gate und -Gainbegrenzung stammen aus der Pausenlautheit nach dem ersten Durchlauf mit "
+        f"abgeschaltetem Normalizer (Abstände {NORMALIZER_GATE_MARGIN_DB:.0f} dB bzw. {NORMALIZER_PAUSE_HEADROOM_LU:.0f} LU, Annahmen).",
         "- Lautheitskriterium: integrierte Lautheit mit BS.1770-Gating (absolut −70 LUFS, relativ −10 LU), also "
         "die Lautheit der Sprache ohne Pausen; der Normalizer regelt auf dieselbe gegatete Sprachlautheit. Ungegatete "
         "3-s-Fenster lesen bei 40 % Pausenanteil 2–3 LU tiefer und sind kein Maßstab. Die Messung 'nachher' läuft "

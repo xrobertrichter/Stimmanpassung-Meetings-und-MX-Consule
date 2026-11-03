@@ -43,7 +43,7 @@ Position, gleicher Raum, gleiche Mikrofoneinstellung wie im Seminar.
 | Inhalt | Normal sprechen wie im Seminar, mit natürlichen Pausen zwischen Sätzen | Sprachpegel und Sprachanteil müssen typisch sein |
 | Zischlaute | Mehrere Sätze mit s/sch/z-Lauten, z. B. „Sechs Schlösser stehen still am See", „Zwischen zwei Zweigen zischt es", „Sie sagte, sie sei seit sechs Stunden hier" | Zischanteil, Schwerpunkt und Spitzenpegel des Zischbands für den De-Esser |
 | Abstand | Wie im Seminar (empfohlen 15–25 cm, leicht seitlich) | Nahbesprechungseffekt und Pegel hängen stark vom Abstand ab |
-| Pegel | Keine Übersteuerung (Spitzen unter −6 dBFS); Rode-Gain nicht nachträglich ändern | Trim wird aus dieser Aufnahme berechnet |
+| Pegel | Keine Übersteuerung (Spitzen unter −3 dBFS, wie README und `record`-Prüfung); Rode-Gain nicht nachträglich ändern | Trim wird aus dieser Aufnahme berechnet |
 
 **Aufnahme unter macOS:** siehe `README.md` und `docs/01_macOS_Setup.md` (eigenes
 Kommando bzw. `afconvert` als Bordmittel für die Umwandlung nach 48 kHz WAV). Verlustbehaftete
@@ -102,14 +102,14 @@ Norm ist, ist dort und hier als **Annahme** markiert.
 
 | Parameter | Regel | Begründung / Annahme |
 |---|---|---|
-| `input_trim.gain_db` | −20 dBFS − gemessener Sprachpegel, begrenzt auf −12…+24 dB | Referenzpegel aktiver Sprache −20 dBFS RMS (memory/04); lässt ~14 dB Headroom für Sprachspitzen |
+| `input_trim.gain_db` | −20 dBFS − gemessener Sprachpegel, begrenzt auf −12…+24 dB | Referenzpegel aktiver Sprache −20 dBFS RMS (Projektreferenz, docs/02); lässt ~14 dB Headroom für Sprachspitzen |
 | `expander.threshold_db` | min(Rauschteppich + 10 dB, Sprachpegel − 12 dB), jeweils nach Trim; Grenzen aus `adaptive.bounds` | Übliche Praxis für Gate/Expander-Schwellen sind 8–12 dB über dem Rauschteppich. Die Kennlinie der Kette (Ratio 2,5, Knie 6 dB) senkt ein Signal 10 dB unter der Schwelle um 15 dB; das lässt Reserve gegen die ~6 dB Kompressor-Reduction (mit 8 dB Abstand maß der Selbsttest 5,8 dB Störabstandsgewinn, mit 10 dB 8,7 dB). 12 dB unter der Sprache bleiben leise Silben erhalten. Bei Störabstand < 22 dB greift die Sprach-Regel, der Expander kann dann wenig tun |
 | `deesser.freq_hz` | Schwerpunkt der Zischenergie 4–10 kHz, begrenzt auf 5–9 kHz | Bandzentrum der gemessenen Zischlaute |
-| `deesser.threshold_db` | nur wenn Zischanteil > −15 dB (**Annahme**, aus dem Langzeit-Sprachspektrum abgeleitet): Schwelle = Spitzenpegel der lauten Zischlaute im De-Esser-Band (nach Trim) − Overshoot, mit Overshoot = 4 dB / (1 − 1/Ratio) (hartes Knie des De-Essers); Grenzen aus `adaptive.bounds` | Der De-Esser misst Sample-Spitzen des Bandsignals; das Modell misst dieselbe Größe (95. Perzentil der 50-ms-Spitzen aktiver Rahmen) und setzt die Schwelle so, dass die lauten Zischlaute mindestens 4 dB Reduktion erhalten, aber nicht jeder Laut am Deckel `max_reduction_db` hängt (gemessen: Median 4,9 dB, 0 % am Deckel). Die Schwelle darf dabei über oder unter dem Startwert liegen. Unterhalb der Referenz: Startwert |
-| EQ | Dichte je Messband relativ zum Ankerband 350–1000 Hz gegen die Referenzkurve „flach bis 500 Hz, −6 dB/Okt bis 4 kHz, darüber −10 dB/Okt" (**Annahme**: typisches Langzeit-Sprachspektrum, das oberhalb 4 kHz steiler fällt); 50 % der Abweichung werden korrigiert (**Annahme**, Sprecherklang soll erhalten bleiben), Totzone ±1 dB, Korrektur wird auf den Basiswert des Bands **addiert**, Ergebnis auf ±4 dB begrenzt. **Low-Shelf 120 Hz und High-Shelf 10 kHz nur als Absenkung** (nie > 0 dB); **Low-Shelf nur bei Grundfrequenz ≤ 150 Hz** (**Annahme**), bei höheren Stimmen enthält das Band 80–170 Hz keine Sprache, sondern Trittschall und Lüfter | Vier Bänder: Low-Shelf 120 Hz (Messband 80–170 Hz), Peak 250 Hz (170–350), Peak 3 kHz (2–4,5 kHz), High-Shelf 10 kHz (7–14 kHz). Vorhandene Basis-Bänder innerhalb ±20 % der Frequenz werden genutzt (z. B. 220 Hz statt 250 Hz), sonst wird ein Band angelegt; ein Band mit 0 dB wird nicht angelegt |
+| `deesser.threshold_db` | nur wenn Zischanteil > −15 dB (**Annahme**, aus dem Langzeit-Sprachspektrum abgeleitet): Schwelle = Spitzenpegel der lauten Zischlaute im De-Esser-Band (nach Trim) − Overshoot, mit Overshoot = 4 dB / (1 − 1/Ratio) (hartes Knie des De-Essers); Grenzen aus `adaptive.bounds` | Der De-Esser misst Sample-Spitzen des Bandsignals; das Modell misst dieselbe Größe (95. Perzentil der 50-ms-Spitzen aktiver Rahmen) und setzt die Schwelle so, dass die lauten Zischlaute mindestens 4 dB Reduktion erhalten, aber nicht jeder Laut am Deckel `max_reduction_db` hängt (gemessen: Median 4,9 dB, 0 % am Deckel). Die Schwelle darf dabei über oder unter dem Startwert liegen. **Unterhalb der Referenz (kein Zischproblem): Schwelle = Spitzenpegel + 2 dB** (**Annahme**), der De-Esser ruht und fasst nur Ausreißer an (gemessen: 0 % der aktiven Rahmen > 1 dB Reduktion statt 100 % mit dem Startwert −30). Der Startwert −30 der YAML gilt nur bis zur Kalibrierung |
+| EQ | Dichte je Messband relativ zum Ankerband 350–1000 Hz gegen die Referenzkurve „flach bis 500 Hz, −6 dB/Okt bis 4 kHz, darüber −10 dB/Okt" (**Annahme**: typisches Langzeit-Sprachspektrum, das oberhalb 4 kHz steiler fällt); 50 % der Abweichung werden korrigiert (**Annahme**, Sprecherklang soll erhalten bleiben), Totzone ±1 dB, Korrektur wird auf den Basiswert des Bands **addiert**, Ergebnis auf ±4 dB begrenzt. **Low-Shelf 120 Hz und High-Shelf 10 kHz nur als Absenkung** (nie > 0 dB), **High-Shelf höchstens −3 dB** (**Annahme**: zusammen mit dem De-Esser klänge mehr dumpf) und sein Messband 7–14 kHz wird **ohne Zischrahmen** gemessen (aktive Rahmen, deren Bandspitze mehr als 6 dB unter dem Zisch-p95 liegt; der Anteil ausgeschlossener Rahmen steht im Bericht); **Low-Shelf nur bei Grundfrequenz ≤ 150 Hz** (**Annahme**), bei höheren Stimmen enthält das Band 80–170 Hz keine Sprache, sondern Trittschall und Lüfter | Vier Bänder: Low-Shelf 120 Hz (Messband 80–170 Hz), Peak 250 Hz (170–350), Peak 3 kHz (2–4,5 kHz), High-Shelf 10 kHz (7–14 kHz). Vorhandene Basis-Bänder innerhalb ±20 % der Frequenz werden genutzt (z. B. 220 Hz statt 250 Hz), sonst wird ein Band angelegt; ein Band mit 0 dB wird nicht angelegt |
 | `compressor.threshold_db` | Sprachpegel nach Trim (−20 dBFS), Grenzen aus `adaptive.bounds` | Der Kompressor der Kette misst Sample-Spitzen; Silbenspitzen liegen ~10 dB über dem RMS (wird gemessen: „Crest-Faktor"). Schwelle auf RMS-Höhe verdichtet nur die Spitzen (~6 dB bei 3:1). Eine Schwelle 6 dB darunter ergab in der Messung ~10 dB Reduktion und machte den Störabstandsgewinn des Expanders zunichte |
 | `compressor.makeup_db` | statische Kennlinie (weiches Knie) am mittleren Silbenspitzenpegel, 0…12 dB | Modell stimmt mit der echten Kette auf ±0,6 dB überein; Ziel „Ausgang ≈ Eingang", den Rest regelt der Normalizer |
-| `normalizer.gate_lufs` | Pausenlautheit nach Kette (Median der Momentary-Lautheit in der Pause, erster Durchlauf) + 8 dB (**Annahme**), mindestens −40 LUFS, höchstens Ziel − 15 LU | Unterhalb des Gates hält der Normalizer seinen Gain: Raumrauschen darf das Gate nie öffnen, leise Sprache muss es öffnen |
+| `normalizer.gate_lufs` | Pausenlautheit nach Kette **ohne Normalizer** (erster Durchlauf mit `normalizer.enabled: false`, Median der Momentary-Lautheit in der Pause) + 8 dB (**Annahme**), mindestens −40 LUFS, höchstens Ziel − 15 LU | Gate und Gainbegrenzung gelten für den Pegel am Eingang des Normalizers; würde der erste Durchlauf mit laufendem AGC gemessen, enthielte die Pause dessen noch unkalibrierten Gain (Grenzfall Teppich −38 dBFS: max_gain 0 statt > 0). Unterhalb des Gates hält der Normalizer seinen Gain: Raumrauschen darf das Gate nie öffnen, leise Sprache muss es öffnen |
 | `normalizer.max_gain_db` | Ziel − (Pausenlautheit nach Kette + 6 LU), begrenzt auf 0…12 dB | Der Normalizer kann Rauschen rechnerisch nie auf Sprachlautheit anheben. 0 dB heißt: die Pausen sind in diesem Raum bereits zu laut (Bericht warnt) |
 | `normalizer.target_lufs` | bleibt (Basis: −18 LUFS) | Zielwert aus der Konfiguration (E3) |
 | `limiter.ceiling_dbfs` | bleibt (Basis: −1 dBTP) | True-Peak-Obergrenze (E3) |
@@ -137,7 +137,7 @@ Der Bericht (Pfad aus `--report`, Standard `reports/calibration_report.md`) hat 
    |---|---|---|
    | Störabstand verbessert | Sprachpegel minus Rauschteppich, nachher minus vorher, ≥ 6 dB | Bewertung bei gleichem Sprachpegel, weil der Normalizer leise Aufnahmen insgesamt anhebt; die absoluten Werte stehen daneben |
    | Pausenlautheit nach Kette | Maximum der Momentary-Lautheit in der längsten Pause ≥ 5 s (die ersten 0,5 s werden übersprungen) ≤ Ziel − 20 LU, also −38 LUFS bei −18 LUFS Ziel | Prüft, dass die Kette Pausen nicht anhebt (Normalizer-Gate). Bei Verfehlung steht die Abhilfe im Hinweis: Raum leiser (Lüfter, Abstand) oder `normalizer.max_gain_db` senken |
-   | Zischanteil | gesunken (wenn De-Esser nötig), sonst nicht schlechter als +1 dB | zusätzlich Zischspitzen im De-Esser-Band vorher/nachher |
+   | Zischanteil | gesunken (wenn De-Esser nötig); bei einer Stimme ohne Zischproblem: nachher weiterhin unter der Referenz −15 dB oder nicht schlechter als +1 dB (Kompression hebt leise Frikative relativ zu lauten Vokalen leicht an) | zusätzlich Zischspitzen im De-Esser-Band vorher/nachher |
    | Lautheit im Ziel | integriert −18 LUFS ± 2 LU | Die Lautheitsregelung braucht einige Sekunden, das geht in den integrierten Wert ein |
    | True Peak unter Ceiling | ≤ −1 dBTP (+0,1 dB Messtoleranz) | 4x-Oversampling-Messung |
 
@@ -181,7 +181,10 @@ gewählt (docs/01). Die Statuszeile zeigt einmal pro Sekunde Pegel, Normalizer-G
 Limiter-Eingriff, Xruns und die letzten Änderungen der adaptiven Regelung.
 
 Optionen: `--no-adaptive` schaltet die Regelung ab (feste Werte aus der YAML),
-`--freeze` lässt sie mitlaufen und protokollieren, aber nichts verändern (Abschnitt 10).
+`--freeze` startet sie eingefroren (mitlaufen und protokollieren, nichts verändern, Abschnitt 10).
+Im laufenden Betrieb schaltet das Signal SIGUSR1 den Freeze um, ohne den Stream zu
+unterbrechen: `kill -USR1 <pid>` (die PID steht in der Startmeldung bzw. über `pgrep -f "voicechain run"`);
+der aktuelle Zustand steht in der Statuszeile und als Ereignis `freeze` im JSONL-Log.
 
 ---
 
@@ -209,7 +212,11 @@ mit `snapshot()`:
  "frames": int, "history_s": float}
 ```
 
-Die Runtime legt diesen Schnappschuss alle `interval_s` als `meters["analysis"]` neben die
+**Ergänzung zum Schnittstellenvertrag (Beauftragung §4.2):** `AdaptiveController.update(meters)`
+erwartet neben den Metern aus `chain.get_meters()` den zusätzlichen Schlüssel
+`meters["analysis"]` mit genau diesem Schnappschuss; fehlt er oder ist er noch nicht `ready`,
+regelt der Controller nicht und schreibt `no_analysis` ins Log. Die Runtime legt diesen
+Schnappschuss alle `interval_s` als `meters["analysis"]` neben die
 Meter der Kette (`chain.get_meters()`, deren Stufen Mittel und Maximum der Gain-Reduction
 seit dem letzten Lesen akkumulieren) und ruft `controller.update(meters)` auf. Da der
 Analyzer vor dem Input Trim misst, rechnet der Controller `input_trim.gain_db` auf die Pegel
@@ -228,7 +235,10 @@ Dynamik ≥ 15 dB. Tastaturklicks (3/s, −30 dBFS) lesen sich als „Sprache" b
 15 % Anteil, ein Kollege im Raum oder der Rückkanal über Lautsprecher (−42 dBFS) fallen am Pegel
 durch. Ist die Prüfung negativ, schreibt der Controller je Intervall ein Ereignis
 `implausible_speech` mit den Gründen und ändert De-Esser und Kompressor nicht; der Expander
-folgt weiter dem Rauschteppich, aber ohne die Regel „12 dB unter Sprache". Nach **mehr als
+folgt weiter dem Rauschteppich. Die Kappe „12 dB unter Sprache" bleibt dabei aktiv, solange
+das Gehörte Sprache ist (also auch bei einem Sprecher mit abweichendem Pegel: leiser Sprecher
+−28 dBFS in einem −46-dBFS-Raum → Expander höchstens −40, nicht −36); nur bei Tippen
+(Sprachanteil) oder gleichförmigem Geräusch (Dynamik) entfällt sie. Nach **mehr als
 60 s ohne plausible Sprache** wandern De-Esser- und Kompressor-Schwelle in `max_step_db`-Schritten
 zu ihren kalibrierten Startwerten zurück (Grund `rest`), so dass der Sprecher nach einer
 Zuhörphase die kalibrierte Kette vorfindet.
@@ -238,7 +248,8 @@ Zuhörphase die kalibrierte Kette vorfindet.
 | Parameter | Ziel | Totzone | Grund im Log |
 |---|---|---|---|
 | `expander.threshold_db` | min(Rauschteppich + 10, Sprache − 12) (Konstante `EXPANDER_FLOOR_MARGIN_DB` in calibrate.py, von adaptive.py importiert); ohne plausible Sprache nur Rauschteppich + 10 | ±2 dB | `noise_floor_track` |
-| `deesser.threshold_db` | Zischspitzen im De-Esser-Band (nach Trim) − Overshoot, wenn Zischanteil über der Referenz; sonst zurück zum kalibrierten Ruhewert | ±1,5 dB | `sibilance_track`, `sibilance_rest` |
+| `deesser.threshold_db` | Zischspitzen im De-Esser-Band (nach Trim) − Overshoot, wenn Zischanteil über der Referenz; sonst Zischspitzen + 2 dB (Ruhelage, dieselbe Formel wie die Kalibrierung) | ±1,5 dB | `sibilance_track`, `sibilance_rest` |
+| `normalizer.max_gain_db` | nur durch die Limiter-Schutzregel (unten): Deckel auf den aktuellen Gain, später zurück auf den kalibrierten Wert; innerhalb des `bounds`-Eintrags `normalizer.max_gain_db` (fehlt er, 0 … kalibrierter Wert) | – | `limiter_overload`, `limiter_recovered` |
 | `compressor.threshold_db` | Sprachpegel (nach Trim) | ±2 dB | `speech_level_track` |
 
 Je Intervall höchstens ein Schritt von `max_step_db` (Standard 0,5 dB) in Richtung Ziel, nur
@@ -246,6 +257,14 @@ wenn der Fehler außerhalb der Totzone liegt, nur innerhalb der `bounds`, und nu
 letzte Eingriff an diesem Parameter mindestens zwei Intervalle zurückliegt. Weil die Ziele
 aus dem Eingangssignal berechnet werden (nicht aus dem Ausgang), gibt es keine Rückkopplung
 und kein Pendeln: die Richtung ändert sich nur, wenn sich das Signal ändert.
+
+**Raumänderung im Betrieb (Beauftragung §6.4).** Wird der Rauschteppich nach der Kalibrierung
+8–12 dB lauter, greifen zwei Mechanismen auf verschiedenen Zeitskalen: Der Normalizer schätzt
+seinen Teppich selbst (Meter `normalizer.noise_floor_lufs`, wirksames Gate
+`normalizer.effective_gate_lufs`, Abstand `gate_margin_lu`; Beschreibung in docs/02, Normalizer)
+und hält Pausen ab dem nächsten Satz auf Abstand, ohne auf die Regelung zu warten; die Regelung
+zieht die Expander-Schwelle anschließend langsam nach (unten). Die Kalibrierung begrenzt
+`max_gain_db` zusätzlich so, dass der Teppich rechnerisch nie auf Sprachlautheit kommen kann.
 
 **Konvergenzzeit.** 0,5 dB je zwei Intervalle = 0,5 dB je 4 s, dazu ~10 s, bis die 20-s-Historie
 eine Änderung des Raums abbildet. Beispiel: Lüfter geht an, Rauschteppich +10 dB → das Ziel
@@ -266,7 +285,14 @@ seit dem letzten `get_meters()` akkumuliert sind, also über das ganze Intervall
 |---|---|---|
 | Limiter-Gain-Reduction im Intervall im Mittel > 3 dB | Kompressor-Schwelle wird nicht angehoben; `normalizer.max_gain_db` wird auf den aktuellen Normalizer-Gain gedeckelt (mehr Pegel gibt es nicht); Ereignis `limiter_protect` mit `hold_normalizer_gain: true` | `limiter_overload` |
 | Limiter-Reduction wieder < 1,5 dB | `normalizer.max_gain_db` zurück auf den konfigurierten Wert | `limiter_recovered` |
-| Maximum der Expander-Gain-Reduction > 6 dB in einem Intervall, das durchgehend Sprache enthielt (`recent_speech_ratio` ≥ 95 %; sonst stammt das Maximum aus einer Pause und ist kein Beleg) | Expander-Schwelle sofort um `max_step_db` senken, ohne Totzone und ohne Wartezeit, aber nie unter die untere Grenze | `speech_cut` |
+| Maximum der Expander-Gain-Reduction > 6 dB in **zwei aufeinanderfolgenden** Intervallen, die jeweils vollständig Sprache enthielten (`recent_speech_ratio` ≥ 98 %, also höchstens ein inaktiver 50-ms-Rahmen; eine Pause, die 70 ms nach Intervallbeginn endet, lässt das Gate noch geschlossen und zählt daher nicht). Was die Stufen während der Lernphase akkumuliert haben, wird am Ende der Lernphase verworfen | Expander-Schwelle sofort um `max_step_db` senken, ohne Totzone und ohne Wartezeit, aber nie unter die untere Grenze (Simulation 300 s normale Sprache: 0 Fehlalarme) | `speech_cut` |
+
+Nicht enthalten ist ein **Pump-Detektor** (§3.2 nennt „Pumpen" als Rücknahmegrund): Der
+Normalizer ist feedforward mit höchstens 1 dB/s aufwärts und kann nicht schwingen, der
+Kompressor sitzt mit der Schwelle auf RMS-Höhe und 100 ms Release im unkritischen Bereich;
+eine Schwankungsmessung der Gain-Reduction hätte derzeit keinen Fall, in dem sie eingreifen
+müsste. Hört man dennoch Pumpen, ist `--freeze`/SIGUSR1 das Mittel der Wahl, danach die
+Kompressor-Zeitkonstanten in docs/02 prüfen.
 
 ---
 
@@ -320,6 +346,9 @@ nicht mehr mit der Kalibrierung überein (neu kalibrieren).
   was die Regelung getan hätte.
 - Zum Prüfen einer manuell geänderten YAML: `run --freeze` zeigt im Log die Abweichung der
   Regelziele vom festen Wert.
+- Während des Betriebs umschalten: `kill -USR1 <pid>` friert ein bzw. gibt wieder frei
+  (Ereignis `freeze` im Log, Zustand in der Statuszeile); so lässt sich vor einer
+  Präsentation einfrieren und nach einer Tipp-Phase wieder freigeben, ohne neu zu starten.
 - Dauerhaft fest: `--no-adaptive` oder `adaptive.enabled: false` in der YAML.
 
 ---
@@ -346,9 +375,15 @@ nicht mehr mit der Kalibrierung überein (neu kalibrieren).
   mehr nachgeführt. Das ist gewollt (sonst folgt die Regelung Fremdgeräuschen) und steht im
   Log; Abhilfe ist eine neue Kalibrierung.
 - **Sprachabschneide-Erkennung.** Das Expander-Maximum ist nur in Intervallen aussagekräftig,
-  die durchgehend Sprache enthielten; bei vielen kurzen Pausen wird die Regel selten geprüft.
-  Ein zu hoch stehender Expander fällt dann über die normale Nachführung (Rauschteppich + 10,
-  Sprache − 12) zurück.
+  die vollständig Sprache enthielten, und erst nach zwei solchen Intervallen in Folge; bei
+  vielen kurzen Pausen wird die Regel selten geprüft. Ein zu hoch stehender Expander fällt dann
+  über die normale Nachführung (Rauschteppich + 10, Sprache − 12) zurück.
+- **Kein Pump-Detektor** (siehe §8): Pumpen wird nicht automatisch erkannt; Abhilfe ist Freeze
+  (`--freeze` oder SIGUSR1) und die Prüfung der Zeitkonstanten nach docs/02.
+- **Leiser oder lauterer Sprecher.** Weicht der Pegel dauerhaft um mehr als 6 dB vom
+  kalibrierten ab, bekommt der Sprecher nach 60 s die kalibrierte Kette plus den Ausgleich des
+  Normalizers; Kompressor und De-Esser werden nicht nachgeführt, der Expander behält die
+  Sprach-Kappe. Dauerhaft anderer Abstand: neu kalibrieren.
 - **EQ und De-Esser überlappen.** Die EQ-Messung umfasst die Zischlaute; ein Hochshelf-Cut
   und der De-Esser wirken bei zischenden Stimmen beide. Die Begrenzung auf ±4 dB, nur
   Absenkung für Shelves und 50 % Korrektur halten das im Rahmen.

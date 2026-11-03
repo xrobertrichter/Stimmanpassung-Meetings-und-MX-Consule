@@ -29,7 +29,8 @@ __all__ = [
     "rms_dbfs", "frame_rms_db", "activity_threshold_db", "speech_activity", "noise_floor_dbfs",
     "speech_level_dbfs", "speech_activity_ratio", "dynamic_range_db", "fundamental_frequency_hz",
     "frame_power_spectrum", "active_power_spectrum", "sibilance_ratio_db", "sibilance_centroid_hz",
-    "band_peak_dbfs", "third_octave_density_db", "spectral_tilt_db_per_oct", "band_energies_db",
+    "deesser_band_sos", "band_peak_frame_db", "band_peak_frames_dbfs", "band_peak_dbfs",
+    "third_octave_density_db", "spectral_tilt_db_per_oct", "band_energies_db",
     "longest_pause", "pause_loudness_lufs",
 ]
 
@@ -491,15 +492,23 @@ def frame_power_spectrum(frames: np.ndarray, sample_rate: int) -> tuple[np.ndarr
 
 
 def active_power_spectrum(x: np.ndarray, sample_rate: int,
-                          frame_ms: float = ANALYSIS_FRAME_MS) -> tuple[np.ndarray, np.ndarray]:
+                          frame_ms: float = ANALYSIS_FRAME_MS,
+                          frame_mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Average power spectrum over the active speech frames.
 
-    Falls back to all frames when no speech is detected, so that the spectral
-    functions still describe the recording (e.g. for a noise-only sample).
+    ``frame_mask`` (bool per frame) replaces the activity mask when given, e.g.
+    to exclude sibilant frames. Falls back to all frames when the mask selects
+    none, so that the spectral functions still describe the recording (e.g. for
+    a noise-only sample).
     """
     x = _as_mono_float(x)
-    mask, _ = speech_activity(x, sample_rate, frame_ms)
+    if frame_mask is None:
+        mask, _ = speech_activity(x, sample_rate, frame_ms)
+    else:
+        mask = np.asarray(frame_mask, dtype=bool)
     frames = _frames(x, sample_rate, frame_ms)
+    if mask.shape[0] != frames.shape[0]:
+        raise ValueError(f"frame_mask has {mask.shape[0]} entries, signal has {frames.shape[0]} frames")
     if np.any(mask):
         frames = frames[mask]
     freqs, power = frame_power_spectrum(frames, sample_rate)
@@ -541,24 +550,39 @@ def sibilance_centroid_hz(x: np.ndarray, sample_rate: int) -> float:
     return float(np.sum(freqs[sel] * power[sel]) / total)
 
 
+def deesser_band_sos(freq_hz: float, bandwidth_oct: float, sample_rate: int) -> np.ndarray:
+    """The de-esser's own band-pass design (RBJ, constant 0 dB peak gain)."""
+    return bandpass_sos(freq_hz, bandwidth_to_q(bandwidth_oct, freq_hz, sample_rate), sample_rate)
+
+
+def band_peak_frame_db(band_frame: np.ndarray) -> float:
+    """Sample-peak level (dBFS) of one frame of the band-passed signal.
+
+    Single core of the band-peak measurement: the offline analysis
+    (:func:`band_peak_frames_dbfs`) and the live analyzer apply it per frame, so
+    both see exactly what the de-esser's peak detector sees.
+    """
+    return float(_amp_to_db(float(np.max(np.abs(band_frame)))))
+
+
+def band_peak_frames_dbfs(x: np.ndarray, sample_rate: int, freq_hz: float, bandwidth_oct: float,
+                          frame_ms: float = ANALYSIS_FRAME_MS) -> np.ndarray:
+    """Per-frame band peak levels (dBFS) of the whole signal (all frames)."""
+    x = _as_mono_float(x)
+    band = signal.sosfilt(deesser_band_sos(freq_hz, bandwidth_oct, sample_rate), x)
+    frames = _frames(band, sample_rate, frame_ms)
+    return np.array([band_peak_frame_db(f) for f in frames])
+
+
 def band_peak_dbfs(x: np.ndarray, sample_rate: int, freq_hz: float, bandwidth_oct: float,
                    percentile: float = BAND_PEAK_PERCENTILE,
                    frame_ms: float = ANALYSIS_FRAME_MS) -> float:
-    """Sample-peak level (dBFS) of the band-passed signal in the loud sibilant frames.
-
-    The band-pass is the de-esser's own design (RBJ, ``freq_hz`` /
-    ``bandwidth_oct``), so the value is what the de-esser's peak detector sees.
-    The result is the ``percentile`` (default 95 %) of the per-frame peaks over
-    the active frames (all frames when no speech is detected).
-    """
-    x = _as_mono_float(x)
-    sos = bandpass_sos(freq_hz, bandwidth_to_q(bandwidth_oct, freq_hz, sample_rate), sample_rate)
-    band = signal.sosfilt(sos, x)
+    """``percentile`` (default 95 %) of the per-frame band peaks over the active
+    frames (all frames when no speech is detected): the level of the loud sibilants."""
+    peaks = band_peak_frames_dbfs(x, sample_rate, freq_hz, bandwidth_oct, frame_ms)
     mask, _ = speech_activity(x, sample_rate, frame_ms)
-    frames = np.abs(_frames(band, sample_rate, frame_ms))
     if np.any(mask):
-        frames = frames[mask]
-    peaks = _amp_to_db(np.max(frames, axis=1))
+        peaks = peaks[mask]
     return float(np.percentile(peaks, percentile))
 
 
@@ -600,13 +624,15 @@ def spectral_tilt_db_per_oct(x: np.ndarray, sample_rate: int,
     return float(slope)
 
 
-def band_energies_db(x: np.ndarray, sample_rate: int, edges_hz: list[float]) -> list[float]:
-    """Energy (dBFS) of the active frames in each band between consecutive edges."""
+def band_energies_db(x: np.ndarray, sample_rate: int, edges_hz: list[float],
+                     frame_mask: np.ndarray | None = None) -> list[float]:
+    """Energy (dBFS) of the active frames (or of ``frame_mask``) in each band
+    between consecutive edges."""
     if len(edges_hz) < 2:
         raise ValueError("edges_hz needs at least two values")
     if any(b <= a for a, b in zip(edges_hz[:-1], edges_hz[1:])):
         raise ValueError(f"edges_hz must be strictly increasing, got {edges_hz}")
-    freqs, power = active_power_spectrum(x, sample_rate)
+    freqs, power = active_power_spectrum(x, sample_rate, frame_mask=frame_mask)
     out = []
     for lo, hi in zip(edges_hz[:-1], edges_hz[1:]):
         out.append(float(_power_to_db(_band_power(freqs, power, lo, hi))))
@@ -619,29 +645,32 @@ def band_energies_db(x: np.ndarray, sample_rate: int, edges_hz: list[float]) -> 
 
 def longest_pause(x: np.ndarray, sample_rate: int, min_s: float,
                   frame_ms: float = ANALYSIS_FRAME_MS) -> tuple[float, float] | None:
-    """Longest stretch of inactive frames of at least ``min_s`` seconds.
+    """Longest stretch of inactive frames of at least ``min_s`` seconds *after*
+    the first speech frame.
 
-    Pauses that follow speech are preferred over leading silence, because the
-    behaviour of the chain after a sentence (expander release, normalizer hold)
-    is what a pause measurement is for. Returns ``(start_s, end_s)`` or None.
+    Leading silence does not count: the behaviour of the chain after a sentence
+    (expander release, normalizer hold) is what a pause measurement is for, and
+    before the first sentence neither has happened yet. Returns
+    ``(start_s, end_s)`` or None when there is no speech or no such pause.
     """
     mask, _ = speech_activity(_as_mono_float(x), sample_rate, frame_ms)
+    if not np.any(mask):
+        return None
     frame_s = _frame_length(sample_rate, frame_ms) / sample_rate
     min_frames = int(math.ceil(min_s / frame_s))
+    first_active = int(np.argmax(mask))
     runs: list[tuple[int, int]] = []
     start = None
     for i, active in enumerate(np.concatenate((mask, [True]))):
         if not active and start is None:
             start = i
         elif active and start is not None:
-            if i - start >= min_frames:
+            if i - start >= min_frames and start > first_active:
                 runs.append((start, i))
             start = None
     if not runs:
         return None
-    first_active = int(np.argmax(mask)) if np.any(mask) else 0
-    after_speech = [r for r in runs if r[0] > first_active]
-    pick = max(after_speech or runs, key=lambda r: r[1] - r[0])
+    pick = max(runs, key=lambda r: r[1] - r[0])
     return pick[0] * frame_s, pick[1] * frame_s
 
 

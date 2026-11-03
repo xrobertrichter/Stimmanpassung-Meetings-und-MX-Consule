@@ -49,8 +49,10 @@ class FakeChain:
         return copy.deepcopy(self.meters)
 
 
-def analysis(floor=-60.0, speech=-20.0, sib=-15.0, band_peak=-25.0, active=True, ready=True,
+def analysis(floor=-60.0, speech=-20.0, sib=-15.0, band_peak=-32.0, active=True, ready=True,
              detected=True, ratio=0.7, dynamic=None):
+    """Neutral defaults: speech at the reference, clean voice whose resting de-esser
+    target (band peak + 2 dB = -30) equals the shipped threshold."""
     return {"ready": ready, "speech_detected": detected, "noise_floor_dbfs": floor,
             "speech_level_dbfs": speech, "dynamic_range_db": speech - floor if dynamic is None else dynamic,
             "sibilance_ratio_db": sib, "band_peak_p95_dbfs": band_peak, "band_hz": (6500.0, 1.0),
@@ -149,18 +151,22 @@ def test_deesser_and_compressor_converge_to_targets():
 
 def test_deesser_threshold_can_rise_above_the_calibrated_value_within_bounds():
     cfg, chain, ctrl = make()
-    hi = cfg["adaptive"]["bounds"]["deesser.threshold_db"][1]
-    # Band peak -8 dBFS -> target -13.3, clipped to the -15 bound; start -30.
+    lo, hi = cfg["adaptive"]["bounds"]["deesser.threshold_db"]
+    # Band peak -8 dBFS -> target -13.3 (clipped to the upper bound if it is lower); start -30.
     run(ctrl, lambda i: meters_dict(sib=-4.0, band_peak=-8.0), 80)
-    assert hi - adaptive.DEESSER_DEADZONE_DB <= chain.get_param("deesser", "threshold_db") <= hi
+    target = cal.clamp(-8.0 - OVERSHOOT, lo, hi)
+    thr = chain.get_param("deesser", "threshold_db")
+    assert abs(thr - target) <= adaptive.DEESSER_DEADZONE_DB
+    assert thr > -20.0 and lo <= thr <= hi
 
 
-def test_deesser_returns_to_rest_threshold_when_sibilance_is_low():
+def test_deesser_rests_two_db_above_the_band_peak_when_sibilance_is_low():
     cfg, chain, ctrl = make({"deesser": {"threshold_db": -40.0}})
-    ctrl.rest_values[("deesser", "threshold_db")] = -30.0   # calibrated resting value differs from current
-    changes = run(ctrl, lambda i: meters_dict(sib=-25.0), 40)
+    # Clean voice, band peak -32 -> resting threshold -30 (same formula as the calibration).
+    changes = run(ctrl, lambda i: meters_dict(sib=-25.0, band_peak=-32.0), 40)
     assert abs(chain.get_param("deesser", "threshold_db") - (-30.0)) <= adaptive.DEESSER_DEADZONE_DB
     assert all(c["reason"] == "sibilance_rest" for c in changes if c["stage"] == "deesser")
+    assert len([c for c in changes if c["stage"] == "deesser"]) >= 10
 
 
 def test_no_change_inside_deadzone():
@@ -208,35 +214,40 @@ def test_bounds_are_never_violated():
     assert chain.get_param("compressor", "threshold_db") == pytest.approx(-15.0, abs=adaptive.COMPRESSOR_DEADZONE_DB)
 
 
-def test_apply_clamps_to_bounds_even_for_immediate_steps_m12():
-    """Mutation M12: the safety-net clamp in _apply. speech_cut at the lower bound
-    must not push the expander below the bound (the target clamp in _track is bypassed)."""
+def speech_cut_meters(**kw):
+    """Meters of an interval in which the expander cut speech (max 9 dB, speech throughout)."""
+    return meters_dict(expander_gr=9.0, floor=-90.0, active=True, **kw)
+
+
+def test_apply_clamps_immediate_steps_to_the_bounds():
+    """Safety net independent of the target clamp: a speech_cut step at the lower
+    bound must not push the expander below the bound."""
     cfg, chain, ctrl = make({"expander": {"threshold_db": -70.0}})
     lo = cfg["adaptive"]["bounds"]["expander.threshold_db"][0]
     assert chain.get_param("expander", "threshold_db") == lo
-    changes = ctrl.update(meters_dict(expander_gr=9.0, floor=-90.0, active=True), now=LEARN_S)
-    assert [c for c in changes if c["stage"] == "expander"] == []
+    for k in range(3):   # the rule needs two consecutive intervals; none may move the value
+        changes = ctrl.update(speech_cut_meters(), now=LEARN_S + k * INTERVAL_S)
+        assert [c for c in changes if c["stage"] == "expander"] == []
     assert chain.get_param("expander", "threshold_db") == lo
     # One step above the bound: the immediate step lands exactly on the bound, not below.
     chain.set_param("expander", "threshold_db", lo + 0.3)
-    changes = ctrl.update(meters_dict(expander_gr=9.0, floor=-90.0, active=True), now=LEARN_S + INTERVAL_S)
+    changes = ctrl.update(speech_cut_meters(), now=LEARN_S + 3 * INTERVAL_S)
     assert [c["new"] for c in changes if c["stage"] == "expander"] == [pytest.approx(lo)]
 
 
-def test_value_outside_bounds_is_walked_back_in_steps_bl10():
-    """BL-10: the validator refuses files with values outside bounds; at run time
-    (set_param) the controller walks such a value back, never jumps."""
+def test_value_outside_bounds_is_walked_back_in_steps():
+    """The validator refuses files with values outside bounds; at run time (set_param)
+    the controller walks such a value back step by step, never jumps."""
     cfg, chain, ctrl = make()
-    chain.set_param("deesser", "threshold_db", -10.0)      # above the -15 upper bound
+    chain.set_param("deesser", "threshold_db", -5.0)       # above the upper bound
     chain.history.clear()
     lo_d, hi_d = cfg["adaptive"]["bounds"]["deesser.threshold_db"]
-    changes = run(ctrl, lambda i: meters_dict(sib=-25.0), 40)
+    # Clean voice with band peak -40: rest target -38, far below the bound.
+    changes = run(ctrl, lambda i: meters_dict(sib=-25.0, band_peak=-40.0), 40)
     steps = [c for c in changes if c["stage"] == "deesser"]
-    # Rest value -30 is the target (sibilance below reference): walked down in 0.5 dB
-    # steps; every intermediate value stays inside [old, hi] and never leaves further.
     assert len(steps) >= 10
     assert all(c["new"] - c["old"] == pytest.approx(-STEP_DB) for c in steps)
-    assert all(c["new"] <= -10.0 for c in steps)
+    assert all(c["new"] <= -5.0 for c in steps)
     assert chain.get_param("deesser", "threshold_db") <= hi_d
 
 
@@ -248,7 +259,7 @@ def test_input_trim_is_added_to_analysis_levels():
     assert chain.get_param("expander", "threshold_db") > -46.0
 
 
-# --------------------------------------------------------------------------- plausibility (PO-2)
+# --------------------------------------------------------------------------- plausibility of "the speaker is talking"
 
 @pytest.mark.parametrize("kw,expected_reason", [
     (dict(speech=-40.0, ratio=0.15), "level"),                 # keyboard clicks
@@ -271,12 +282,19 @@ def test_implausible_speech_holds_deesser_and_compressor(tmp_path, kw, expected_
     assert any(expected_reason in r for r in impl[0]["reasons"])
 
 
-def test_expander_speech_cap_only_applies_to_plausible_speech():
-    # Plausible speech -20: target min(-60+10, -20-12) = -50. Implausible "speech" at -45
-    # would cap the target at -57, but the cap is ignored: target stays -50.
-    cfg, chain, ctrl = make({"expander": {"threshold_db": -52.0}})
-    changes = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-45.0, ratio=0.6), 20)
-    assert [c for c in changes if c["stage"] == "expander"] == []
+def test_expander_speech_cap_stays_for_a_quiet_speaker_but_not_for_typing():
+    # Quiet speaker (-28 dBFS after trim, level implausible) in a -46 dBFS room:
+    # floor + 10 = -36 would sit only 8 dB under the speech; the cap keeps -40.
+    cfg, chain, ctrl = make()
+    changes = run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.6), 40)
+    thr = chain.get_param("expander", "threshold_db")
+    assert abs(thr - (-40.0)) <= adaptive.EXPANDER_DEADZONE_DB
+    assert thr <= -28.0 - cal.EXPANDER_SPEECH_MARGIN_DB
+    assert [c for c in changes if c["stage"] in ("deesser", "compressor")] == []
+    # Typing (speech ratio 0.15) is not speech: the cap does not apply, the floor rule does.
+    cfg, chain, ctrl = make()
+    run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.15), 40)
+    assert abs(chain.get_param("expander", "threshold_db") - (-36.0)) <= adaptive.EXPANDER_DEADZONE_DB
 
 
 def test_rest_after_60_s_without_plausible_speech(tmp_path):
@@ -306,7 +324,7 @@ def test_rest_after_60_s_without_plausible_speech(tmp_path):
 
 
 def test_keyboard_clicks_do_not_move_deesser_or_compressor(tmp_path):
-    """PO-2 simulation: 3 min of typing (3 strokes/s, -30 dBFS) on -55 dBFS noise."""
+    """Listening phase: 3 min of typing (3 strokes/s, -30 dBFS) on -55 dBFS noise."""
     log = tmp_path / "k.jsonl"
     cfg, chain, ctrl = make(log_path=log)
     x = synth.make_keyboard_clicks(180.0, SR, rate_per_s=3.0, level_dbfs=-30.0, noise_floor_dbfs=-55.0, seed=1)
@@ -327,7 +345,7 @@ def test_keyboard_clicks_do_not_move_deesser_or_compressor(tmp_path):
 
 
 def test_distant_quiet_voice_does_not_move_deesser_or_compressor(tmp_path):
-    """PO-2 simulation: 3 min of a quiet voice at -42 dBFS (colleague, playback)."""
+    """Listening phase: 3 min of a quiet voice at -42 dBFS (colleague, playback)."""
     log = tmp_path / "f.jsonl"
     cfg, chain, ctrl = make(log_path=log)
     x = synth.make_speech_like(180.0, SR, level_dbfs=-42.0, noise_floor_dbfs=-55.0, sibilance_db=3.0, seed=2)
@@ -347,36 +365,57 @@ def test_distant_quiet_voice_does_not_move_deesser_or_compressor(tmp_path):
 
 # --------------------------------------------------------------------------- protection rules
 
-def test_speech_cut_lowers_expander_immediately_even_inside_deadzone():
+def test_speech_cut_needs_two_consecutive_intervals_then_steps_without_deadzone():
     cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})  # exactly on target (floor -60 + 10)
-    changes = ctrl.update(meters_dict(expander_gr=8.0, floor=-60.0, active=True), now=LEARN_S)
+    cut = lambda: meters_dict(expander_gr=8.0, floor=-60.0, active=True)
+    # First interval: suspicion only, no change.
+    assert [c for c in ctrl.update(cut(), now=LEARN_S) if c["stage"] == "expander"] == []
+    # Second consecutive interval: immediate step although the value sits inside the dead zone.
+    changes = ctrl.update(cut(), now=LEARN_S + INTERVAL_S)
     exp = [c for c in changes if c["stage"] == "expander"]
-    assert len(exp) == 1
-    assert exp[0]["reason"] == "speech_cut"
+    assert len(exp) == 1 and exp[0]["reason"] == "speech_cut"
     assert exp[0]["new"] == pytest.approx(-50.0 - STEP_DB)
-    # Next interval still cutting -> another immediate step (no 2-interval spacing).
-    changes = ctrl.update(meters_dict(expander_gr=8.0, floor=-60.0, active=True), now=LEARN_S + INTERVAL_S)
+    # Still cutting -> another immediate step (no 2-interval spacing).
+    changes = ctrl.update(cut(), now=LEARN_S + 2 * INTERVAL_S)
     assert [c["reason"] for c in changes if c["stage"] == "expander"] == ["speech_cut"]
     assert chain.get_param("expander", "threshold_db") == pytest.approx(-51.0)
+    # One clean interval resets the streak: the next suspicious one does not act alone.
+    ctrl.update(meters_dict(expander_gr=0.0, floor=-60.0, active=True), now=LEARN_S + 3 * INTERVAL_S)
+    assert [c for c in ctrl.update(cut(), now=LEARN_S + 4 * INTERVAL_S) if c["stage"] == "expander"] == []
 
 
 def test_speech_cut_uses_the_max_meter_not_the_mean():
     cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})
-    m = meters_dict(floor=-60.0, active=True)
-    m["expander"] = {"gain_reduction_mean_db": 1.0, "gain_reduction_max_db": 7.0}
-    changes = ctrl.update(m, now=LEARN_S)
+    for k in range(2):
+        m = meters_dict(floor=-60.0, active=True)
+        m["expander"] = {"gain_reduction_mean_db": 1.0, "gain_reduction_max_db": 7.0}
+        changes = ctrl.update(m, now=LEARN_S + k * INTERVAL_S)
     assert [c["reason"] for c in changes if c["stage"] == "expander"] == ["speech_cut"]
 
 
 def test_expander_reduction_in_pauses_is_not_speech_cut():
     cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})
-    changes = ctrl.update(meters_dict(expander_gr=15.0, floor=-60.0, active=False), now=LEARN_S)
-    assert [c for c in changes if c["stage"] == "expander"] == []
-    # An interval with a pause inside (90 % speech) cannot attribute the maximum to speech.
-    m = meters_dict(expander_gr=15.0, floor=-60.0, active=True)
-    m["analysis"]["recent_speech_ratio"] = 0.9
-    changes = ctrl.update(m, now=LEARN_S + INTERVAL_S)
-    assert [c for c in changes if c["stage"] == "expander"] == []
+    for k in range(3):
+        changes = ctrl.update(meters_dict(expander_gr=15.0, floor=-60.0, active=False), now=LEARN_S + k * INTERVAL_S)
+        assert [c for c in changes if c["stage"] == "expander"] == []
+    # A pause that ends 70 ms into the interval leaves 39 of 40 frames active (97.5 %):
+    # the maximum stems from the closed gate, not from speech.
+    for k in range(3, 6):
+        m = meters_dict(expander_gr=14.0, floor=-60.0, active=True)
+        m["analysis"]["recent_speech_ratio"] = 39 / 40
+        changes = ctrl.update(m, now=LEARN_S + k * INTERVAL_S)
+        assert [c for c in changes if c["stage"] == "expander"] == []
+
+
+def test_meters_collected_during_learning_do_not_trigger_after_it():
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})
+    # Heavy "speech cut" readings during the learning phase ...
+    for k in range(15):
+        ctrl.update(meters_dict(expander_gr=12.0, floor=-60.0, active=True), now=k * INTERVAL_S)
+    # ... are dropped at learn_done: two clean intervals after it change nothing.
+    for k in range(2):
+        changes = ctrl.update(meters_dict(expander_gr=0.0, floor=-60.0, active=True), now=LEARN_S + k * INTERVAL_S)
+        assert changes == []
 
 
 def test_limiter_overload_blocks_compressor_raise_and_holds_normalizer(tmp_path):
@@ -545,28 +584,17 @@ def test_live_analyzer_speech_active_flag_follows_signal():
     assert la.snapshot()["speech_active"] is False
 
 
-# --------------------------------------------------------------------------- closed loop with the real chain (SW-5)
+# --------------------------------------------------------------------------- closed loop with the real chain
 
-def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_cfg):
-    """Chain + LiveAnalyzer + AdaptiveController over 200 s: floor -55 dBFS for 100 s,
-    then -45 dBFS. Learning phase untouched, expander follows monotonically, bounds
-    hold, every change is logged with a reason, de-esser/compressor stay quiet."""
+def _run_closed_loop(x, cfg, log, learn_s=LEARN_S, block=2048):
+    """Chain + LiveAnalyzer + AdaptiveController on a simulated clock; update every interval."""
     from voicechain.dsp.chain import Chain
-    quiet = synth.make_speech_like(100.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-55.0, sibilance_db=-6.0,
-                                   seed=21, long_pause_s=6.0)
-    loud = synth.make_speech_like(100.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-45.0, sibilance_db=-6.0,
-                                  seed=22, long_pause_s=6.0)
-    x = np.concatenate([quiet, loud])
-    cfg = cal.recommend(cal.analyze(quiet, SR), base_cfg)
-    cfg["adaptive"].update({"learn_s": LEARN_S, "interval_s": INTERVAL_S, "max_step_db": STEP_DB})
+    cfg = copy.deepcopy(cfg)
+    cfg["adaptive"].update({"learn_s": learn_s, "interval_s": INTERVAL_S, "max_step_db": STEP_DB})
     chain = Chain.from_config(cfg)
     la = adaptive.LiveAnalyzer(SR, deesser_freq_hz=cfg["chain"]["deesser"]["freq_hz"],
                                deesser_bandwidth_oct=cfg["chain"]["deesser"]["bandwidth_oct"])
-    log = tmp_path / "loop.jsonl"
     ctrl = adaptive.AdaptiveController(cfg, chain, clock=lambda: 0.0, log_path=log)
-    start_thr = chain.get_param("expander", "threshold_db")
-    trim = chain.get_param("input_trim", "gain_db")
-    block = 2048
     tick = int(INTERVAL_S * SR)
     changes = []
     next_tick = tick
@@ -580,19 +608,41 @@ def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_c
             changes.extend(ctrl.update(m, now=next_tick / SR))
             next_tick += tick
     ctrl.close()
+    return chain, changes
+
+
+def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_cfg):
+    """Chain + LiveAnalyzer + AdaptiveController over 300 s of normal speech: floor
+    -55 dBFS for 100 s, then -45 dBFS. Learning phase untouched, expander follows
+    monotonically, bounds hold, every change is logged with a reason, de-esser and
+    compressor stay quiet, no speech_cut saw-tooth (at most one false alarm)."""
+    quiet = synth.make_speech_like(100.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-55.0, sibilance_db=-6.0,
+                                   seed=21, long_pause_s=6.0)
+    loud = synth.make_speech_like(200.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-45.0, sibilance_db=-6.0,
+                                  seed=22, long_pause_s=6.0)
+    x = np.concatenate([quiet, loud])
+    cfg = cal.recommend(cal.analyze(quiet, SR), base_cfg)
+    start_thr = cfg["chain"]["expander"]["threshold_db"]
+    trim = cfg["chain"]["input_trim"]["gain_db"]
+    log = tmp_path / "loop.jsonl"
+    chain, changes = _run_closed_loop(x, cfg, log)
     exp = [c for c in changes if c["stage"] == "expander"]
     assert changes and all(c["t"] >= LEARN_S for c in changes)
+    assert [c for c in changes if c["reason"] == "speech_cut"].__len__() <= 1
     # First 100 s: the calibrated threshold already matches the floor -> no expander step.
     assert all(c["t"] > 100.0 for c in exp)
-    steps = [c["new"] - c["old"] for c in exp]
+    tracked = [c for c in exp if c["reason"] == "noise_floor_track"]
+    steps = [c["new"] - c["old"] for c in tracked]
     assert len(steps) >= 10 and all(s == pytest.approx(STEP_DB) for s in steps)   # monotone, +0.5 each
-    assert all(np.diff([c["t"] for c in exp]) >= 2 * INTERVAL_S - 1e-9)
+    assert all(np.diff([c["t"] for c in tracked]) >= 2 * INTERVAL_S - 1e-9)
     lo, hi = cfg["adaptive"]["bounds"]["expander.threshold_db"]
     assert all(lo <= c["new"] <= hi for c in exp)
     target = min(-45.0 + trim + cal.EXPANDER_FLOOR_MARGIN_DB, -20.0 - cal.EXPANDER_SPEECH_MARGIN_DB)
     final = chain.get_param("expander", "threshold_db")
     assert start_thr == pytest.approx(-55.0 + trim + cal.EXPANDER_FLOOR_MARGIN_DB, abs=1.0)
     assert abs(final - target) <= adaptive.EXPANDER_DEADZONE_DB + 0.5
+    # Converged within ~90 s after the step (16 steps of 4 s plus detection): no step after 200 s.
+    assert max(c["t"] for c in tracked) <= 200.0
     other = [c for c in changes if c["stage"] != "expander"]
     assert len(other) <= 2, other                                   # speaker unchanged
     entries = events(log)
@@ -601,3 +651,30 @@ def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_c
     assert all(set(e) == {"t", "stage", "name", "old", "new", "reason"} for e in logged)
     # Ticks at 2, 4, ..., 28 s fall into the 30 s learning phase: 14 entries.
     assert [e["event"] for e in entries if "event" in e].count("learning") == 14
+
+
+def test_pause_ending_just_after_an_interval_start_is_no_speech_cut(tmp_path, base_cfg):
+    """A pause that ends 70 ms after the meter interval begins leaves the gate closed
+    at the interval start (expander maximum 12-14 dB) while the analyzer counts 39
+    of 40 frames active. That must not count as speech being cut."""
+    speech = synth.make_speech_like(40.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-55.0, sibilance_db=-6.0,
+                                    seed=23, pause_ratio=0.0)          # continuous speech, no pauses
+    cfg = cal.recommend(cal.analyze(synth.make_speech_like(60.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-55.0,
+                                                           sibilance_db=-6.0, seed=23, long_pause_s=6.0), SR), base_cfg)
+    rng = np.random.default_rng(5)
+    noise = (rng.standard_normal(SR) * 10 ** (-55 / 20)).astype(np.float32)
+    # Blocks of 2 s: speech, then a pause that ends 70 ms into the next interval, repeated.
+    pieces = []
+    t = 0.0
+    k = 0
+    while t < 60.0:
+        pieces.append(speech[int(k % 30 * SR): int(k % 30 * SR) + int(1.93 * SR)])   # 1.93 s speech
+        pieces.append(noise[: int(0.14 * SR)])                                      # 0.14 s pause ...
+        t += 2.07                                                                   # ... ending at +0.07 s
+        k += 1
+    x = np.concatenate(pieces)
+    log = tmp_path / "onset.jsonl"
+    chain, changes = _run_closed_loop(x, cfg, log, learn_s=4.0)
+    cuts = [c for c in changes if c["reason"] == "speech_cut"]
+    assert cuts == [], cuts
+    assert chain.get_param("expander", "threshold_db") >= cfg["chain"]["expander"]["threshold_db"] - 1e-9

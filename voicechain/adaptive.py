@@ -19,9 +19,9 @@ Two classes:
     (``voicechain.calibrate.*_target``), in steps of at most ``max_step_db``,
     inside ``adaptive.bounds``, with dead zones, and with at least two intervals
     between changes of the same parameter. A plausibility check keeps keyboard
-    clicks, distant voices or playback from being treated as the speaker
-    (PO-2). Protection rules react to limiter overload and to speech being cut
-    by the expander.
+    clicks, distant voices or playback from being treated as the speaker (a
+    sound engineer does not re-trim the de-esser for typing). Protection rules
+    react to limiter overload and to speech being cut by the expander.
 
 Snapshot format (``meters["analysis"]``)::
 
@@ -104,7 +104,7 @@ COMPRESSOR_DEADZONE_DB = 2.0
 #: Minimum number of intervals between two changes of the same parameter.
 MIN_CHANGE_SPACING_INTERVALS = 2
 
-#: Plausibility of "the speaker is talking" (PO-2): the measured speech level
+#: Plausibility of "the speaker is talking": the measured speech level
 #: after trim must lie within this tolerance of the reference level (the
 #: calibration put the speaker there), speech must fill a reasonable share of
 #: the history and the frame-level dynamics must look like speech. Keyboard
@@ -128,9 +128,14 @@ LIMITER_PROTECT_RELEASE_GR_DB = 1.5
 #: Task specification: 6 dB.
 SPEECH_CUT_GR_DB = 6.0
 #: The expander's interval maximum counts as "during speech" only when at least
-#: this share of the interval's frames were speech; with the default hold
-#: (100 ms) the remaining 5 % (100 ms) cannot close the gate. Assumption.
-SPEECH_CUT_MIN_ACTIVE_RATIO = 0.95
+#: this share of the interval's 50 ms frames were speech: a pause that ends
+#: within the first 100 ms of an interval still leaves the gate closed (12-14 dB)
+#: while 39 of 40 frames read active, so one inactive frame (97.5 %) must already
+#: disqualify the interval. Assumption.
+SPEECH_CUT_MIN_ACTIVE_RATIO = 0.98
+#: speech_cut acts only when this many consecutive intervals show the condition:
+#: a single interval can still be an onset artefact, two in a row are not.
+SPEECH_CUT_CONSECUTIVE_INTERVALS = 2
 #: Numerical tolerance for "no change" and time comparisons.
 EPS = 1e-9
 #: Parameters the controller tracks (stage, name) and their dead zones.
@@ -311,9 +316,16 @@ class AdaptiveController:
         chain_cfg = cfg["chain"]
         self.deesser_ratio = float(chain_cfg["deesser"]["ratio"])
         self.normalizer_max_gain_db = float(chain_cfg["normalizer"]["max_gain_db"])
+        #: The limiter protection moves normalizer.max_gain_db inside its bounds
+        #: entry when the configuration has one, else inside [0, configured value].
+        self.normalizer_gain_bounds = self.bounds.get(("normalizer", "max_gain_db"),
+                                                      (0.0, self.normalizer_max_gain_db))
+        if not self.normalizer_gain_bounds[0] <= self.normalizer_max_gain_db <= self.normalizer_gain_bounds[1]:
+            raise ValueError(
+                f"normalizer.max_gain_db={self.normalizer_max_gain_db} lies outside "
+                f"adaptive.bounds {self.normalizer_gain_bounds}")
         #: Calibrated values the de-esser and compressor return to when no
-        #: plausible speech has been heard for IMPLAUSIBLE_REST_S (and the
-        #: de-esser's resting threshold when sibilance is below the reference).
+        #: plausible speech has been heard for IMPLAUSIBLE_REST_S.
         self.rest_values = {key: float(chain.get_param(*key)) for key in TRACKED}
         self._frozen = False
         # The learning phase starts when the controller is created (the runtime
@@ -325,6 +337,7 @@ class AdaptiveController:
         self._learn_done_logged = False
         self._last_change_t: dict[tuple[str, str], float] = {}
         self._limiter_protect = False
+        self._speech_cut_streak = 0
         self._acc_limiter: list[float] = []
         self._acc_expander_speech: list[float] = []
         self._acc_normalizer: list[float] = []
@@ -359,9 +372,10 @@ class AdaptiveController:
         Returns the list of applied changes ``{"t", "stage", "name", "old", "new", "reason"}``.
         """
         now = self._now(now)
-        self._accumulate(meters)
         elapsed = now - self._t_start
         if elapsed < self.learn_s - EPS:
+            # Listening only: meters of the learning phase are not collected, so
+            # nothing from it can trigger a rule after the phase ends.
             if (self._last_learning_log_t is None
                     or now - self._last_learning_log_t >= self.interval_s - EPS):
                 self._last_learning_log_t = now
@@ -370,7 +384,9 @@ class AdaptiveController:
             return []
         if not self._learn_done_logged:
             self._learn_done_logged = True
+            self._drain()
             self._log({"t": now, "event": "learn_done", "learn_s": self.learn_s})
+        self._accumulate(meters)
         if now - self._last_decision_t < self.interval_s - EPS:
             return []
         self._last_decision_t = now
@@ -453,7 +469,11 @@ class AdaptiveController:
                 "immediate": False, "target": target}
 
     def _plausibility(self, analysis: dict, speech_after_trim: float) -> list[str]:
-        """Reasons why the analysed signal is not the speaker; empty = plausible."""
+        """Reasons why the analysed signal is not the speaker; empty = plausible.
+
+        Each reason starts with a code (``no_speech``, ``level``, ``speech_ratio``,
+        ``dynamic_range``) followed by the measured value.
+        """
         reasons = []
         if not analysis.get("speech_detected", False):
             reasons.append("no_speech")
@@ -466,6 +486,13 @@ class AdaptiveController:
             reasons.append(f"dynamic_range {float(analysis.get('dynamic_range_db', 0.0)):.1f} dB < "
                            f"{PLAUSIBLE_MIN_DYNAMIC_RANGE_DB:.0f}")
         return reasons
+
+    @staticmethod
+    def _speech_present(reasons: list[str]) -> bool:
+        """True when what is heard is speech of some kind (possibly at the wrong
+        level): the expander's "12 dB below speech" cap then still protects it.
+        Typing (low speech ratio) or steady noise (low dynamics) is not speech."""
+        return not any(r.startswith(("no_speech", "speech_ratio", "dynamic_range")) for r in reasons)
 
     def _propose(self, now: float, analysis: dict, stats: dict) -> list[dict]:
         trim = 0.0 if self.analysis_is_post_trim else float(self.chain.get_param("input_trim", "gain_db"))
@@ -503,18 +530,22 @@ class AdaptiveController:
         # "12 dB below speech" cap applies only to plausible speech.
         exp_speech = stats["expander_gr_speech_max"]
         if exp_speech is not None and exp_speech > SPEECH_CUT_GR_DB:
+            self._speech_cut_streak += 1
+        else:
+            self._speech_cut_streak = 0
+        if self._speech_cut_streak >= SPEECH_CUT_CONSECUTIVE_INTERVALS:
             proposals.append({"stage": "expander", "name": "threshold_db", "step": -self.max_step_db,
                               "reason": "speech_cut", "immediate": True, "target": None})
         else:
+            speech_present = self._speech_present(implausible)
             p = self._track("expander", "threshold_db",
-                            expander_threshold_target(floor, speech if plausible else None),
+                            expander_threshold_target(floor, speech if speech_present else None),
                             EXPANDER_DEADZONE_DB, "noise_floor_track")
             if p:
                 proposals.append(p)
 
         if plausible:
-            de_target, engaged = deesser_threshold_target(
-                band_peak, sib, self.deesser_ratio, self.rest_values[("deesser", "threshold_db")])
+            de_target, engaged = deesser_threshold_target(band_peak, sib, self.deesser_ratio)
             p = self._track("deesser", "threshold_db", de_target, DEESSER_DEADZONE_DB,
                             "sibilance_track" if engaged else "sibilance_rest")
             if p:
@@ -536,7 +567,8 @@ class AdaptiveController:
         current_gain = stats["normalizer_gain_last"]
         if current_gain is None:
             return None
-        hold = clamp(current_gain, 0.0, self.normalizer_max_gain_db)
+        hold = clamp(current_gain, self.normalizer_gain_bounds[0],
+                     min(self.normalizer_gain_bounds[1], self.normalizer_max_gain_db))
         return {"stage": "normalizer", "name": "max_gain_db", "absolute": hold,
                 "reason": reason, "immediate": True, "target": hold}
 
