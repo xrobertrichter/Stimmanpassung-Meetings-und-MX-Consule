@@ -320,6 +320,16 @@ class LiveEngine:
         self._ramp_index = np.arange(self.block_size, dtype=np.float32)
         self._ramp = np.zeros(self.block_size, dtype=np.float32)
 
+        # Kill switch (docs/06 section 2, level 2 key 4): processing off means the chain
+        # computes only input trim + limiter, the analyzer is not fed and the adaptive
+        # controller is not ticked (its state is kept, nothing is reset).
+        self.processing = True
+        # CPU load of the chain: seconds spent in chain.process() per status interval,
+        # divided by the audio time of those blocks (1.0 = the callback would starve).
+        self._cpu_acc_s = 0.0
+        self._cpu_blocks = 0
+        self.cpu_load = 0.0
+
         # Optional control channel (docs/06): LiveControl handles the commands, the
         # ControlServer is polled by the service thread.
         self.control = None
@@ -387,9 +397,12 @@ class LiveEngine:
             self._in_rms_acc += float(np.dot(x, x))
             self._in_rms_blocks += frames
 
-            if self.analyzer is not None:
+            if self.analyzer is not None and self.processing:
                 self.analyzer.push(x)
+            t_start = time.perf_counter()
             y = self.chain.process(x)
+            self._cpu_acc_s += time.perf_counter() - t_start
+            self._cpu_blocks += frames
             y = np.asarray(y, dtype=np.float32)
             self._apply_output_gain(y)
             # Mono -> N channels: broadcast into the output buffer, no new arrays.
@@ -460,9 +473,22 @@ class LiveEngine:
         self.chain.set_bypass(self.bypassed)
         return self.bypassed
 
+    def set_processing(self, on) -> bool:
+        """Hook for LiveControl (kill switch): chain.set_processing, then pause analyzer
+        and adaptive ticks while off. Nothing of the controller is reset, so switching
+        back on continues with the learned state."""
+        if on == "toggle":
+            on = not self.processing
+        on = bool(on)
+        self.chain.set_processing(on)
+        self.processing = on
+        with self._lock:
+            self.last_change_text = "processing OFF (kill switch)" if not on else "processing on again"
+        return on
+
     def control_hooks(self) -> dict:
         """The ``hooks`` dict LiveControl expects: functions outside the adaptive controller."""
-        return {"mute": self.set_muted, "bypass": self.set_bypass}
+        return {"mute": self.set_muted, "bypass": self.set_bypass, "processing": self.set_processing}
 
     def attach_control(self, live_control, socket_path) -> None:
         """Attach a LiveControl instance; the socket server is started with the stream."""
@@ -552,7 +578,8 @@ class LiveEngine:
 
         ``meters`` is the shared reading from :meth:`read_meters`; when omitted a
         fresh reading is taken."""
-        if self.controller is None:
+        if self.controller is None or not self.processing:
+            # Kill switch: the controller is neither fed nor reset while the chain is off.
             return []
         if meters is None:
             meters = self.read_meters()
@@ -594,6 +621,11 @@ class LiveEngine:
         self._out_peak = 0.0
         self._in_rms_acc = 0.0
         self._in_rms_blocks = 0
+        cpu_blocks, cpu_s = self._cpu_blocks, self._cpu_acc_s
+        self._cpu_blocks = 0
+        self._cpu_acc_s = 0.0
+        if cpu_blocks > 0:
+            self.cpu_load = cpu_s / (cpu_blocks / self.sample_rate)
 
         if meters is None:
             with self._lock:
@@ -637,23 +669,28 @@ class LiveEngine:
         gate_text += snr_text
         if self.controller is None:
             mode = "off"
+        elif not self.processing:
+            mode = "paused"
         elif self.is_frozen():
             mode = "FROZEN"
         else:
             mode = "on"
         flags = ""
+        if not self.processing:
+            flags += " | OFF"
         if self.muted:
             flags += " | MUTE"
         if self.bypassed:
             flags += " | BYPASS"
         return (
-            "in {:6.1f} dBFS (rms {:6.1f}) | out {:6.1f} dBFS{} | GR exp {} des {} comp {} "
+            "in {:6.1f} dBFS (rms {:6.1f}) | out {:6.1f} dBFS{} | cpu {:3.0f}% | GR exp {} des {} comp {} "
             "norm {} lim {}{} | xruns {}{} | blocks {} | adaptive {}: {}{}"
         ).format(
             _to_dbfs(in_peak),
             _to_dbfs(in_rms),
             _to_dbfs(out_peak),
             flags,
+            100.0 * self.cpu_load,
             gr("expander"),
             gr("deesser"),
             gr("compressor"),

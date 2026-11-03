@@ -632,7 +632,7 @@ def test_ctl_parser_knows_all_19_console_commands():
     for name in cli.CTL_COMMANDS:
         args = parser.parse_args(["ctl", name])
         assert args.name == name and args.func is cli.cmd_ctl
-    assert len(cli.CTL_COMMANDS) == 19
+    assert len(cli.CTL_COMMANDS) == 20  # 19 of the original contract + power (kill switch)
     with pytest.raises(SystemExit):
         parser.parse_args(["ctl", "explode"])
 
@@ -654,6 +654,7 @@ def test_ctl_parser_knows_all_19_console_commands():
         ("mute", {"cmd": "mute", "on": "toggle"}),
         ("freeze", {"cmd": "freeze", "on": "toggle"}),
         ("bypass", {"cmd": "bypass", "on": "toggle"}),
+        ("power", {"cmd": "processing", "on": "toggle"}),
         ("reset", {"cmd": "reset"}),
         ("status", {"cmd": "status"}),
         ("relearn", {"cmd": "relearn"}),
@@ -671,6 +672,14 @@ def test_build_control_command_options():
     assert cli.build_control_command("mute", value="on") == {"cmd": "mute", "on": True}
     assert cli.build_control_command("freeze", value="aus") == {"cmd": "freeze", "on": False}
     assert cli.build_control_command("bypass", value="toggle") == {"cmd": "bypass", "on": "toggle"}
+    assert cli.build_control_command("power", value="off") == {"cmd": "processing", "on": False}
+    assert cli.build_control_command("power", value="on") == {"cmd": "processing", "on": True}
+    import argparse
+
+    parser = cli.build_parser()
+    subparsers = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)][0]
+    ctl_help = subparsers.choices["ctl"].format_help()
+    assert "power" in ctl_help and "kill switch" in ctl_help
     marker = cli.build_control_command("marker", text="Rückfrage Folie 3")
     assert marker == {"cmd": "marker", "text": "Rückfrage Folie 3"}
     default_marker = cli.build_control_command("marker")
@@ -819,6 +828,8 @@ def test_run_opens_control_socket_and_answers_a_live_command(monkeypatch, tmp_pa
             time.sleep(0.01)
         answers.append(send_command({"cmd": "offset", "name": "room_db", "delta": 2}, sock, timeout=3.0))
         answers.append(send_command({"cmd": "status"}, sock, timeout=3.0))
+        answers.append(send_command({"cmd": "processing", "on": False}, sock, timeout=3.0))  # kill switch
+        answers.append(send_command({"cmd": "processing", "on": True}, sock, timeout=3.0))
         answers.append(send_command({"cmd": "relearn"}, sock, timeout=3.0))
 
     threading.Thread(target=client, daemon=True).start()
@@ -827,14 +838,16 @@ def test_run_opens_control_socket_and_answers_a_live_command(monkeypatch, tmp_pa
     captured = capsys.readouterr()
     assert code == EXIT_OK, captured.err
     assert "Control socket: {}".format(sock) in captured.err
-    assert len(answers) == 3, captured.err
+    assert len(answers) == 5, captured.err
     assert answers[0]["ok"] is True and answers[0]["state"]["offsets"]["room_db"] == 2.0
     assert answers[1]["ok"] is True and "Offsets:" in answers[1]["message"]
     assert answers[1]["state"]["adaptive_enabled"] is True
-    assert answers[2]["ok"] is True and "Lernphase neu gestartet" in answers[2]["message"]
+    assert answers[2]["ok"] is True and answers[2]["state"]["processing"] is False  # real Chain.set_processing path
+    assert answers[3]["ok"] is True and answers[3]["state"]["processing"] is True
+    assert answers[4]["ok"] is True and "Lernphase neu gestartet" in answers[4]["message"]
     assert len(analyzers) == 1  # the one analyzer of cmd_run was handed to LiveControl ...
     assert analyzers[0].reset_calls == 1  # ... and relearn cleared its history
-    assert answers[2]["state"]["learning"] is True
+    assert answers[4]["state"]["learning"] is True
     assert not sock.exists()  # removed at stop
 
 

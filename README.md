@@ -139,13 +139,16 @@ sonst bleibt es still.
 
 Die laufende Kette lässt sich ohne Terminal korrigieren: Drehregler für Lauter/Leiser, Druck für
 Mute, Tasten für weniger/mehr Raum, weniger Zischen, natürlicher/dichter, Freeze, Reset und
-Status, auf einer zweiten Ebene Klangfarbe, Neu lernen, Snapshot, Bypass-Vergleich und Marker.
+Status, auf einer zweiten Ebene Klangfarbe, Kill-Switch (Verarbeitung aus: nur Input Trim +
+Limiter, spart Last, Regelung pausiert – anders als der Bypass, der nur abhört und weiterrechnet),
+Neu lernen, Snapshot, Bypass-Vergleich und Marker.
 Alle Tasten sind Offsets auf die kalibrierten Werte; die adaptive Regelung arbeitet weiter und
 regelt sie nicht zurück. Jede Funktion ist auch im Terminal erreichbar:
 
 ```bash
 python -m voicechain ctl room-less --notify   # weniger Raum, Antwort als macOS-Mitteilung
 python -m voicechain ctl status               # Lautheit, Störabstand, Offsets, Freeze/Mute
+python -m voicechain ctl power                # Kill-Switch: Verarbeitung aus/an (Statuszeile OFF)
 python -m voicechain ctl reset                # zurück zum Kalibrierzustand
 ```
 
@@ -162,7 +165,7 @@ Manifest und Verdrahtung in Logi Options+: `integrations/mx_console/README.md`.
 | `python -m voicechain calibrate --wav PFAD [--config BASIS] [--out NEU.yaml] [--report BERICHT.md]` | Sprachsample analysieren → Konfigurationsvorschlag + Bericht |
 | `python -m voicechain process --in PFAD --out PFAD [--config PFAD]` | WAV (48 kHz) offline durch die Kette (A/B-Hören), Messzeilen vorher/nachher |
 | `python -m voicechain selftest [--config PFAD] [--report PFAD]` | Synthetische Signale durch die Kette, Prüftabelle Soll/Ist, Exit-Code 1 bei Nichtbestehen |
-| `python -m voicechain ctl KOMMANDO [--value X] [--text ...] [--path PFAD] [--socket PFAD] [--notify]` | Laufende Kette steuern (19 Kommandos der Konsole, z. B. `louder`, `mute`, `room-less`, `reset`, `status`); Exit 0/1/2 |
+| `python -m voicechain ctl KOMMANDO [--value X] [--text ...] [--path PFAD] [--socket PFAD] [--notify]` | Laufende Kette steuern (20 Kommandos der Konsole, z. B. `louder`, `mute`, `room-less`, `power`, `reset`, `status`); Exit 0/1/2 |
 | `python -m voicechain make-sample --out PFAD` | Synthetisches Sprach-WAV erzeugen, um den Kalibrierablauf ohne Mikrofon zu proben |
 
 Relative Pfade werden vom Repository-Wurzelverzeichnis aus aufgelöst; Ausgabeverzeichnisse

@@ -365,9 +365,10 @@ def test_client_reports_server_that_closes_without_answer(sock_path):
 MANIFEST_DIR = Path(__file__).resolve().parent.parent / "integrations" / "mx_console"
 EXPECTED_PAGES = {
     "Meeting": ["room-less", "room-more", "deess-more", "natural", "dense", "freeze", "reset", "status"],
-    "Feinabstimmung": ["warmer", "brighter", "deess-less", "loudness-reset", "relearn", "snapshot", "bypass", "marker"],
+    "Feinabstimmung": ["warmer", "brighter", "deess-less", "power", "relearn", "snapshot", "bypass", "marker"],
 }
 EXPECTED_DIAL = {"rotate_cw": "louder", "rotate_ccw": "quieter", "press": "mute"}
+EXPECTED_UNASSIGNED = ["loudness-reset"]  # keeps script, AppleScript and CLI, but no key
 
 
 def _load_manifest() -> dict:
@@ -382,6 +383,8 @@ def test_manifest_pages_match_the_assignment():
         assert [k["slot"] for k in keys] == list(range(1, 9))  # 8 keys per page
         assert [k["id"] for k in keys] == EXPECTED_PAGES[page["name"]]
         assert {k: v["id"] for k, v in page["dial"].items()} == EXPECTED_DIAL  # dial identical on both pages
+    assert [u["id"] for u in manifest["unassigned"]] == EXPECTED_UNASSIGNED
+    assert all("slot" not in u for u in manifest["unassigned"])
 
 
 def test_every_function_has_script_applescript_cli_and_short_label():
@@ -389,9 +392,11 @@ def test_every_function_has_script_applescript_cli_and_short_label():
 
     parser = build_parser()
     manifest = _load_manifest()
-    entries = [k for page in manifest["pages"] for k in page["keys"]] + [
-        v for page in manifest["pages"] for v in page["dial"].values()
-    ]
+    entries = (
+        [k for page in manifest["pages"] for k in page["keys"]]
+        + [v for page in manifest["pages"] for v in page["dial"].values()]
+        + list(manifest["unassigned"])  # unassigned functions need the same artefacts
+    )
     ids = set()
     for entry in entries:
         ids.add(entry["id"])
@@ -407,15 +412,15 @@ def test_every_function_has_script_applescript_cli_and_short_label():
         assert entry["cli"] == "python -m voicechain ctl {} --notify".format(entry["id"])
         args = parser.parse_args(["ctl", entry["id"]])  # the CLI name exists in the parser
         assert args.name == entry["id"]
-    assert ids == set(CTL_COMMANDS)  # all 19 commands are reachable from the console (17 functions + dial)
-    assert len(ids) == 19
+    assert ids == set(CTL_COMMANDS)  # every CLI command has console artefacts (keys, dial or unassigned)
+    assert len(ids) == 20
 
 
 def test_action_scripts_are_valid_bash_and_documented():
     import subprocess
 
     scripts = sorted((MANIFEST_DIR / "actions").glob("*.sh"))
-    assert len(scripts) == 19
+    assert len(scripts) == 20
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)
         text = script.read_text(encoding="utf-8")

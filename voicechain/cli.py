@@ -684,12 +684,12 @@ CTL_OFFSET_KEYS = {
     "warmer": ("tone_db", -1.0),
     "brighter": ("tone_db", +1.0),
 }
-CTL_TOGGLE_KEYS = {"mute": "mute", "freeze": "freeze", "bypass": "bypass"}
+CTL_TOGGLE_KEYS = {"mute": "mute", "freeze": "freeze", "bypass": "bypass", "power": "processing"}
 CTL_PLAIN_KEYS = {"reset": "reset", "status": "status", "relearn": "relearn"}
 CTL_COMMANDS = (
     "louder", "quieter", "mute", "room-less", "room-more", "deess-more", "deess-less", "natural",
     "dense", "freeze", "reset", "status", "warmer", "brighter", "loudness-reset", "relearn",
-    "snapshot", "bypass", "marker",
+    "snapshot", "bypass", "marker", "power",
 )
 # Default text of a marker when the key gives none: time of day is what one looks for later.
 MARKER_TEXT_FORMAT = "Marker %H:%M:%S"
@@ -878,7 +878,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ctl = sub.add_parser("ctl", help="steer the running chain (console keys): one command, one answer line")
     p_ctl.add_argument("name", choices=CTL_COMMANDS, metavar="COMMAND", help="one of: " + ", ".join(CTL_COMMANDS))
-    p_ctl.add_argument("--value", help="step size for offset keys, on/off/toggle for mute, freeze, bypass")
+    p_ctl.add_argument(
+        "--value",
+        help="step size for offset keys; on/off/toggle for mute, freeze, bypass and power "
+        "(power = kill switch: processing off computes only input trim + limiter)",
+    )
     p_ctl.add_argument("--text", help="marker text (default: time of day)")
     p_ctl.add_argument("--path", help="snapshot: target YAML (default chosen by the chain)")
     p_ctl.add_argument("--socket", help="control socket (default: control.socket_path of the config, logs/control.sock)")

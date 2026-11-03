@@ -20,12 +20,14 @@ Taste / Dial ──► Logi Options+ Aktion „Run“ ──► actions/<kommand
 | Pfad | Zweck |
 |------|-------|
 | `functions.json` | Manifest beider Ebenen („Meeting“, „Feinabstimmung“): je Taste `slot`, `id`, `label` (≤ 10 Zeichen für das Tastendisplay), `description`, `action_script`, `applescript`, `cli`; je Ebene `dial` mit `rotate_cw`, `rotate_ccw`, `press`. Ein eigenes Profilskript (z. B. das `mx_profile.py` des Nutzers) kann die Datei einlesen und daraus das Options+-Profil erzeugen. |
-| `actions/<kommando>.sh` | Eine Shell-Aktion je Funktion (19 Stück, alle 19 `ctl`-Kommandos). Findet das Repository relativ zum eigenen Pfad, nutzt `.venv/bin/python`, falls vorhanden, sonst `python3` (oder `PYTHON_BIN`), ruft `python -m voicechain ctl <kommando> --notify`. Zusätzliche Argumente werden durchgereicht (`actions/louder.sh --value 1`). |
+| `actions/<kommando>.sh` | Eine Shell-Aktion je Funktion (20 Stück, alle 20 `ctl`-Kommandos). Findet das Repository relativ zum eigenen Pfad, nutzt `.venv/bin/python`, falls vorhanden, sonst `python3` (oder `PYTHON_BIN`), ruft `python -m voicechain ctl <kommando> --notify`. Zusätzliche Argumente werden durchgereicht (`actions/louder.sh --value 1`). |
 | `applescript/<kommando>.applescript` | Dieselbe Funktion als AppleScript (`do shell script` auf das Shell-Skript), für Options+-Aktionen vom Typ AppleScript. Der Repository-Pfad steht am Anfang der Datei (`~/voicechain`) und ist anzupassen, wenn das Repository woanders liegt. |
 
 Die Kommandonamen sind die der CLI (`python -m voicechain ctl --help`): `louder`, `quieter`, `mute`,
 `room-less`, `room-more`, `deess-more`, `deess-less`, `natural`, `dense`, `freeze`, `reset`,
-`status`, `warmer`, `brighter`, `loudness-reset`, `relearn`, `snapshot`, `bypass`, `marker`.
+`status`, `warmer`, `brighter`, `power` (Kill-Switch, Ebene 2 Taste 4), `relearn`, `snapshot`,
+`bypass`, `marker` sowie `loudness-reset` (hat Skript, AppleScript und CLI, aber keine Taste;
+im Manifest unter `unassigned`, frei belegbar).
 
 ## Einrichtung
 

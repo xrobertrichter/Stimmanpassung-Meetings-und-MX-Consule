@@ -52,13 +52,26 @@ ein Dialpad (Drehen, Drücken). Zwei Ebenen: **Meeting** (häufige Griffe) und *
 | K1 | Wärmer | `warmer` | Klang-Tilt −1 dB (Low-Shelf 250 Hz +½ dB, High-Shelf 4 kHz −½ dB) | Tilt −3…+3 dB | Klangfarbe braucht man selten live; ein Tilt ist der schonendste Eingriff (zwei kleine Shelves statt eines EQ-Bands). |
 | K2 | Heller | `brighter` | Klang-Tilt +1 dB | | Mehr Präsenz, wenn die Stimme bei schlechter Verbindung dumpf ankommt. |
 | K3 | Mehr Zischen | `deess-less` | De-Esser-Schwelle höher (`deess_db` +2) | +2 dB je Druck | Rücknahme, wenn S-Laute lispeln (De-Esser zu stark). |
-| K4 | Lautheit zurück | `loudness-reset` | Lautheits-Offset 0 (Ziel = Kalibrierwert) | | Nach vielen Dial-Rastungen schnell zum Referenzpegel, ohne alle anderen Offsets zu verlieren. |
+| K4 | Verarbeitung an/aus (Kill-Switch) | `power` | Kette wirklich abschalten: nur Input Trim + Limiter werden gerechnet, Analyzer und Regelung pausieren | Toggle; Statuszeile `OFF`, Regelung `paused` | Spart Prozessorlast (Laptop im Akkubetrieb, lange Sitzung) und ist der Notaus, wenn die Verarbeitung selbst das Problem ist. Wiedereinschalten setzt die Filterzustände zurück und blendet 30 ms ein. „Lautheit zurück" bleibt als Kommando `loudness-reset` ohne Taste. |
 | K5 | Neu lernen | `relearn` | Lernphase der Regelung neu starten; Offsets bleiben | | Nach Platz- oder Raumwechsel muss die Regelung Rauschteppich und Sprachpegel neu hören. |
 | K6 | Snapshot speichern | `snapshot` | Basiswerte + Offsets als `config/chain.live.yaml` (Zeitstempel im Kommentar) | | Was sich bewährt hat, wird dauerhaft; die Kalibrierdatei selbst bleibt unverändert. |
 | K7 | Bypass A/B | `bypass` | Kette umgehen (nur Input Trim + Limiter), 30-ms-Crossfade | Toggle; Statuszeile `BYPASS` | Der ehrliche Vergleich „mit / ohne" – der Limiter bleibt als Schutz drin. |
 | K8 | Marker | `marker` | Zeitmarke mit Text ins Regelungslog | | Für die spätere Analyse: „hier klang es komisch" lässt sich im JSONL wiederfinden. |
 
-Die Zuordnung Taste → Skript steht in `integrations/mx_console/functions.json`.
+Die Zuordnung Taste → Skript steht in `integrations/mx_console/functions.json`; Funktionen ohne
+Taste (derzeit `loudness-reset`: Lautheits-Offset auf 0, Ziel wieder Kalibrierwert) sind dort unter
+`unassigned` gelistet und per `ctl` erreichbar.
+
+### Kill-Switch und Bypass – der Unterschied
+
+| | Bypass A/B (`bypass`) | Verarbeitung aus (`power`) |
+|---|---|---|
+| Was man hört | Input Trim + Limiter | Input Trim + Limiter |
+| Was gerechnet wird | die ganze Kette läuft weiter (Zustände, Meter, Regelung aktuell), nur der Ausgang wird umgeblendet | nur Input Trim + Limiter; Expander, De-Esser, EQ, Kompressor, Normalizer werden nicht gerechnet |
+| Analyzer / Regelung | laufen weiter | pausieren (Zustand bleibt, nichts wird zurückgesetzt) |
+| Zweck | ehrlicher A/B-Vergleich, jederzeit knackfrei zurück | Last sparen oder Verarbeitung ausschalten, wenn sie selbst stört |
+| Zurückschalten | Crossfade 30 ms, Zustände sind warm | Filterzustände werden zurückgesetzt, kurze Einblendung 30 ms; die Regelung läuft mit dem alten Wissen weiter |
+| Statuszeile | `BYPASS` | `OFF`, `adaptive paused`, sichtbar kleinere `cpu`-Last |
 
 ## 4. Verhalten gegenüber der adaptiven Regelung
 
@@ -108,9 +121,11 @@ Die Zuordnung Taste → Skript steht in `integrations/mx_console/functions.json`
 ## 7. Statuszeile
 
 Zusätzlich zu Pegeln, Gain-Reduction und Regelungszustand zeigt `run` bei aktivem Steuerkanal:
-`MUTE`, `BYPASS`, die Offsets in Kurzform `off L+1.0 R+2 S-2 T0 I+1` (L Lautheit in LU,
-R Raum, S Zischen, T Tilt in dB, I Intensität in Stufen) und das aktuelle Lautheitsziel
-`target -17.0 LUFS`. `FROZEN` erscheint wie bisher bei eingefrorener Regelung.
+`OFF` (Kill-Switch), `MUTE`, `BYPASS`, die Rechenlast der Kette `cpu 12%` (Rechenzeit je Block
+relativ zur Blockdauer; im Aus-Zustand deutlich kleiner), die Offsets in Kurzform
+`off L+1.0 R+2 S-2 T0 I+1` (L Lautheit in LU, R Raum, S Zischen, T Tilt in dB, I Intensität in
+Stufen) und das aktuelle Lautheitsziel `target -17.0 LUFS`. `FROZEN` erscheint wie bisher bei
+eingefrorener Regelung, `adaptive paused` bei ausgeschalteter Verarbeitung.
 
 ## 8. Fehlersuche
 
@@ -126,3 +141,4 @@ R Raum, S Zischen, T Tilt in dB, I Intensität in Stufen) und das aktuelle Lauth
 | Antwort „abgelehnt: …" | Grenze erreicht oder Kommando im aktuellen Zustand nicht möglich (z. B. Relearn ohne Regelung) | Text lesen; ggf. `reset` |
 | Taste wirkt, aber die Regelung „holt zurück" | Nur scheinbar: die Regelung bewegt sich um das verschobene Ziel; prüfen mit `status` (Offsets bleiben) | Bei Bedarf `freeze` |
 | Mute vergessen, die anderen hören nichts | `MUTE` in der Statuszeile, Mitteilung bei Dial-Druck | Dial drücken oder `reset` |
+| Klingt plötzlich roh (Raum und Zischen zurück), Statuszeile `OFF` | Kill-Switch (`power`) ist aus | K4 auf Ebene 2 erneut drücken oder `ctl power --value on`; `reset` schaltet ebenfalls wieder ein |

@@ -134,10 +134,14 @@ class RecordingChain:
         self.fail = fail
         self.meter_calls = 0
         self.bypass_calls: list[bool] = []
+        self.processing_calls: list[bool] = []
         self.target_lufs = -18.0
 
     def set_bypass(self, on: bool) -> None:
         self.bypass_calls.append(bool(on))
+
+    def set_processing(self, on: bool) -> None:
+        self.processing_calls.append(bool(on))
 
     def get_param(self, stage: str, name: str) -> float:
         assert (stage, name) == ("normalizer", "target_lufs"), (stage, name)
@@ -906,7 +910,7 @@ def test_mute_toggle_and_bypass_hooks(fake_sd):
     assert engine.set_bypass("toggle") is False
     assert chain.bypass_calls == [True, False]
     hooks = engine.control_hooks()
-    assert set(hooks) == {"mute", "bypass"}
+    assert set(hooks) == {"mute", "bypass", "processing"}
     hooks["mute"](True)
     assert engine.muted and engine._gain_target == 0.0
     hooks["bypass"](True)
@@ -1010,3 +1014,56 @@ def test_start_fails_cleanly_when_socket_cannot_be_created(fake_sd, tmp_path):
         engine.start()
     assert engine.stream is None
     assert FakeStream.instances[-1].closed  # the audio stream opened before is released again
+
+
+# ----------------------------------------------------------------- kill switch
+def test_processing_hook_calls_chain_then_pauses_analyzer_and_controller(fake_sd):
+    log: list = []
+    chain = RecordingChain(log, gain=1.0)
+    analyzer = RecordingAnalyzer(log)
+    controller = RecordingController()
+    engine = LiveEngine(base_cfg(), chain, controller=controller, analyzer=analyzer)
+    hooks = engine.control_hooks()
+    assert set(hooks) == {"mute", "bypass", "processing"}
+
+    assert engine.processing is True
+    assert hooks["processing"](False) is False
+    assert chain.processing_calls == [False]  # the chain is switched first ...
+    assert engine.processing is False  # ... then the engine pauses analyzer/controller
+
+    indata = np.full((BLOCK, 1), 0.2, dtype=np.float32)
+    outdata = np.zeros((BLOCK, 2), dtype=np.float32)
+    engine.audio_callback(indata, outdata, BLOCK, None, None)
+    assert [name for name, _ in log] == ["chain.process"]  # analyzer.push skipped while off
+    assert analyzer.pushed_samples == 0
+    np.testing.assert_allclose(outdata[:, 0], 0.2, rtol=1e-6)  # audio keeps flowing (chain decides what it computes)
+
+    assert engine.adaptive_tick() == []
+    assert controller.calls == []  # controller neither fed nor reset
+    line = engine.status_line()
+    assert "| OFF" in line and "adaptive paused:" in line and "processing OFF" in line
+    assert "cpu " in line and "%" in line
+
+    assert engine.set_processing("toggle") is True
+    assert chain.processing_calls == [False, True]
+    engine.audio_callback(indata, outdata, BLOCK, None, None)
+    assert [name for name, _ in log][-2:] == ["analyzer.push", "chain.process"]
+    engine.adaptive_tick()
+    assert len(controller.calls) == 1 and "analysis" in controller.calls[0]
+    line = engine.status_line()
+    assert "| OFF" not in line and "adaptive on:" in line
+
+
+def test_status_line_reports_cpu_load_of_the_chain(fake_sd):
+    class SlowChain(RecordingChain):
+        def process(self, x):
+            time.sleep(0.002)  # 2 ms per 5.3 ms block ~ 38 % load
+            return super().process(x)
+
+    engine = LiveEngine(base_cfg(), SlowChain([], gain=1.0))
+    _ramp_blocks(engine, 10)
+    line = engine.status_line()
+    assert 25.0 <= 100.0 * engine.cpu_load <= 95.0, line
+    assert "cpu {:3.0f}%".format(100.0 * engine.cpu_load) in line
+    # the accumulator is reset per status line; without new blocks the last value stays
+    assert engine.status_line().count("cpu") == 1

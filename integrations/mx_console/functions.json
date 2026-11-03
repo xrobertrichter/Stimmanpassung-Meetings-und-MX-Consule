@@ -1,6 +1,6 @@
 {
   "schema": "voicechain-mx-console/1",
-  "description": "Belegung der Logi MX Creative Console für voicechain (docs/06_Beauftragung_MX_Console.md §2). Jede Taste startet die Shell-Aktion oder das AppleScript; die CLI-Zeile ist der Inhalt beider.",
+  "description": "Belegung der Logi MX Creative Console für voicechain (docs/06_Beauftragung_MX_Console.md §2). Jede Taste startet die Shell-Aktion oder das AppleScript; die CLI-Zeile ist der Inhalt beider. Funktionen unter 'unassigned' haben Skript und CLI, aber keine Taste (frei belegbar).",
   "requires": "python -m voicechain run (Steuer-Socket control.socket_path, Standard logs/control.sock)",
   "pages": [
     {
@@ -138,12 +138,12 @@
         },
         {
           "slot": 4,
-          "id": "loudness-reset",
-          "label": "Lautheit 0",
-          "description": "Lautheits-Offset auf 0 (Ziel = Kalibrierwert)",
-          "action_script": "integrations/mx_console/actions/loudness-reset.sh",
-          "applescript": "integrations/mx_console/applescript/loudness-reset.applescript",
-          "cli": "python -m voicechain ctl loudness-reset --notify"
+          "id": "power",
+          "label": "Verarb.",
+          "description": "Verarbeitung an/aus (Kill-Switch): nur Input Trim + Limiter rechnen, Analyzer und Regelung pausieren; Wiedereinschalten setzt die Stufen zurück und blendet 30 ms ein",
+          "action_script": "integrations/mx_console/actions/power.sh",
+          "applescript": "integrations/mx_console/applescript/power.applescript",
+          "cli": "python -m voicechain ctl power --notify"
         },
         {
           "slot": 5,
@@ -208,6 +208,16 @@
           "cli": "python -m voicechain ctl mute --notify"
         }
       }
+    }
+  ],
+  "unassigned": [
+    {
+      "id": "loudness-reset",
+      "label": "Lautheit 0",
+      "description": "Lautheits-Offset auf 0 (Ziel = Kalibrierwert)",
+      "action_script": "integrations/mx_console/actions/loudness-reset.sh",
+      "applescript": "integrations/mx_console/applescript/loudness-reset.applescript",
+      "cli": "python -m voicechain ctl loudness-reset --notify"
     }
   ]
 }
