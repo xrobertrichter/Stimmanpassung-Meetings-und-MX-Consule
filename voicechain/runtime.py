@@ -64,7 +64,8 @@ STATUS_INTERVAL_S = 1.0
 # of docs/06, so the thread wakes every 20 ms instead of once per second.
 CONTROL_POLL_INTERVAL_S = 0.02
 # Length of the output-gain ramp for mute/unmute (docs/06: 30 ms). Linear in
-# amplitude: no audible click, finished within two 256-sample blocks at 48 kHz.
+# amplitude: no audible click; 1440 samples at 48 kHz, i.e. the ramp spans six
+# 256-sample blocks (5.6 blocks, the last one partially).
 MUTE_RAMP_S = 0.03
 
 
@@ -862,7 +863,11 @@ class LiveEngine:
             thread.join(timeout=max(2.0, 2.0 * self.adaptive_interval_s))
         self._service_thread = None
         if self.control_server is not None:
-            self.control_server.stop()
+            try:
+                self.control_server.stop()
+            except Exception as exc:  # noqa: BLE001 - the stream must be released regardless
+                self.control_errors += 1
+                print("control socket cleanup failed: {!r}".format(exc), file=sys.stderr, flush=True)
         stream = self.stream
         self.stream = None
         if stream is not None:
@@ -882,13 +887,23 @@ class LiveEngine:
             )
         return "block {:.1f} ms".format(1000.0 * self.block_size / self.sample_rate)
 
+    def handle_sigterm(self, signum=None, frame=None) -> None:
+        """SIGTERM (``kill <pid>``, Options+ "Beenden", launchd): request an orderly stop,
+        so the socket file is removed and the stream closed like after Ctrl-C."""
+        self._stop_event.set()
+
     def run_forever(self) -> None:
-        """Start, block until Ctrl-C or a callback error, then stop.
+        """Start, block until Ctrl-C/SIGTERM or a callback error, then stop.
 
         SIGUSR1 toggles the freeze state of the adaptive controller while running
         (``kill -USR1 <pid>``)."""
-        self.start()
+        previous_sigterm = None
         try:
+            # start() inside the try: a Ctrl-C while the stream/socket come up must
+            # still reach the finally and release both (stop() is idempotent).
+            self.start()
+            if threading.current_thread() is threading.main_thread():
+                previous_sigterm = signal.signal(signal.SIGTERM, self.handle_sigterm)
             signals_ok = self.install_signal_handlers() if self.controller is not None else False
             print(
                 "voicechain running: input #{} channel {} -> output #{} ({} ch), {} Hz, {}. "
@@ -913,6 +928,8 @@ class LiveEngine:
             # error is noticed, Ctrl-C is delivered immediately by the OS.
             while not self._stop_event.is_set():
                 time.sleep(0.2)
+            if self.last_error is None:
+                print("\nstopping (SIGTERM or stop requested) ...", file=sys.stderr, flush=True)
         except KeyboardInterrupt:
             print("\nstopping ...", file=sys.stderr, flush=True)
         finally:
@@ -920,6 +937,8 @@ class LiveEngine:
             if self._signal_handlers_installed:
                 signal.signal(signal.SIGUSR1, signal.SIG_DFL)
                 self._signal_handlers_installed = False
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
         if self.last_error is not None:
             raise RuntimeError(
                 "audio callback failed after {} blocks: {!r}".format(self.blocks_processed, self.last_error)

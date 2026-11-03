@@ -1,6 +1,7 @@
--- MX Creative Console action "mute": Ausgang in 30 ms stumm / wieder an (Dial drücken)
--- Runs the shell action of the same name; the shell script shows the notification.
--- Adjust repoRoot if the repository is not in your home folder under "voicechain".
+-- MX Creative Console action "mute": Ausgang in 30 ms stumm / wieder an (sichtbar auf der Taste)
+-- Runs the shell action of the same name (it chooses the Python with the project's
+-- dependencies: .venv, VOICECHAIN_PYTHON or Homebrew) and shows the answer as a
+-- notification. Adjust repoRoot if the repository is not ~/voicechain.
 set repoRoot to (POSIX path of (path to home folder)) & "voicechain"
 set actionScript to repoRoot & "/integrations/mx_console/actions/mute.sh"
 try

@@ -20,7 +20,7 @@ Protocol details
 
 from __future__ import annotations
 
-import errno
+import getpass
 import json
 import os
 import selectors
@@ -30,8 +30,17 @@ import time
 from pathlib import Path
 from typing import Callable
 
-#: Default socket path relative to the repository root (``cfg.control.socket_path``).
-DEFAULT_SOCKET_PATH = "logs/control.sock"
+#: Default socket path when ``cfg.control.socket_path`` is not set: ``/tmp/voicechain-<user>.sock``.
+#: Decision (docs/06 section 7): Unix socket paths are limited to 103 bytes on macOS and a
+#: repository under ``/Users/<name>/Documents/...`` easily exceeds that with a repo-relative
+#: path; ``/tmp`` is short, per-user (name in the file, mode 0600) and independent of where
+#: the repository lives, so console scripts and ``ctl`` find it without configuration.
+DEFAULT_SOCKET_TEMPLATE = "/tmp/voicechain-{user}.sock"
+#: Longest Unix socket path accepted by macOS (``sun_path`` 104 bytes incl. NUL); Linux allows
+#: 107, the stricter limit is used everywhere so a configuration works on both.
+MAX_SOCKET_PATH_BYTES = 103
+#: Timeout of the liveness probe that decides whether an existing socket file is stale.
+LIVENESS_PROBE_S = 0.2
 #: Commands handled per poll() call; more are left in the buffers for the next pass,
 #: so a flood of commands cannot starve the adaptive controller and the status line.
 MAX_COMMANDS_PER_POLL = 8
@@ -50,14 +59,43 @@ class ControlError(RuntimeError):
     """Client-side failure: no server, timeout, protocol error."""
 
 
+def default_socket_path() -> Path:
+    """``/tmp/voicechain-<user>.sock`` (user name, else numeric uid)."""
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):
+        user = str(os.getuid())
+    return Path(DEFAULT_SOCKET_TEMPLATE.format(user=user))
+
+
 def socket_path_from_config(cfg: dict, base_dir: Path) -> Path:
     """Socket path from ``cfg["control"]["socket_path"]`` (default
-    :data:`DEFAULT_SOCKET_PATH`); relative paths are resolved against ``base_dir``."""
+    :func:`default_socket_path`); relative paths are resolved against ``base_dir``."""
     control_cfg = cfg.get("control") or {}
-    raw = control_cfg.get("socket_path") or DEFAULT_SOCKET_PATH
+    raw = control_cfg.get("socket_path")
+    if not raw:
+        return default_socket_path()
     path = Path(str(raw)).expanduser()
     if not path.is_absolute():
         path = Path(base_dir) / path
+    return path
+
+
+def check_socket_path(path) -> Path:
+    """Raise :class:`ControlError` with a remedy when ``path`` is too long for AF_UNIX.
+
+    Checked explicitly before bind()/connect(): Python reports the overflow itself
+    as a bare ``OSError`` without errno, which would reach the user without advice.
+    """
+    path = Path(path)
+    length = len(os.fsencode(str(path)))
+    if length > MAX_SOCKET_PATH_BYTES:
+        raise ControlError(
+            "control socket path is {} bytes long, Unix sockets allow {} on macOS: {}. "
+            "Set control.socket_path in the YAML to a short absolute path, e.g. "
+            "~/.voicechain/ctl.sock or /tmp/voicechain-<user>.sock (the default), and give "
+            "the same path to ctl with --socket or --config.".format(length, MAX_SOCKET_PATH_BYTES, path)
+        )
     return path
 
 
@@ -110,6 +148,7 @@ class ControlServer:
         self._selector: selectors.BaseSelector | None = None
         self._listener: socket.socket | None = None
         self._connections: dict[int, _Connection] = {}
+        self._bound_inode: int | None = None
         self.commands_handled = 0
         self.protocol_errors = 0
         self.handler_errors = 0
@@ -122,20 +161,17 @@ class ControlServer:
     def start(self) -> None:
         if self.running:
             raise RuntimeError("ControlServer is already running")
+        check_socket_path(self.socket_path)
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self._remove_socket_file()
+        self._remove_stale_socket_file()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             listener.bind(str(self.socket_path))
         except OSError as exc:
             listener.close()
-            if exc.errno == errno.ENAMETOOLONG:
-                raise ControlError(
-                    "socket path too long for a Unix socket ({} chars): {}. "
-                    "Set control.socket_path to a shorter path.".format(len(str(self.socket_path)), self.socket_path)
-                ) from exc
             raise ControlError("cannot create control socket {}: {}".format(self.socket_path, exc)) from exc
         os.chmod(self.socket_path, SOCKET_MODE)
+        self._bound_inode = os.stat(self.socket_path).st_ino
         listener.listen(LISTEN_BACKLOG)
         listener.setblocking(False)
         self._selector = selectors.DefaultSelector()
@@ -155,9 +191,25 @@ class ControlServer:
         if self._selector is not None:
             self._selector.close()
             self._selector = None
-        self._remove_socket_file()
+        self._remove_own_socket_file()
 
-    def _remove_socket_file(self) -> None:
+    def _remove_own_socket_file(self) -> None:
+        """Unlink the socket file only if it is still the one this server bound
+        (another ``run`` may have replaced it in the meantime)."""
+        if self._bound_inode is None:
+            return
+        try:
+            current = os.lstat(self.socket_path)
+        except FileNotFoundError:
+            self._bound_inode = None
+            return
+        if stat.S_ISSOCK(current.st_mode) and current.st_ino == self._bound_inode:
+            os.unlink(self.socket_path)
+        self._bound_inode = None
+
+    def _remove_stale_socket_file(self) -> None:
+        """Replace a socket file left behind by a crashed run; refuse a live server or a
+        regular file."""
         try:
             mode = os.lstat(self.socket_path).st_mode
         except FileNotFoundError:
@@ -165,6 +217,11 @@ class ControlServer:
         if not stat.S_ISSOCK(mode):
             raise ControlError(
                 "{} exists and is not a socket; refusing to replace it".format(self.socket_path)
+            )
+        if socket_is_alive(self.socket_path):
+            raise ControlError(
+                "voicechain run läuft bereits (Steuer-Socket {} antwortet). Zweite Instanz nicht "
+                "gestartet; erst die laufende beenden.".format(self.socket_path)
             )
         os.unlink(self.socket_path)
 
@@ -291,6 +348,23 @@ class ControlServer:
         conn.sock.close()
 
 
+def socket_is_alive(path, timeout: float = LIVENESS_PROBE_S) -> bool:
+    """True when a server accepts connections on ``path`` (used to tell a live run from
+    a stale file). Connection refused / missing file / timeout mean "not alive"."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        probe.connect(str(path))
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, BlockingIOError, PermissionError):
+        return False
+    except OSError:
+        return False
+    else:
+        return True
+    finally:
+        probe.close()
+
+
 # --------------------------------------------------------------------------- client
 #: Pause between connect retries while the server's backlog is full (several
 #: console keys pressed at once); the server polls every 20 ms.
@@ -332,7 +406,7 @@ def send_command(cmd: dict, socket_path, timeout: float = 1.0) -> dict:
     """
     if not isinstance(cmd, dict) or "cmd" not in cmd:
         raise ValueError("cmd must be a dict with a 'cmd' key, got {!r}".format(cmd))
-    path = Path(socket_path)
+    path = check_socket_path(socket_path)
     if not path.exists():
         raise ControlError(
             "voicechain run läuft nicht (kein Steuer-Socket unter {}). Erst 'python -m voicechain run' starten.".format(path)

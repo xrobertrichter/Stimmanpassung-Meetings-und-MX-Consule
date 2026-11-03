@@ -747,21 +747,39 @@ def _parse_switch(value: str | None, name: str):
 
 def _ctl_socket_path(config_arg: str | None) -> Path:
     """Socket path for ctl without importing the DSP stack: read only ``control.socket_path``
-    from the YAML (PyYAML only). A missing or unreadable file falls back to the default."""
-    import yaml
-
+    from the YAML (PyYAML only). Without PyYAML (Apple's system python started by
+    Options+ / ``do shell script``) and without ``--config`` the default path is used,
+    so the console still works as long as ``run`` uses the default too."""
     path = _config_path(config_arg)
+    if not path.is_file():
+        if config_arg is not None:
+            raise FileNotFoundError("configuration file not found: {}".format(path))
+        return socket_path_from_config({}, REPO_ROOT)
+    try:
+        import yaml
+    except ImportError:
+        if config_arg is not None:
+            raise ValueError(
+                "PyYAML is not installed in this Python ({}); cannot read {}. Use the repository's "
+                ".venv (set VOICECHAIN_PYTHON for the console scripts) or pass --socket.".format(
+                    sys.executable, path
+                )
+            ) from None
+        print(
+            "note: PyYAML missing in {}; using the default control socket {}".format(
+                sys.executable, socket_path_from_config({}, REPO_ROOT)
+            ),
+            file=sys.stderr,
+        )
+        return socket_path_from_config({}, REPO_ROOT)
     cfg: dict = {}
-    if path.is_file():
-        with path.open("r", encoding="utf-8") as fh:
-            try:
-                loaded = yaml.safe_load(fh)
-            except yaml.YAMLError as exc:
-                raise ValueError("{}: YAML syntax error: {}".format(path, exc)) from exc
-        if isinstance(loaded, dict):
-            cfg = loaded
-    elif config_arg is not None:
-        raise FileNotFoundError("configuration file not found: {}".format(path))
+    with path.open("r", encoding="utf-8") as fh:
+        try:
+            loaded = yaml.safe_load(fh)
+        except yaml.YAMLError as exc:
+            raise ValueError("{}: YAML syntax error: {}".format(path, exc)) from exc
+    if isinstance(loaded, dict):
+        cfg = loaded
     return socket_path_from_config(cfg, REPO_ROOT)
 
 
@@ -797,12 +815,13 @@ def cmd_ctl(args: argparse.Namespace) -> int:
     socket_path = Path(args.socket).expanduser() if args.socket else _ctl_socket_path(args.config)
     if args.socket and not socket_path.is_absolute():
         socket_path = REPO_ROOT / socket_path
+    notify_errors = args.notify or args.notify_errors
     try:
         response = send_command(command, socket_path, timeout=args.timeout)
     except ControlError as exc:
         line = "voicechain: {}".format(exc)
         print(line, file=sys.stderr)
-        if args.notify:
+        if notify_errors:
             notify(str(exc))
         return EXIT_ERROR
     if response.get("ok"):
@@ -813,7 +832,7 @@ def cmd_ctl(args: argparse.Namespace) -> int:
         return EXIT_OK
     line = "abgelehnt: {}".format(response.get("error", "unbekannter Fehler"))
     print(line, file=sys.stderr)
-    if args.notify:
+    if notify_errors:
         notify(line)
     return EXIT_FAILED
 
@@ -880,15 +899,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctl.add_argument("name", choices=CTL_COMMANDS, metavar="COMMAND", help="one of: " + ", ".join(CTL_COMMANDS))
     p_ctl.add_argument(
         "--value",
-        help="step size for offset keys; on/off/toggle for mute, freeze, bypass and power "
-        "(power = kill switch: processing off computes only input trim + limiter)",
+        help="offset keys: one press = one step; --value sets the magnitude of that step, "
+        "the chain limits it to at most one step width (0.5 LU, 2 dB, 1 dB, 1 level); "
+        "on/off/toggle for mute, freeze, bypass and power (power = kill switch: processing "
+        "off computes only input trim + limiter)",
     )
     p_ctl.add_argument("--text", help="marker text (default: time of day)")
     p_ctl.add_argument("--path", help="snapshot: target YAML (default chosen by the chain)")
-    p_ctl.add_argument("--socket", help="control socket (default: control.socket_path of the config, logs/control.sock)")
+    p_ctl.add_argument("--socket", help="control socket (default: control.socket_path of the config, else /tmp/voicechain-<user>.sock)")
     p_ctl.add_argument("--config", help="YAML whose control.socket_path is used (default: config/chain.default.yaml)")
     p_ctl.add_argument("--timeout", type=float, default=1.0, help="seconds to wait for the answer (default 1.0)")
     p_ctl.add_argument("--notify", action="store_true", help="also show the answer as a macOS notification (osascript)")
+    p_ctl.add_argument(
+        "--notify-errors",
+        action="store_true",
+        help="notification only when the chain rejects the command or is not running (dial keys: "
+        "no banner per detent, but a hint at the range limit)",
+    )
     p_ctl.set_defaults(func=cmd_ctl)
 
     p_mk = sub.add_parser("make-sample", help="write a synthetic speech-like WAV (48 kHz) to rehearse calibration")

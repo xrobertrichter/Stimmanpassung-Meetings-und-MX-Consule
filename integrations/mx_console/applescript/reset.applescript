@@ -1,6 +1,7 @@
--- MX Creative Console action "reset": Alle Offsets 0, Lautheit und Regelung auf Kalibrierwerte, Mute/Bypass aus
--- Runs the shell action of the same name; the shell script shows the notification.
--- Adjust repoRoot if the repository is not in your home folder under "voicechain".
+-- MX Creative Console action "reset": Bedienzustand zurück: Offsets 0, Lautheit Kalibrierwert, Mute/Bypass/DSP-aus/Freeze aus; nachgeführte Schwellen bleiben
+-- Runs the shell action of the same name (it chooses the Python with the project's
+-- dependencies: .venv, VOICECHAIN_PYTHON or Homebrew) and shows the answer as a
+-- notification. Adjust repoRoot if the repository is not ~/voicechain.
 set repoRoot to (POSIX path of (path to home folder)) & "voicechain"
 set actionScript to repoRoot & "/integrations/mx_console/actions/reset.sh"
 try

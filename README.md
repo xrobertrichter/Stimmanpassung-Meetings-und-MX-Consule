@@ -137,23 +137,40 @@ sonst bleibt es still.
 
 ## Bedienung im Meeting (MX Creative Console)
 
-Die laufende Kette lässt sich ohne Terminal korrigieren: Drehregler für Lauter/Leiser, Druck für
-Mute, Tasten für weniger/mehr Raum, weniger Zischen, natürlicher/dichter, Freeze, Reset und
-Status, auf einer zweiten Ebene Klangfarbe, Kill-Switch (Verarbeitung aus: nur Input Trim +
-Limiter, spart Last, Regelung pausiert – anders als der Bypass, der nur abhört und weiterrechnet),
-Neu lernen, Snapshot, Bypass-Vergleich und Marker.
-Alle Tasten sind Offsets auf die kalibrierten Werte; die adaptive Regelung arbeitet weiter und
-regelt sie nicht zurück. Jede Funktion ist auch im Terminal erreichbar:
+Die laufende Kette lässt sich ohne Terminal korrigieren. Alle Tasten sind Offsets auf die
+kalibrierten Werte; die adaptive Regelung arbeitet weiter und regelt sie nicht zurück. Ein Druck
+ist ein Schritt (`--value` ändert nur den Betrag bis zur Schrittweite), Reset nimmt alles zurück.
+
+| Symptom | Taste (Ebene) |
+|---|---|
+| Teilnehmende hören Lüfter/Raum in meinen Pausen | Wenig Raum (Meeting) |
+| Wortenden abgeschnitten | Mehr Raum (Meeting) |
+| S-Laute stechen / es lispelt | Zischen − / Zischen + (Meeting) |
+| Klingt gepresst / Pegel schwankt | Natürlich / Dichter (Meeting) |
+| Zu leise oder zu laut | Dial drehen; Druck = Kalibrierwert (beide Ebenen) |
+| Gleich Präsentation, nichts mehr ändern | Freeze (Meeting) |
+| Ich habe mich verstellt | Reset (Meeting) |
+| Dumpf / spitz über die Verbindung | Wärmer / Heller (Feinabstimmung) |
+| Was ist aktiv? | Status (Feinabstimmung) |
+| Laptop heiß, Verarbeitung aus | DSP an/aus (Feinabstimmung) |
+| Raumwechsel | Neu lernen (Feinabstimmung) |
+| So soll es bleiben / Vergleich / kurz stumm | Snapshot / Bypass A/B / Mute (Feinabstimmung) |
+
+Jede Funktion ist auch im Terminal erreichbar:
 
 ```bash
 python -m voicechain ctl room-less --notify   # weniger Raum, Antwort als macOS-Mitteilung
 python -m voicechain ctl status               # Lautheit, Störabstand, Offsets, Freeze/Mute
 python -m voicechain ctl power                # Kill-Switch: Verarbeitung aus/an (Statuszeile OFF)
-python -m voicechain ctl reset                # zurück zum Kalibrierzustand
+python -m voicechain ctl reset                # Bedienzustand zurück (nachgeführte Schwellen bleiben)
+python -m voicechain ctl relearn              # Regelung neu lernen (nach Raumwechsel)
 ```
 
-Konzept, Begründung je Taste und Fehlersuche: `docs/05_MX_Creative_Console.md`; Skripte,
-Manifest und Verdrahtung in Logi Options+: `integrations/mx_console/README.md`.
+Voraussetzung für die Konsole: das `.venv` im Repository (Schritt 2), denn Logi Options+ startet
+Skripte mit minimalem PATH und Apples System-Python ohne die Abhängigkeiten; die Skripte nehmen
+`.venv/bin/python`, sonst `VOICECHAIN_PYTHON` oder das Homebrew-Python. Konzept, Begründung je
+Taste und Fehlersuche: `docs/05_MX_Creative_Console.md`; Skripte, Manifest (20 Kommandos) und
+Verdrahtung in Logi Options+: `integrations/mx_console/README.md`.
 
 ## Kommandos im Überblick
 
@@ -165,7 +182,7 @@ Manifest und Verdrahtung in Logi Options+: `integrations/mx_console/README.md`.
 | `python -m voicechain calibrate --wav PFAD [--config BASIS] [--out NEU.yaml] [--report BERICHT.md]` | Sprachsample analysieren → Konfigurationsvorschlag + Bericht |
 | `python -m voicechain process --in PFAD --out PFAD [--config PFAD]` | WAV (48 kHz) offline durch die Kette (A/B-Hören), Messzeilen vorher/nachher |
 | `python -m voicechain selftest [--config PFAD] [--report PFAD]` | Synthetische Signale durch die Kette, Prüftabelle Soll/Ist, Exit-Code 1 bei Nichtbestehen |
-| `python -m voicechain ctl KOMMANDO [--value X] [--text ...] [--path PFAD] [--socket PFAD] [--notify]` | Laufende Kette steuern (20 Kommandos der Konsole, z. B. `louder`, `mute`, `room-less`, `power`, `reset`, `status`); Exit 0/1/2 |
+| `python -m voicechain ctl KOMMANDO [--value X] [--text ...] [--path PFAD] [--socket PFAD] [--notify] [--notify-errors]` | Laufende Kette steuern (20 Kommandos der Konsole, z. B. `louder`, `room-less`, `power`, `reset`, `status`); Socket Standard `/tmp/voicechain-<user>.sock` bzw. `control.socket_path`; Exit 0/1/2 |
 | `python -m voicechain make-sample --out PFAD` | Synthetisches Sprach-WAV erzeugen, um den Kalibrierablauf ohne Mikrofon zu proben |
 
 Relative Pfade werden vom Repository-Wurzelverzeichnis aus aufgelöst; Ausgabeverzeichnisse

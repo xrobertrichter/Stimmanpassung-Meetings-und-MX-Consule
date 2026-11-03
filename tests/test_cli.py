@@ -46,6 +46,31 @@ class _RaisingFinder(importlib.abc.MetaPathFinder):
 
 
 @pytest.fixture
+def short_tmp():
+    """Short directory under /tmp for sockets (macOS: AF_UNIX paths <= 103 bytes)."""
+    import shutil
+    import tempfile
+
+    folder = Path(tempfile.mkdtemp(prefix="vc", dir="/tmp"))
+    try:
+        yield folder
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def _run_config(tmp_path: Path, short_tmp: Path, **overrides) -> Path:
+    """Default configuration with log and socket paths outside the repository."""
+    cfg = load_config(str(default_config_path()))
+    cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
+    cfg["control"] = {"socket_path": str(short_tmp / "r.sock")}
+    for key, value in overrides.items():
+        cfg[key] = value
+    cfg_path = tmp_path / "run.yaml"
+    save_config(cfg, str(cfg_path))
+    return cfg_path
+
+
+@pytest.fixture
 def no_portaudio(monkeypatch):
     """Make ``import sounddevice`` fail the way it does without PortAudio."""
     monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
@@ -156,8 +181,8 @@ def test_devices_without_portaudio_reports_error_not_traceback(no_portaudio, cap
     assert "Traceback" not in captured.err
 
 
-def test_run_without_portaudio_reports_error(no_portaudio, capsys):
-    code = main(["run"])
+def test_run_without_portaudio_reports_error(no_portaudio, capsys, tmp_path, short_tmp):
+    code = main(["run", "--config", str(_run_config(tmp_path, short_tmp))])
     captured = capsys.readouterr()
     assert code == EXIT_ERROR
     assert "PortAudio" in captured.err
@@ -461,6 +486,7 @@ def test_selftest_rows_are_structured():
 
 
 # ------------------------------------------------------------------------- calibrate
+@pytest.mark.slow  # ~15 s: full calibration of a 60 s sample (acceptance run with "slow")
 def test_calibrate_writes_config_and_report(tmp_path, capsys):
     sample = tmp_path / "sample.wav"
     assert main(["make-sample", "--out", str(sample)]) == EXIT_OK
@@ -487,15 +513,13 @@ def test_calibrate_missing_wav_is_reported(tmp_path, capsys):
 
 
 # ------------------------------------------------------------------------------ run
-def test_run_with_fake_stream_processes_blocks_and_stops_on_ctrl_c(monkeypatch, tmp_path, capsys):
+def test_run_with_fake_stream_processes_blocks_and_stops_on_ctrl_c(monkeypatch, tmp_path, short_tmp, capsys):
     blocks = 40
     fake_sd = _make_fake_sd(blocks)
     monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
     cfg = load_config(str(default_config_path()))
-    cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
     cfg["adaptive"]["interval_s"] = 0.1  # smallest value validate_config allows
-    cfg_path = tmp_path / "run.yaml"
-    save_config(cfg, str(cfg_path))
+    cfg_path = _run_config(tmp_path, short_tmp, adaptive=cfg["adaptive"] | {"log_path": str(tmp_path / "logs" / "a.jsonl")})
 
     code = main(["run", "--config", str(cfg_path), "--freeze"])
     captured = capsys.readouterr()
@@ -510,9 +534,11 @@ def test_run_with_fake_stream_processes_blocks_and_stops_on_ctrl_c(monkeypatch, 
     assert np.max(np.abs(stacked)) > 0.001  # the chain produced output
     assert "stopped after {} blocks".format(blocks) in captured.err
     assert "adaptive: on (frozen)" in captured.err
+    assert not (short_tmp / "r.sock").exists()
+    assert not (cli.REPO_ROOT / "logs" / "control.sock").exists()  # nothing written into the repo
 
 
-def test_run_builds_analyzer_with_deesser_band_of_loaded_config(monkeypatch, tmp_path, capsys):
+def test_run_builds_analyzer_with_deesser_band_of_loaded_config(monkeypatch, tmp_path, short_tmp, capsys):
     """The live analyzer must measure in the de-esser band of the (calibrated) configuration."""
     import voicechain.adaptive as adaptive
 
@@ -530,9 +556,7 @@ def test_run_builds_analyzer_with_deesser_band_of_loaded_config(monkeypatch, tmp
     cfg = load_config(str(default_config_path()))
     cfg["chain"]["deesser"]["freq_hz"] = 7200.0  # calibrated to a sibilance centroid off the default
     cfg["chain"]["deesser"]["bandwidth_oct"] = 0.5
-    cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
-    cfg_path = tmp_path / "calibrated.yaml"
-    save_config(cfg, str(cfg_path))
+    cfg_path = _run_config(tmp_path, short_tmp, chain=cfg["chain"])
 
     code = main(["run", "--config", str(cfg_path)])
     assert code == EXIT_OK, capsys.readouterr().err
@@ -627,7 +651,7 @@ class _PolledControlServer:
             time.sleep(0.005)
 
 
-def test_ctl_parser_knows_all_19_console_commands():
+def test_ctl_parser_knows_all_console_commands():
     parser = cli.build_parser()
     for name in cli.CTL_COMMANDS:
         args = parser.parse_args(["ctl", name])
@@ -696,9 +720,9 @@ def test_build_control_command_options():
         cli.build_control_command("unknown-key")
 
 
-def test_ctl_round_trip_exit_codes_and_single_line_output(tmp_path, capsys, monkeypatch):
+def test_ctl_round_trip_exit_codes_and_single_line_output(short_tmp, capsys, monkeypatch):
     monkeypatch.setattr(cli, "notify", lambda message, title="voicechain": False)
-    sock = tmp_path / "c.sock"
+    sock = short_tmp / "c.sock"
 
     def responder(cmd):
         if cmd["cmd"] == "reset":
@@ -724,13 +748,19 @@ def test_ctl_round_trip_exit_codes_and_single_line_output(tmp_path, capsys, monk
     assert "voicechain run läuft nicht" in err and "Traceback" not in err
 
 
-def test_ctl_default_socket_path_comes_from_config(tmp_path, monkeypatch, capsys):
+def test_ctl_default_socket_path_comes_from_config(tmp_path, short_tmp, monkeypatch, capsys):
     cfg_path = tmp_path / "ctl.yaml"
-    sock = tmp_path / "x.sock"
+    sock = short_tmp / "x.sock"
     cfg_path.write_text("control:\n  socket_path: {}\n".format(sock), encoding="utf-8")
     assert cli._ctl_socket_path(str(cfg_path)) == sock
-    # default config -> logs/control.sock under the repository root
-    assert cli._ctl_socket_path(None) == cli.REPO_ROOT / "logs" / "control.sock"
+    # the default config sets control.socket_path (relative to the repository root)
+    from voicechain.control import default_socket_path, socket_path_from_config
+
+    default_cfg = load_config(str(default_config_path()))
+    assert cli._ctl_socket_path(None) == socket_path_from_config(default_cfg, cli.REPO_ROOT)
+    # a config without the key -> /tmp/voicechain-<user>.sock
+    (tmp_path / "nokey.yaml").write_text("sample_rate: 48000\n", encoding="utf-8")
+    assert cli._ctl_socket_path(str(tmp_path / "nokey.yaml")) == default_socket_path()
     with _PolledControlServer(sock) as server:
         assert main(["ctl", "status", "--config", str(cfg_path)]) == EXIT_OK
         assert server.commands == [{"cmd": "status"}]
@@ -739,12 +769,12 @@ def test_ctl_default_socket_path_comes_from_config(tmp_path, monkeypatch, capsys
     assert "not found" in capsys.readouterr().err
 
 
-def test_ctl_notify_without_osascript_is_console_only(tmp_path, monkeypatch, capsys):
+def test_ctl_notify_without_osascript_is_console_only(short_tmp, monkeypatch, capsys):
     import shutil
 
     monkeypatch.setattr(shutil, "which", lambda name: None)
     assert cli.notify("hallo") is False
-    sock = tmp_path / "c.sock"
+    sock = short_tmp / "c.sock"
     with _PolledControlServer(sock):
         assert main(["ctl", "louder", "--socket", str(sock), "--notify"]) == EXIT_OK
     out = capsys.readouterr()
@@ -771,6 +801,41 @@ def test_ctl_notify_uses_osascript_when_present(monkeypatch, tmp_path):
     assert 'display notification "Raum +2 dB \\"ok\\"" with title "voicechain"' == calls[0][2]
 
 
+def test_ctl_notify_errors_only_notifies_rejections(short_tmp, monkeypatch, capsys):
+    """Dial detents use --notify-errors: no banner per step, one when the chain says no."""
+    shown: list[str] = []
+    monkeypatch.setattr(cli, "notify", lambda message, title="voicechain": shown.append(message) or True)
+    sock = short_tmp / "c.sock"
+
+    def responder(cmd):
+        if cmd.get("delta", 0) < 0:
+            return {"ok": False, "error": "Lautheit am Anschlag (-24.0 LUFS)"}
+        return {"ok": True, "state": {}, "message": "Lautheit +0.5 LU"}
+
+    with _PolledControlServer(sock, responder):
+        assert main(["ctl", "louder", "--socket", str(sock), "--notify-errors"]) == EXIT_OK
+        assert shown == []
+        assert main(["ctl", "quieter", "--socket", str(sock), "--notify-errors"]) == EXIT_FAILED
+        assert shown == ["abgelehnt: Lautheit am Anschlag (-24.0 LUFS)"]
+    capsys.readouterr()
+    assert main(["ctl", "louder", "--socket", str(sock), "--notify-errors"]) == EXIT_ERROR
+    assert len(shown) == 2 and "läuft nicht" in shown[-1]
+
+
+def test_ctl_socket_path_without_pyyaml_falls_back_to_default(monkeypatch, tmp_path, capsys):
+    """Apple's system python (Options+ PATH) has no PyYAML: ctl must still find the default socket."""
+    from voicechain.control import default_socket_path
+
+    monkeypatch.setitem(sys.modules, "yaml", None)  # makes "import yaml" fail
+    assert cli._ctl_socket_path(None) == default_socket_path()
+    assert "PyYAML missing" in capsys.readouterr().err
+    cfg_path = tmp_path / "x.yaml"
+    cfg_path.write_text("control:\n  socket_path: /tmp/other.sock\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        cli._ctl_socket_path(str(cfg_path))  # an explicit --config cannot be honoured silently
+    assert "PyYAML" in str(excinfo.value) and "--socket" in str(excinfo.value)
+
+
 def test_ctl_import_path_stays_light():
     """ctl must answer in < 300 ms including interpreter start: importing the CLI
     module must not pull in numpy/scipy (they are loaded lazily by the heavy commands)."""
@@ -787,13 +852,13 @@ def test_ctl_import_path_stays_light():
     assert int(millis) < 500  # generous bound for slow CI; measured 13 ms
 
 
-def test_run_opens_control_socket_and_answers_a_live_command(monkeypatch, tmp_path, capsys):
+def test_run_opens_control_socket_and_answers_a_live_command(monkeypatch, tmp_path, short_tmp, capsys):
     """End to end: run with the real LiveControl, a console command arrives while audio runs."""
     from voicechain.control import send_command
 
     blocks = 60
     fake_sd = _make_fake_sd(blocks)
-    sock = tmp_path / "live.sock"
+    sock = short_tmp / "live.sock"
     cfg = load_config(str(default_config_path()))
     cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
     cfg["control"] = {"socket_path": str(sock)}
@@ -844,16 +909,16 @@ def test_run_opens_control_socket_and_answers_a_live_command(monkeypatch, tmp_pa
     assert answers[1]["state"]["adaptive_enabled"] is True
     assert answers[2]["ok"] is True and answers[2]["state"]["processing"] is False  # real Chain.set_processing path
     assert answers[3]["ok"] is True and answers[3]["state"]["processing"] is True
-    assert answers[4]["ok"] is True and "Lernphase neu gestartet" in answers[4]["message"]
+    assert answers[4]["ok"] is True and "Lernphase" in answers[4]["message"]  # relearn restarts the learning phase
     assert len(analyzers) == 1  # the one analyzer of cmd_run was handed to LiveControl ...
     assert analyzers[0].reset_calls == 1  # ... and relearn cleared its history
     assert answers[4]["state"]["learning"] is True
     assert not sock.exists()  # removed at stop
 
 
-def test_run_no_control_skips_the_socket(monkeypatch, tmp_path, capsys):
+def test_run_no_control_skips_the_socket(monkeypatch, tmp_path, short_tmp, capsys):
     fake_sd = _make_fake_sd(10)
-    sock = tmp_path / "none.sock"
+    sock = short_tmp / "none.sock"
     cfg = load_config(str(default_config_path()))
     cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
     cfg["control"] = {"socket_path": str(sock)}

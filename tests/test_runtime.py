@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.abc
 import importlib.machinery
 import math
+import pathlib
 import sys
 import threading
 import time
@@ -189,6 +190,19 @@ class RecordingController:
 
     def freeze(self, on: bool):
         self.frozen = on
+
+
+@pytest.fixture
+def short_sock_path():
+    """Socket path under /tmp (macOS limits AF_UNIX paths to 103 bytes; tmp_path is longer)."""
+    import shutil
+    import tempfile
+
+    folder = pathlib.Path(tempfile.mkdtemp(prefix="vc", dir="/tmp"))
+    try:
+        yield folder / "c.sock"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 @pytest.fixture
@@ -972,10 +986,10 @@ def test_frozen_state_follows_controller_flag(fake_sd):
     assert controller.frozen is False
 
 
-def test_control_server_runs_in_service_thread_and_socket_lifecycle(fake_sd, tmp_path):
+def test_control_server_runs_in_service_thread_and_socket_lifecycle(fake_sd, short_sock_path):
     from voicechain.control import send_command
 
-    sock_path = tmp_path / "c.sock"
+    sock_path = short_sock_path
     cfg = base_cfg(adaptive={"enabled": True, "learn_s": 0.0, "interval_s": 1.0})
     chain = RecordingChain([])
     engine = LiveEngine(cfg, chain, controller=RecordingController(), on_status=lambda line: None)
@@ -1003,10 +1017,10 @@ def test_control_server_runs_in_service_thread_and_socket_lifecycle(fake_sd, tmp
     assert engine.control_server is not None and not engine.control_server.running
 
 
-def test_start_fails_cleanly_when_socket_cannot_be_created(fake_sd, tmp_path):
+def test_start_fails_cleanly_when_socket_cannot_be_created(fake_sd, short_sock_path):
     from voicechain.control import ControlError
 
-    blocker = tmp_path / "blocker.sock"
+    blocker = short_sock_path.parent / "blocker.sock"
     blocker.write_text("not a socket", encoding="utf-8")
     engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
     engine.attach_control(FakeLiveControl(), blocker)
@@ -1067,3 +1081,67 @@ def test_status_line_reports_cpu_load_of_the_chain(fake_sd):
     assert "cpu {:3.0f}%".format(100.0 * engine.cpu_load) in line
     # the accumulator is reset per status line; without new blocks the last value stays
     assert engine.status_line().count("cpu") == 1
+
+
+# ------------------------------------------------------------ shutdown robustness
+def test_sigterm_requests_an_orderly_stop(fake_sd, short_sock_path):
+    """kill <pid> must behave like Ctrl-C: socket file removed, stream closed, no traceback."""
+    import os
+    import signal
+
+    engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
+    engine.attach_control(FakeLiveControl(), short_sock_path)
+
+    def send_term():
+        deadline = time.monotonic() + 3.0
+        while not short_sock_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=send_term, daemon=True).start()
+    previous = signal.getsignal(signal.SIGTERM)
+    engine.run_forever()  # returns normally
+    assert signal.getsignal(signal.SIGTERM) == previous  # handler restored
+    assert not short_sock_path.exists()
+    assert FakeStream.instances[-1].closed
+    assert engine.stream is None
+
+
+def test_stop_closes_stream_even_if_control_cleanup_fails(fake_sd, capsys):
+    engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
+    engine.start()
+
+    class BrokenServer:
+        running = False
+
+        def start(self):
+            raise AssertionError("not used")
+
+        def stop(self):
+            raise OSError("cannot unlink socket")
+
+    engine.control_server = BrokenServer()
+    engine.stop()
+    assert FakeStream.instances[-1].stopped and FakeStream.instances[-1].closed
+    assert engine.stream is None
+    assert engine.control_errors == 1
+    assert "control socket cleanup failed" in capsys.readouterr().err
+
+
+def test_ctrl_c_during_start_still_releases_the_stream(fake_sd, short_sock_path):
+    """start() runs inside run_forever's try: an interrupt while the socket comes up
+    must reach the finally (stream closed, no socket file), not escape as a traceback."""
+
+    engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
+    engine.attach_control(FakeLiveControl(), short_sock_path)
+    real_start = engine.control_server.start
+
+    def start_then_interrupt():
+        real_start()
+        raise KeyboardInterrupt  # Ctrl-C arriving in the start window
+
+    engine.control_server.start = start_then_interrupt
+    engine.run_forever()  # no exception
+    assert FakeStream.instances[-1].closed
+    assert not short_sock_path.exists()
+    assert engine.stream is None

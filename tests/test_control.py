@@ -18,11 +18,14 @@ from pathlib import Path
 import pytest
 
 from voicechain.control import (
-    DEFAULT_SOCKET_PATH,
     MAX_LINE_BYTES,
+    MAX_SOCKET_PATH_BYTES,
     ControlError,
     ControlServer,
+    check_socket_path,
+    default_socket_path,
     send_command,
+    socket_is_alive,
     socket_path_from_config,
 )
 
@@ -74,9 +77,19 @@ class PolledServer:
 
 
 @pytest.fixture
-def sock_path(tmp_path) -> Path:
-    # Unix socket paths are limited to ~100 bytes; keep the name short.
-    return tmp_path / "c.sock"
+def sock_path() -> Path:
+    """Short socket path: macOS limits AF_UNIX paths to 103 bytes and pytest's tmp_path
+    (/private/var/folders/...) exceeds that, so sockets live in /tmp/vcXXXX/c.sock."""
+    import shutil
+    import tempfile
+
+    folder = Path(tempfile.mkdtemp(prefix="vc", dir="/tmp"))
+    path = folder / "c.sock"
+    assert len(os.fsencode(str(path))) <= 90
+    try:
+        yield path
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 # ------------------------------------------------------------------- lifecycle
@@ -140,19 +153,67 @@ class PolledServerFromRunning:
             time.sleep(0.005)
 
 
-def test_socket_path_too_long_is_a_clear_error(tmp_path):
+def test_socket_path_too_long_is_checked_before_bind_and_connect(tmp_path):
     long_path = tmp_path / ("x" * 120) / "c.sock"
+    assert len(os.fsencode(str(long_path))) > MAX_SOCKET_PATH_BYTES
+    # server side: explicit check, with the remedy, before any bind()
     with pytest.raises(ControlError) as excinfo:
         ControlServer(long_path, EchoHandler()).start()
-    assert "too long" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "bytes long" in message and str(MAX_SOCKET_PATH_BYTES) in message
+    assert "control.socket_path" in message and "/tmp/voicechain-<user>.sock" in message
+    assert not long_path.parent.exists()  # nothing was created
+    # client side: same check before connect(), same advice
+    with pytest.raises(ControlError) as excinfo:
+        send_command({"cmd": "status"}, long_path)
+    assert "control.socket_path" in str(excinfo.value)
+    # exactly at the limit is accepted by the check itself
+    at_limit = Path("/" + "y" * (MAX_SOCKET_PATH_BYTES - 1))
+    assert check_socket_path(at_limit) == at_limit
 
 
 def test_socket_path_from_config_defaults_and_resolves(tmp_path):
     base = tmp_path / "repo"
-    assert socket_path_from_config({}, base) == base / DEFAULT_SOCKET_PATH
+    default = socket_path_from_config({}, base)
+    assert default == default_socket_path()
+    assert str(default).startswith("/tmp/voicechain-") and str(default).endswith(".sock")
+    assert len(os.fsencode(str(default))) <= MAX_SOCKET_PATH_BYTES
+    assert socket_path_from_config({"control": {"socket_path": None}}, base) == default
     assert socket_path_from_config({"control": {"socket_path": "run/x.sock"}}, base) == base / "run" / "x.sock"
     absolute = tmp_path / "abs.sock"
     assert socket_path_from_config({"control": {"socket_path": str(absolute)}}, base) == absolute
+
+
+def test_second_server_refuses_to_replace_a_live_socket(sock_path):
+    first = EchoHandler()
+    with PolledServer(sock_path, first) as running:
+        assert socket_is_alive(sock_path)
+        second = ControlServer(sock_path, EchoHandler())
+        with pytest.raises(ControlError) as excinfo:
+            second.start()
+        assert "voicechain run läuft bereits" in str(excinfo.value)
+        assert not second.running
+        second.stop()  # never bound: must not touch the first server's socket file
+        assert sock_path.exists()
+        assert send_command({"cmd": "status"}, sock_path)["ok"] is True  # first server untouched
+        assert running.server.commands_handled == 1
+    assert not socket_is_alive(sock_path)
+
+
+def test_stop_removes_only_its_own_socket_file(sock_path):
+    server = ControlServer(sock_path, EchoHandler())
+    server.start()
+    # Another process replaces the file under us (a second run that ignored ours): unlink + rebind.
+    os.unlink(sock_path)
+    other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    other.bind(str(sock_path))
+    try:
+        server.stop()
+        assert sock_path.exists()  # the newer file belongs to someone else and stays
+        assert stat.S_ISSOCK(os.lstat(sock_path).st_mode)
+    finally:
+        other.close()
+        sock_path.unlink(missing_ok=True)
 
 
 # ------------------------------------------------------------------- round trips
@@ -364,11 +425,12 @@ def test_client_reports_server_that_closes_without_answer(sock_path):
 # ------------------------------------------------------------- console manifest
 MANIFEST_DIR = Path(__file__).resolve().parent.parent / "integrations" / "mx_console"
 EXPECTED_PAGES = {
-    "Meeting": ["room-less", "room-more", "deess-more", "natural", "dense", "freeze", "reset", "status"],
-    "Feinabstimmung": ["warmer", "brighter", "deess-less", "power", "relearn", "snapshot", "bypass", "marker"],
+    "Meeting": ["room-less", "room-more", "deess-more", "deess-less", "natural", "dense", "freeze", "reset"],
+    "Feinabstimmung": ["warmer", "brighter", "status", "power", "relearn", "snapshot", "bypass", "mute"],
 }
-EXPECTED_DIAL = {"rotate_cw": "louder", "rotate_ccw": "quieter", "press": "mute"}
-EXPECTED_UNASSIGNED = ["loudness-reset"]  # keeps script, AppleScript and CLI, but no key
+EXPECTED_DIAL = {"rotate_cw": "louder", "rotate_ccw": "quieter", "press": "loudness-reset"}
+EXPECTED_UNASSIGNED = ["marker"]  # keeps script, AppleScript and CLI, but no key
+EXPECTED_LABELS = {"deess-more": "Zischen −", "deess-less": "Zischen +", "power": "DSP an/aus", "loudness-reset": "Lautheit 0"}
 
 
 def _load_manifest() -> dict:
@@ -385,6 +447,14 @@ def test_manifest_pages_match_the_assignment():
         assert {k: v["id"] for k, v in page["dial"].items()} == EXPECTED_DIAL  # dial identical on both pages
     assert [u["id"] for u in manifest["unassigned"]] == EXPECTED_UNASSIGNED
     assert all("slot" not in u for u in manifest["unassigned"])
+    labels = {e["id"]: e["label"] for page in manifest["pages"] for e in page["keys"] + list(page["dial"].values())}
+    for fid, label in EXPECTED_LABELS.items():
+        assert labels[fid] == label
+    # dial detents must not raise a notification banner each, only rejections
+    for page in manifest["pages"]:
+        for name, entry in page["dial"].items():
+            expected_flag = "--notify-errors" if name.startswith("rotate") else "--notify"
+            assert entry["cli"].endswith(expected_flag), (name, entry["cli"])
 
 
 def test_every_function_has_script_applescript_cli_and_short_label():
@@ -407,9 +477,12 @@ def test_every_function_has_script_applescript_cli_and_short_label():
         assert script.is_file(), script
         assert os.access(script, os.X_OK), "not executable: {}".format(script)
         assert applescript.is_file(), applescript
-        assert "-m voicechain ctl {} --notify".format(entry["id"]) in script.read_text(encoding="utf-8")
+        flag = "--notify-errors" if entry["id"] in ("louder", "quieter") else "--notify"
+        script_text = script.read_text(encoding="utf-8")
+        assert "-m voicechain ctl {} {} ".format(entry["id"], flag) in script_text
+        assert "VOICECHAIN_PYTHON" in script_text and "/opt/homebrew/bin/python3" in script_text
         assert "actions/{}.sh".format(entry["id"]) in applescript.read_text(encoding="utf-8")
-        assert entry["cli"] == "python -m voicechain ctl {} --notify".format(entry["id"])
+        assert entry["cli"] == "python -m voicechain ctl {} {}".format(entry["id"], flag)
         args = parser.parse_args(["ctl", entry["id"]])  # the CLI name exists in the parser
         assert args.name == entry["id"]
     assert ids == set(CTL_COMMANDS)  # every CLI command has console artefacts (keys, dial or unassigned)

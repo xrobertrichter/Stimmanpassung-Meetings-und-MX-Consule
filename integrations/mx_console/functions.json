@@ -1,7 +1,7 @@
 {
-  "schema": "voicechain-mx-console/1",
-  "description": "Belegung der Logi MX Creative Console für voicechain (docs/06_Beauftragung_MX_Console.md §2). Jede Taste startet die Shell-Aktion oder das AppleScript; die CLI-Zeile ist der Inhalt beider. Funktionen unter 'unassigned' haben Skript und CLI, aber keine Taste (frei belegbar).",
-  "requires": "python -m voicechain run (Steuer-Socket control.socket_path, Standard logs/control.sock)",
+  "schema": "voicechain-mx-console/2",
+  "description": "Belegung der Logi MX Creative Console für voicechain nach docs/06_Beauftragung_MX_Console.md §2 (Stand nach PO-Prüfung 2026-11-03). Jede Taste startet die Shell-Aktion oder das AppleScript; die CLI-Zeile ist der Inhalt beider. Dial-Aktionen melden nur Ablehnungen (--notify-errors). Funktionen unter 'unassigned' haben Skript und CLI, aber keine Taste.",
+  "requires": "python -m voicechain run (Steuer-Socket control.socket_path, Standard /tmp/voicechain-<user>.sock)",
   "pages": [
     {
       "name": "Meeting",
@@ -10,7 +10,7 @@
           "slot": 1,
           "id": "room-less",
           "label": "Wenig Raum",
-          "description": "Expander-Schwelle +2 dB: weniger Raum in Pausen",
+          "description": "Expander-Schwelle +2 dB: weniger Raum und Lüfter in Pausen",
           "action_script": "integrations/mx_console/actions/room-less.sh",
           "applescript": "integrations/mx_console/applescript/room-less.applescript",
           "cli": "python -m voicechain ctl room-less --notify"
@@ -19,7 +19,7 @@
           "slot": 2,
           "id": "room-more",
           "label": "Mehr Raum",
-          "description": "Expander-Schwelle −2 dB: natürlichere Pausen",
+          "description": "Expander-Schwelle −2 dB: Wortenden und Raum natürlicher",
           "action_script": "integrations/mx_console/actions/room-more.sh",
           "applescript": "integrations/mx_console/applescript/room-more.applescript",
           "cli": "python -m voicechain ctl room-more --notify"
@@ -27,7 +27,7 @@
         {
           "slot": 3,
           "id": "deess-more",
-          "label": "Zisch -",
+          "label": "Zischen −",
           "description": "De-Esser-Schwelle −2 dB: weniger Zischlaute",
           "action_script": "integrations/mx_console/actions/deess-more.sh",
           "applescript": "integrations/mx_console/applescript/deess-more.applescript",
@@ -35,74 +35,74 @@
         },
         {
           "slot": 4,
+          "id": "deess-less",
+          "label": "Zischen +",
+          "description": "De-Esser-Schwelle +2 dB: De-Esser zurücknehmen (lispelt)",
+          "action_script": "integrations/mx_console/actions/deess-less.sh",
+          "applescript": "integrations/mx_console/applescript/deess-less.applescript",
+          "cli": "python -m voicechain ctl deess-less --notify"
+        },
+        {
+          "slot": 5,
           "id": "natural",
           "label": "Natürlich",
-          "description": "Intensität −1: Kompressor +2 dB, De-Esser +1 dB",
+          "description": "Intensität −1: Kompressor-Schwelle +2 dB, weniger verdichtet",
           "action_script": "integrations/mx_console/actions/natural.sh",
           "applescript": "integrations/mx_console/applescript/natural.applescript",
           "cli": "python -m voicechain ctl natural --notify"
         },
         {
-          "slot": 5,
+          "slot": 6,
           "id": "dense",
           "label": "Dichter",
-          "description": "Intensität +1: Kompressor −2 dB, De-Esser −1 dB",
+          "description": "Intensität +1: Kompressor-Schwelle −2 dB, gleichmäßiger",
           "action_script": "integrations/mx_console/actions/dense.sh",
           "applescript": "integrations/mx_console/applescript/dense.applescript",
           "cli": "python -m voicechain ctl dense --notify"
         },
         {
-          "slot": 6,
+          "slot": 7,
           "id": "freeze",
           "label": "Freeze",
-          "description": "Adaptive Regelung einfrieren / freigeben",
+          "description": "Adaptive Regelung einfrieren / wieder freigeben",
           "action_script": "integrations/mx_console/actions/freeze.sh",
           "applescript": "integrations/mx_console/applescript/freeze.applescript",
           "cli": "python -m voicechain ctl freeze --notify"
         },
         {
-          "slot": 7,
+          "slot": 8,
           "id": "reset",
           "label": "Reset",
-          "description": "Alle Offsets 0, Lautheit und Regelung auf Kalibrierwerte, Mute/Bypass aus",
+          "description": "Bedienzustand zurück: Offsets 0, Lautheit Kalibrierwert, Mute/Bypass/DSP-aus/Freeze aus; nachgeführte Schwellen bleiben",
           "action_script": "integrations/mx_console/actions/reset.sh",
           "applescript": "integrations/mx_console/applescript/reset.applescript",
           "cli": "python -m voicechain ctl reset --notify"
-        },
-        {
-          "slot": 8,
-          "id": "status",
-          "label": "Status",
-          "description": "Mitteilung mit Lautheit, Störabstand, Offsets, Freeze/Mute",
-          "action_script": "integrations/mx_console/actions/status.sh",
-          "applescript": "integrations/mx_console/applescript/status.applescript",
-          "cli": "python -m voicechain ctl status --notify"
         }
       ],
       "dial": {
         "rotate_cw": {
           "id": "louder",
           "label": "Lauter",
-          "description": "Ziel-Lautheit +0,5 LU (Dial im Uhrzeigersinn)",
+          "description": "Ziel-Lautheit +0,5 LU je Rastung (Dial rechts), ohne Mitteilung",
           "action_script": "integrations/mx_console/actions/louder.sh",
           "applescript": "integrations/mx_console/applescript/louder.applescript",
-          "cli": "python -m voicechain ctl louder --notify"
+          "cli": "python -m voicechain ctl louder --notify-errors"
         },
         "rotate_ccw": {
           "id": "quieter",
           "label": "Leiser",
-          "description": "Ziel-Lautheit −0,5 LU (Dial gegen den Uhrzeigersinn)",
+          "description": "Ziel-Lautheit −0,5 LU je Rastung (Dial links), ohne Mitteilung",
           "action_script": "integrations/mx_console/actions/quieter.sh",
           "applescript": "integrations/mx_console/applescript/quieter.applescript",
-          "cli": "python -m voicechain ctl quieter --notify"
+          "cli": "python -m voicechain ctl quieter --notify-errors"
         },
         "press": {
-          "id": "mute",
-          "label": "Mute",
-          "description": "Ausgang in 30 ms stumm / wieder an (Dial drücken)",
-          "action_script": "integrations/mx_console/actions/mute.sh",
-          "applescript": "integrations/mx_console/applescript/mute.applescript",
-          "cli": "python -m voicechain ctl mute --notify"
+          "id": "loudness-reset",
+          "label": "Lautheit 0",
+          "description": "Lautheits-Offset zurück auf den Kalibrierwert (Dial drücken)",
+          "action_script": "integrations/mx_console/actions/loudness-reset.sh",
+          "applescript": "integrations/mx_console/applescript/loudness-reset.applescript",
+          "cli": "python -m voicechain ctl loudness-reset --notify"
         }
       }
     },
@@ -113,7 +113,7 @@
           "slot": 1,
           "id": "warmer",
           "label": "Wärmer",
-          "description": "Klang-Tilt −1 dB (250 Hz +½, 4 kHz −½)",
+          "description": "Klang-Tilt −1 dB (250 Hz +½ dB, 4 kHz −½ dB)",
           "action_script": "integrations/mx_console/actions/warmer.sh",
           "applescript": "integrations/mx_console/applescript/warmer.applescript",
           "cli": "python -m voicechain ctl warmer --notify"
@@ -129,18 +129,18 @@
         },
         {
           "slot": 3,
-          "id": "deess-less",
-          "label": "Zisch +",
-          "description": "De-Esser-Schwelle +2 dB: De-Esser zurücknehmen",
-          "action_script": "integrations/mx_console/actions/deess-less.sh",
-          "applescript": "integrations/mx_console/applescript/deess-less.applescript",
-          "cli": "python -m voicechain ctl deess-less --notify"
+          "id": "status",
+          "label": "Status",
+          "description": "Mitteilung: Lautheit, Störabstand, Offsets, Freeze/Mute/Bypass/OFF",
+          "action_script": "integrations/mx_console/actions/status.sh",
+          "applescript": "integrations/mx_console/applescript/status.applescript",
+          "cli": "python -m voicechain ctl status --notify"
         },
         {
           "slot": 4,
           "id": "power",
-          "label": "Verarb.",
-          "description": "Verarbeitung an/aus (Kill-Switch): nur Input Trim + Limiter rechnen, Analyzer und Regelung pausieren; Wiedereinschalten setzt die Stufen zurück und blendet 30 ms ein",
+          "label": "DSP an/aus",
+          "description": "Kill-Switch: nur Input Trim + Limiter rechnen, Analyzer und Regelung pausieren",
           "action_script": "integrations/mx_console/actions/power.sh",
           "applescript": "integrations/mx_console/applescript/power.applescript",
           "cli": "python -m voicechain ctl power --notify"
@@ -149,7 +149,7 @@
           "slot": 5,
           "id": "relearn",
           "label": "Neu lernen",
-          "description": "Lernphase der Regelung neu starten, Offsets bleiben",
+          "description": "Regelung auf Kalibrierwerte, Lernphase neu, Analyzer leer; Offsets bleiben",
           "action_script": "integrations/mx_console/actions/relearn.sh",
           "applescript": "integrations/mx_console/applescript/relearn.applescript",
           "cli": "python -m voicechain ctl relearn --notify"
@@ -158,7 +158,7 @@
           "slot": 6,
           "id": "snapshot",
           "label": "Snapshot",
-          "description": "Basiswerte + Offsets als config/chain.live.yaml speichern",
+          "description": "Hörbaren Ist-Zustand als config/chain.live.yaml speichern (_live.created = Zeitstempel)",
           "action_script": "integrations/mx_console/actions/snapshot.sh",
           "applescript": "integrations/mx_console/applescript/snapshot.applescript",
           "cli": "python -m voicechain ctl snapshot --notify"
@@ -167,57 +167,57 @@
           "slot": 7,
           "id": "bypass",
           "label": "Bypass A/B",
-          "description": "Kette umgehen (nur Input Trim + Limiter) zum Vergleich",
+          "description": "Kette umgehen (nur Input Trim + Limiter), Stufen rechnen weiter; 30 ms Blende",
           "action_script": "integrations/mx_console/actions/bypass.sh",
           "applescript": "integrations/mx_console/applescript/bypass.applescript",
           "cli": "python -m voicechain ctl bypass --notify"
         },
         {
           "slot": 8,
-          "id": "marker",
-          "label": "Marker",
-          "description": "Zeitmarke mit Text ins Regelungslog",
-          "action_script": "integrations/mx_console/actions/marker.sh",
-          "applescript": "integrations/mx_console/applescript/marker.applescript",
-          "cli": "python -m voicechain ctl marker --notify"
+          "id": "mute",
+          "label": "Mute",
+          "description": "Ausgang in 30 ms stumm / wieder an (sichtbar auf der Taste)",
+          "action_script": "integrations/mx_console/actions/mute.sh",
+          "applescript": "integrations/mx_console/applescript/mute.applescript",
+          "cli": "python -m voicechain ctl mute --notify"
         }
       ],
       "dial": {
         "rotate_cw": {
           "id": "louder",
           "label": "Lauter",
-          "description": "Ziel-Lautheit +0,5 LU (Dial im Uhrzeigersinn)",
+          "description": "Ziel-Lautheit +0,5 LU je Rastung (Dial rechts), ohne Mitteilung",
           "action_script": "integrations/mx_console/actions/louder.sh",
           "applescript": "integrations/mx_console/applescript/louder.applescript",
-          "cli": "python -m voicechain ctl louder --notify"
+          "cli": "python -m voicechain ctl louder --notify-errors"
         },
         "rotate_ccw": {
           "id": "quieter",
           "label": "Leiser",
-          "description": "Ziel-Lautheit −0,5 LU (Dial gegen den Uhrzeigersinn)",
+          "description": "Ziel-Lautheit −0,5 LU je Rastung (Dial links), ohne Mitteilung",
           "action_script": "integrations/mx_console/actions/quieter.sh",
           "applescript": "integrations/mx_console/applescript/quieter.applescript",
-          "cli": "python -m voicechain ctl quieter --notify"
+          "cli": "python -m voicechain ctl quieter --notify-errors"
         },
         "press": {
-          "id": "mute",
-          "label": "Mute",
-          "description": "Ausgang in 30 ms stumm / wieder an (Dial drücken)",
-          "action_script": "integrations/mx_console/actions/mute.sh",
-          "applescript": "integrations/mx_console/applescript/mute.applescript",
-          "cli": "python -m voicechain ctl mute --notify"
+          "id": "loudness-reset",
+          "label": "Lautheit 0",
+          "description": "Lautheits-Offset zurück auf den Kalibrierwert (Dial drücken)",
+          "action_script": "integrations/mx_console/actions/loudness-reset.sh",
+          "applescript": "integrations/mx_console/applescript/loudness-reset.applescript",
+          "cli": "python -m voicechain ctl loudness-reset --notify"
         }
       }
     }
   ],
   "unassigned": [
     {
-      "id": "loudness-reset",
-      "label": "Lautheit 0",
-      "description": "Lautheits-Offset auf 0 (Ziel = Kalibrierwert)",
-      "action_script": "integrations/mx_console/actions/loudness-reset.sh",
-      "applescript": "integrations/mx_console/applescript/loudness-reset.applescript",
-      "cli": "python -m voicechain ctl loudness-reset --notify"
+      "id": "marker",
+      "label": "Marker",
+      "description": "Zeitmarke mit Text ins Regelungslog (nicht belegt, per Skript/CLI)",
+      "action_script": "integrations/mx_console/actions/marker.sh",
+      "applescript": "integrations/mx_console/applescript/marker.applescript",
+      "cli": "python -m voicechain ctl marker --notify"
     }
   ]
 }
