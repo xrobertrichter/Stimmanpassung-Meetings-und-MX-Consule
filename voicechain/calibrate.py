@@ -37,9 +37,15 @@ from voicechain import meters
 REFERENCE_SPEECH_LEVEL_DBFS = -20.0
 #: Input trim range: -12 dB catches hot gain settings, +24 dB quiet USB preamps.
 TRIM_BOUNDS_DB = (-12.0, 24.0)
-#: Expander threshold above the noise floor (memory/04, E1): 8 dB keeps the
-#: expander closed during noise fluctuation (+-3 dB for fan/room noise).
-EXPANDER_FLOOR_MARGIN_DB = 8.0
+#: Expander threshold above the noise floor. Common practice for gate/expander
+#: thresholds is 8-12 dB above the noise floor (E1, memory/04): the expander
+#: stays closed during noise fluctuation (+-3 dB for fan/room noise). 10 dB is
+#: chosen because with ratio 2.5 and a 6 dB knee the attenuation at the floor
+#: level is (10 - 3) * 1.5 = 10.5 dB, which leaves enough reserve against the
+#: compressor's ~6 dB gain reduction to meet the >= 6 dB SNR criterion (with
+#: 8 dB the self-test measured 5.8 dB). Shared with voicechain.adaptive via
+#: expander_threshold_target(); project decision 2026-11-03.
+EXPANDER_FLOOR_MARGIN_DB = 10.0
 #: ... but at least this far below the speech level so soft syllables pass.
 EXPANDER_SPEECH_MARGIN_DB = 12.0
 #: Sibilance ratio (5-10 kHz minus 0.3-3 kHz energy, active frames) of

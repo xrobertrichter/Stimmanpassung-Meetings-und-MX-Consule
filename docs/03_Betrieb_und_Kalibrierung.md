@@ -96,7 +96,7 @@ Norm ist, ist dort und hier als **Annahme** markiert.
 | Parameter | Regel | Begründung / Annahme |
 |---|---|---|
 | `input_trim.gain_db` | −20 dBFS − gemessener Sprachpegel, begrenzt auf −12…+24 dB | Referenzpegel aktiver Sprache −20 dBFS RMS (memory/04); lässt ~14 dB Headroom für Sprachspitzen |
-| `expander.threshold_db` | min(Rauschteppich + 8 dB, Sprachpegel − 12 dB), jeweils nach Trim; Grenzen aus `adaptive.bounds` | 8 dB über dem Teppich bleibt der Expander bei Rauschschwankungen zu; 12 dB unter der Sprache bleiben leise Silben erhalten. Bei Störabstand < 20 dB greift die Sprach-Regel, der Expander kann dann wenig tun |
+| `expander.threshold_db` | min(Rauschteppich + 10 dB, Sprachpegel − 12 dB), jeweils nach Trim; Grenzen aus `adaptive.bounds` | Übliche Praxis für Gate/Expander-Schwellen sind 8–12 dB über dem Rauschteppich; 10 dB ergeben bei Ratio 2,5 und 6 dB Knie ≈ 10,5 dB Absenkung am Teppich und damit Reserve gegen die ~6 dB Kompressor-Reduction (mit 8 dB maß der Selbsttest nur 5,8 dB Störabstandsgewinn). 12 dB unter der Sprache bleiben leise Silben erhalten. Bei Störabstand < 22 dB greift die Sprach-Regel, der Expander kann dann wenig tun |
 | `deesser.freq_hz` | Schwerpunkt der Zischenergie 4–10 kHz, begrenzt auf 5–9 kHz | Bandzentrum der gemessenen Zischlaute |
 | `deesser.threshold_db` | nur wenn Zischanteil > −15 dB (**Annahme**, aus dem Langzeit-Sprachspektrum abgeleitet): Zischpegel ≈ Sprache + Zischanteil + 6 dB Burst-Crest (**Annahme**); Schwelle so weit darunter, dass bei Ratio R mindestens 4 dB Reduktion entstehen (4 / (1 − 1/R)); nie über der Standardschwelle | Liegt der Standardwert bereits tiefer, bleibt er (er liefert dann mehr als 4 dB, begrenzt durch `max_reduction_db`). Darunter: Standard |
 | EQ | Dichte je Messband relativ zum Ankerband 350–1000 Hz gegen Referenzkurve „flach bis 500 Hz, dann −6 dB/Okt" (**Annahme**: typisches Langzeit-Sprachspektrum); 50 % der Abweichung werden korrigiert (**Annahme**, Sprecherklang soll erhalten bleiben), Totzone ±1 dB, Korrektur wird auf den Basiswert des Bands **addiert**, Ergebnis auf ±4 dB begrenzt | Nur vier Bänder: Low-Shelf 120 Hz (Messband 80–170 Hz), Peak 250 Hz (170–350), Peak 3 kHz (2–4,5 kHz), High-Shelf 10 kHz (7–14 kHz). Vorhandene Basis-Bänder innerhalb ±20 % der Frequenz werden genutzt (z. B. 220 Hz statt 250 Hz), sonst wird ein Band angelegt |
@@ -203,7 +203,7 @@ Intervall ein `learning`-Eintrag geschrieben. Erst danach wird geregelt.
 
 | Parameter | Ziel | Totzone | Grund im Log |
 |---|---|---|---|
-| `expander.threshold_db` | min(Rauschteppich + 8, Sprache − 12) | ±2 dB | `noise_floor_track` |
+| `expander.threshold_db` | min(Rauschteppich + 10, Sprache − 12) (Konstante `EXPANDER_FLOOR_MARGIN_DB` in calibrate.py, von adaptive.py importiert) | ±2 dB | `noise_floor_track` |
 | `deesser.threshold_db` | wie Kalibrierung aus Sprachpegel und Zischanteil; unterhalb der Referenz zurück zum kalibrierten Ruhewert | ±1,5 dB | `sibilance_track`, `sibilance_rest` |
 | `compressor.threshold_db` | Sprachpegel (nach Trim) | ±2 dB | `speech_level_track` |
 
@@ -280,7 +280,7 @@ zurücknehmen, neu kalibrieren).
 - **Ein Sample, ein Raum.** Die Kalibrierung gilt für die Aufnahmesituation. Anderer Raum,
   anderer Abstand oder anderes Mikrofon-Gain: neu kalibrieren. Die Regelung gleicht nur
   langsame Drift innerhalb der `bounds` aus.
-- **Störabstand.** Liegt der Rauschteppich näher als 20 dB an der Sprache, kann der Expander
+- **Störabstand.** Liegt der Rauschteppich näher als 22 dB an der Sprache, kann der Expander
   die geforderten 6 dB nicht ohne Sprachverlust bringen; die Kette macht das hörbar besser,
   aber das Kriterium fällt durch. Abhilfe: leiserer Raum, geringerer Abstand, Lüfter weg.
 - **Kompression kostet Störabstand.** Jede Dynamikverdichtung hebt die Pausen relativ zur

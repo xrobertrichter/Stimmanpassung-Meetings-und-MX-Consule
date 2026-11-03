@@ -62,9 +62,10 @@ def test_recommend_on_quiet_sample_sets_trim_and_expander(quiet_sample):
     floor_after = m["noise_floor_dbfs"] + trim
     speech_after = m["speech_level_dbfs"] + trim
     thr = cfg["chain"]["expander"]["threshold_db"]
-    assert thr == pytest.approx(floor_after + 8.0, abs=2.0)
+    assert cal.EXPANDER_FLOOR_MARGIN_DB == 10.0
+    assert thr == pytest.approx(floor_after + 10.0, abs=2.0)
     assert thr <= speech_after - 12.0 + 1e-6
-    assert "Rauschteppich + 8" in cfg["_calibration"]["reasons"]["chain.expander.threshold_db"]
+    assert "Rauschteppich + 10" in cfg["_calibration"]["reasons"]["chain.expander.threshold_db"]
 
 
 def test_recommend_on_noisy_sample_caps_expander_below_speech(noisy_sample):
@@ -74,9 +75,9 @@ def test_recommend_on_noisy_sample_caps_expander_below_speech(noisy_sample):
     assert trim == pytest.approx(6.0, abs=1.5)
     speech_after = m["speech_level_dbfs"] + trim
     thr = cfg["chain"]["expander"]["threshold_db"]
-    # floor + trim + 8 = -26 would be only 6 dB under speech -> the speech rule wins.
+    # floor + trim + 10 = -24 would be only 4 dB under speech -> the speech rule wins.
     assert thr == pytest.approx(speech_after - 12.0, abs=0.5)
-    assert thr < m["noise_floor_dbfs"] + trim + 8.0 - 2.0
+    assert thr < m["noise_floor_dbfs"] + trim + 10.0 - 2.0
     assert "Sprachpegel" in cfg["_calibration"]["reasons"]["chain.expander.threshold_db"]
 
 

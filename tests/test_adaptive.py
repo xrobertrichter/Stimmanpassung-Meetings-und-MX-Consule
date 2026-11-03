@@ -109,12 +109,12 @@ def test_learning_phase_is_measured_from_construction_with_the_given_clock():
 
 def test_expander_converges_within_40_intervals_and_moves_in_one_direction():
     cfg, chain, ctrl = make()
-    # floor -60 + 8 = -52, speech -20 - 12 = -32 -> target -52; start -45; 7 dB away.
+    # floor -60 + 10 = -50, speech -20 - 12 = -32 -> target -50; start -45; 5 dB away.
     changes = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-20.0), 40)
     thr = chain.get_param("expander", "threshold_db")
-    assert abs(thr - (-52.0)) <= adaptive.EXPANDER_DEADZONE_DB
+    assert abs(thr - (-50.0)) <= adaptive.EXPANDER_DEADZONE_DB
     steps = [c["new"] - c["old"] for c in changes if c["stage"] == "expander"]
-    assert len(steps) >= 10
+    assert len(steps) >= 6   # 5 dB error, dead zone 2 dB -> at least 3 dB = 6 steps
     assert all(s == pytest.approx(-STEP_DB) for s in steps)
     # Converged: no further changes in the next 20 intervals.
     more = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-20.0), 20, t0=LEARN_S + 40 * INTERVAL_S)
@@ -147,7 +147,7 @@ def test_deesser_returns_to_rest_threshold_when_sibilance_is_low():
 
 
 def test_no_change_inside_deadzone():
-    cfg, chain, ctrl = make({"expander": {"threshold_db": -51.0}})   # target -52, error 1 dB
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -51.0}})   # target -50, error 1 dB
     changes = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-20.0), 10)
     assert [c for c in changes if c["stage"] == "expander"] == []
 
@@ -207,28 +207,29 @@ def test_deesser_rest_threshold_outside_bounds_is_walked_to_the_bound_in_steps()
 
 def test_input_trim_is_added_to_analysis_levels():
     cfg, chain, ctrl = make({"input_trim": {"gain_db": 6.0}})
-    # Measured floor -60 before trim -> -54 after trim -> target -46 (not -52).
+    # Measured floor -60 before trim -> -54 after trim -> target -44 (not -50).
     run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-26.0), 40)
-    assert abs(chain.get_param("expander", "threshold_db") - (-46.0)) <= adaptive.EXPANDER_DEADZONE_DB
+    assert abs(chain.get_param("expander", "threshold_db") - (-44.0)) <= adaptive.EXPANDER_DEADZONE_DB
+    assert chain.get_param("expander", "threshold_db") > -46.0
 
 
 # --------------------------------------------------------------------------- protection rules
 
 def test_speech_cut_lowers_expander_immediately_even_inside_deadzone():
-    cfg, chain, ctrl = make({"expander": {"threshold_db": -52.0}})  # exactly on target
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})  # exactly on target (floor -60 + 10)
     changes = ctrl.update(meters_dict(expander_gr=8.0, floor=-60.0, active=True), now=LEARN_S)
     exp = [c for c in changes if c["stage"] == "expander"]
     assert len(exp) == 1
     assert exp[0]["reason"] == "speech_cut"
-    assert exp[0]["new"] == pytest.approx(-52.0 - STEP_DB)
+    assert exp[0]["new"] == pytest.approx(-50.0 - STEP_DB)
     # Next interval still cutting -> another immediate step (no 2-interval spacing).
     changes = ctrl.update(meters_dict(expander_gr=8.0, floor=-60.0, active=True), now=LEARN_S + INTERVAL_S)
     assert [c["reason"] for c in changes if c["stage"] == "expander"] == ["speech_cut"]
-    assert chain.get_param("expander", "threshold_db") == pytest.approx(-53.0)
+    assert chain.get_param("expander", "threshold_db") == pytest.approx(-51.0)
 
 
 def test_expander_reduction_in_pauses_is_not_speech_cut():
-    cfg, chain, ctrl = make({"expander": {"threshold_db": -52.0}})
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})
     changes = ctrl.update(meters_dict(expander_gr=15.0, floor=-60.0, active=False), now=LEARN_S)
     assert [c for c in changes if c["stage"] == "expander"] == []
 
