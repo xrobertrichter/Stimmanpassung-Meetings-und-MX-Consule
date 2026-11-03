@@ -137,7 +137,7 @@ Der Bericht (Pfad aus `--report`, Standard `reports/calibration_report.md`) hat 
    |---|---|---|
    | Störabstand verbessert | Sprachpegel minus Rauschteppich, nachher minus vorher, ≥ 6 dB | Bewertung bei gleichem Sprachpegel, weil der Normalizer leise Aufnahmen insgesamt anhebt; die absoluten Werte stehen daneben |
    | Pausenlautheit nach Kette | Maximum der Momentary-Lautheit in der längsten Pause ≥ 5 s (die ersten 0,5 s werden übersprungen) ≤ Ziel − 20 LU, also −38 LUFS bei −18 LUFS Ziel | Prüft, dass die Kette Pausen nicht anhebt (Normalizer-Gate). Bei Verfehlung steht die Abhilfe im Hinweis: Raum leiser (Lüfter, Abstand) oder `normalizer.max_gain_db` senken |
-   | Zischanteil | gesunken (wenn De-Esser nötig); bei einer Stimme ohne Zischproblem: nachher weiterhin unter der Referenz −15 dB oder nicht schlechter als +1 dB (Kompression hebt leise Frikative relativ zu lauten Vokalen leicht an) | zusätzlich Zischspitzen im De-Esser-Band vorher/nachher |
+   | Zischanteil | bestanden, wenn nachher ≤ −15 dB, oder Δ ≤ −1 dB, oder (vorher ≤ −10 dB und Δ ≤ +1 dB), oder im Ruhezweig (vorher ≤ −15 dB, De-Esser nicht engagiert) Δ ≤ +3 dB bei nachher ≤ −12 dB. Begründung: Kompressor und Normalizer heben das 5–10-kHz-Band leiser Frikative relativ zu lauten Vokalen um 2–2,5 dB an (gemessen an der echten Kette); ein engagierter De-Esser nimmt das zurück, ein ruhender nicht. Nur klar zischende Stimmen (> −10 dB) müssen messbar besser werden | zusätzlich Zischspitzen im De-Esser-Band vorher/nachher |
    | Lautheit im Ziel | integriert −18 LUFS ± 2 LU | Die Lautheitsregelung braucht einige Sekunden, das geht in den integrierten Wert ein |
    | True Peak unter Ceiling | ≤ −1 dBTP (+0,1 dB Messtoleranz) | 4x-Oversampling-Messung |
 
@@ -396,6 +396,20 @@ nicht mehr mit der Kalibrierung überein (neu kalibrieren).
   über die normale Nachführung (Rauschteppich + 10, Sprache − 12) zurück.
 - **Kein Pump-Detektor** (siehe §8): Pumpen wird nicht automatisch erkannt; Abhilfe ist Freeze
   (`--freeze` oder SIGUSR1) und die Prüfung der Zeitkonstanten nach docs/02.
+- **Monotone, pausenlose Sprache und Dauertöne.** Der Teppich-Schätzer des Normalizers
+  (Plateau-Erkennung, docs/02) und die Regelung lesen ein Signal, das über Sekunden kaum moduliert
+  (gesungene Töne, Summen, extrem monotones Vorlesen ohne Pausen, Testtöne), als Raum: der
+  Normalizer hält dann seinen Gain, und es kann ein `low_snr`-Hinweis („Raum verbessern") erscheinen,
+  obwohl der Raum in Ordnung ist. Echte Sprache moduliert um mehr als 7 LU je halbe Sekunde und
+  ist nicht betroffen; bei Dauertönen (Jingles, Musik über das Mikrofon) Freeze nutzen.
+- **Dichter Vortrag mit geringer Dynamik.** Liest die Regelung über 20 s eine Dynamik
+  (95.–10. Perzentil der Rahmenpegel) unter 15 dB – typisch bei dichtem Vortrag mit nur 10 %
+  Pausen –, gilt das Gehörte als nicht plausibel: De-Esser und Kompressor bleiben auf den
+  kalibrierten Werten (`implausible_speech` im Log), nur der Expander folgt dem Teppich mit der
+  Sprach-Kappe (Dynamik ≥ 10 dB). Das ist gewollt konservativ: die kalibrierte Kette ist in diesem
+  Fall die sichere Einstellung, und die Nachführung soll lieber aussetzen als einem unsicheren
+  Maß folgen. An der ±6-dB-Pegelkante kann der Expander um ±0,5 dB zwischen Kappe und Totzone
+  wechseln (unhörbar).
 - **Leiser oder lauterer Sprecher.** Weicht der Pegel dauerhaft um mehr als 6 dB vom
   kalibrierten ab, bekommt der Sprecher nach 60 s die kalibrierte Kette plus den Ausgleich des
   Normalizers; Kompressor und De-Esser werden nicht nachgeführt, der Expander behält die

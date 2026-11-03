@@ -615,16 +615,55 @@ def test_mildly_sibilant_voice_passes_the_sibilance_criterion_with_the_real_chai
 def test_sibilance_criterion_closed_rule_table(before, delta):
     """Closed rule: pass if after <= -15, or delta <= -1, or (before <= -10 and delta <= +1)."""
     after = before + delta
-    expected = (after <= -15.0) or (delta <= -1.0) or (before <= -10.0 and delta <= 1.0)
+    expected = ((after <= -15.0) or (delta <= -1.0) or (before <= -10.0 and delta <= 1.0)
+                or (before <= -15.0 and delta <= 3.0 and after <= -12.0))
     assert cal.sibilance_criterion_passed(before, after) is expected
-    # Spelled out: every voice passes with -2 dB; +0.5 dB passes unless the voice clearly
-    # sibilant (-8 dB); +1.5 dB passes only when the result still sits below -15 dB (-18 dB voice).
+    # Spelled out: every voice passes with -2 dB; +0.5 dB passes unless the voice is clearly
+    # sibilant (-8 dB); +1.5 dB passes for the resting voices (-18, -15.5: still <= -12 dB),
+    # not for the engaged ones (-13.6 ... -8).
     if delta == -2.0:
         assert expected is True
     if delta == 0.5:
         assert expected is (before <= -10.0)
     if delta == 1.5:
-        assert expected is (before == -18.0)
+        assert expected is (before <= -15.0)
+    # Resting branch limits: +3 dB from -15 passes (-12), +3.1 does not, +2 from -14.5 does not (engaged).
+    assert cal.sibilance_criterion_passed(-15.0, -12.0) is True
+    assert cal.sibilance_criterion_passed(-15.0, -11.9) is False
+    assert cal.sibilance_criterion_passed(-14.5, -12.5) is False
+    assert cal.sibilance_criterion_passed(-8.0, -7.5) is False
+
+
+def _voice_with_sibilance_ratio(target_db: float, seed: int = 4) -> np.ndarray:
+    """30 s speech-like signal (5 s lead, 6 s pause) whose 5-10 kHz band is scaled so
+    that the measured sibilance ratio lands near ``target_db``."""
+    from scipy import signal
+    base = synth.make_speech_like(30.0, SR, sibilance_db=-6.0, seed=seed, lead_silence_s=5.0,
+                                  long_pause_s=6.0, noise_floor_dbfs=-55.0).astype(np.float64)
+    sos = signal.butter(4, [5000.0, 10000.0], btype="bandpass", fs=SR, output="sos")
+    x = base
+    for _ in range(3):   # the ratio is not exactly linear in the band gain: iterate
+        ratio = cal.analyze(x, SR)["sibilance_ratio_db"]
+        band = signal.sosfiltfilt(sos, x)
+        x = x + band * (10 ** ((target_db - ratio) / 20) - 1.0)
+    return x.astype(np.float32)
+
+
+@pytest.mark.parametrize("target", [-18.0, -17.0, -16.0, -15.0, -14.0, -13.0, -12.0, -11.0, -10.0])
+def test_sibilance_criterion_passes_across_the_reference_with_the_real_chain(tmp_path, target):
+    """Calibrated chain on voices from -18 to -10 dB: none fails the sibilance criterion
+    (resting voices rise by the 2-2.5 dB the chain adds, engaged ones are held or improved)."""
+    x = _voice_with_sibilance_ratio(target)
+    measured = cal.analyze(x, SR)["sibilance_ratio_db"]
+    assert measured == pytest.approx(target, abs=0.6)
+    wav = _write_wav(tmp_path / f"v{int(-target)}.wav", x)
+    result = cal.run_calibration(str(wav), None, str(tmp_path / "v.yaml"), str(tmp_path / "v.md"))
+    crit = result["evaluation"]["criteria"]["sibilance_reduced"]
+    assert crit["passed"] is True, (target, crit)
+    after = result["evaluation"]["after"]["sibilance_ratio_db"]
+    assert after - measured <= cal.SIBILANCE_REST_MAX_INCREASE_DB
+    if measured <= cal.SIBILANCE_REFERENCE_DB:
+        assert after <= cal.SIBILANCE_REST_MAX_AFTER_DB
 
 
 def test_sibilance_criterion_on_signals_follows_the_closed_rule():

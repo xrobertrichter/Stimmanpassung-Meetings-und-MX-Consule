@@ -159,6 +159,13 @@ SIBILANCE_MAX_INCREASE_DB = 1.0
 #: 1-3 dB and the de-esser (>= 4 dB only at the loud sibilants) does not take
 #: all of that back. Assumption: -10 dB (5 dB above the reference).
 SIBILANCE_CLEAR_PROBLEM_DB = -10.0
+#: Resting branch (voice at or below the reference, de-esser not engaged): the
+#: de-esser takes nothing back, so the band rises by the full 2-2.5 dB that
+#: compressor and normalizer add (measured on the real chain for ratios of
+#: -17...-15 dB: +1.9...+2.2 dB). Such a voice therefore may rise by up to 3 dB
+#: as long as it stays at or below -12 dB, i.e. still clearly no sibilance problem.
+SIBILANCE_REST_MAX_INCREASE_DB = 3.0
+SIBILANCE_REST_MAX_AFTER_DB = -12.0
 #: Difference tolerated between the limiter's internal peak estimate and the
 #: 4x-oversampled true-peak meter (assumption: 0.1 dB).
 TRUE_PEAK_TOLERANCE_DB = 0.1
@@ -334,12 +341,16 @@ def sibilance_criterion_passed(before_db: float, after_db: float) -> bool:
     Passed when the voice ends up below the reference (no sibilance problem
     after the chain), or the ratio drops by at least SIBILANCE_MAX_INCREASE_DB,
     or the voice had no clear problem to begin with (before <=
-    SIBILANCE_CLEAR_PROBLEM_DB) and did not get worse than +SIBILANCE_MAX_INCREASE_DB.
+    SIBILANCE_CLEAR_PROBLEM_DB) and did not get worse than +SIBILANCE_MAX_INCREASE_DB,
+    or - resting branch, before <= SIBILANCE_REFERENCE_DB - it rose by at most
+    SIBILANCE_REST_MAX_INCREASE_DB and stays at or below SIBILANCE_REST_MAX_AFTER_DB.
     """
     delta = after_db - before_db
     return bool(after_db <= SIBILANCE_REFERENCE_DB
                 or delta <= -SIBILANCE_MAX_INCREASE_DB
-                or (before_db <= SIBILANCE_CLEAR_PROBLEM_DB and delta <= SIBILANCE_MAX_INCREASE_DB))
+                or (before_db <= SIBILANCE_CLEAR_PROBLEM_DB and delta <= SIBILANCE_MAX_INCREASE_DB)
+                or (before_db <= SIBILANCE_REFERENCE_DB and delta <= SIBILANCE_REST_MAX_INCREASE_DB
+                    and after_db <= SIBILANCE_REST_MAX_AFTER_DB))
 
 
 def normalizer_gate_target(pause_loudness_lufs: float, target_lufs: float) -> float:
@@ -773,14 +784,18 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
              else f"De-Esser ruht (Zischanteil unter der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB). ")
             + (f"Klar zischende Stimme (> {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB): muss um ≥ {SIBILANCE_MAX_INCREASE_DB:.0f} dB "
                f"sinken oder unter {SIBILANCE_REFERENCE_DB:.0f} dB landen. " if clearly_sibilant else
-               f"Stimme ohne oder mit geringem Zischproblem (≤ {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB): darf um höchstens "
-               f"+{SIBILANCE_MAX_INCREASE_DB:.0f} dB steigen. ")
+               (f"Stimme ohne Zischproblem (De-Esser ruht): darf um höchstens +{SIBILANCE_REST_MAX_INCREASE_DB:.0f} dB "
+                f"steigen, solange sie ≤ {SIBILANCE_REST_MAX_AFTER_DB:.0f} dB bleibt. " if not deesser_needed else
+                f"Stimme mit geringem Zischproblem (≤ {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB): darf um höchstens "
+                f"+{SIBILANCE_MAX_INCREASE_DB:.0f} dB steigen. "))
             + "Kompressor und Normalizer heben das 5–10-kHz-Band leiser Frikative relativ zu lauten Vokalen um "
             "1–3 dB an; nur ein klar zischende Stimme muss messbar besser werden.")
     criteria["sibilance_reduced"] = {
         "passed": bool(sib_pass),
         "target": (f"nachher ≤ {SIBILANCE_REFERENCE_DB:.0f} dB, oder Δ ≤ −{SIBILANCE_MAX_INCREASE_DB:.0f} dB, oder "
-                   f"(vorher ≤ {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB und Δ ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB)"),
+                   f"(vorher ≤ {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB und Δ ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB), oder "
+                   f"(vorher ≤ {SIBILANCE_REFERENCE_DB:.0f} dB, Δ ≤ +{SIBILANCE_REST_MAX_INCREASE_DB:.0f} dB und "
+                   f"nachher ≤ {SIBILANCE_REST_MAX_AFTER_DB:.0f} dB)"),
         "actual": f"{sib_delta:+.1f} dB ({before['sibilance_ratio_db']:.1f} → {after['sibilance_ratio_db']:.1f} dB)",
         "note": note + (f" Zischspitzen im De-Esser-Band {before['sibilant_band_peak_dbfs']:.1f} → "
                         f"{after['sibilant_band_peak_dbfs']:.1f} dBFS."),
