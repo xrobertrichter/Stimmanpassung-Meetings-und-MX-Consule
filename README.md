@@ -203,9 +203,13 @@ beiden Optionen denselben Namen.
 ## Entwicklung und Tests
 
 ```bash
-pytest -q                      # läuft ohne Audiogeräte (Container/CI)
-python -m voicechain selftest  # messbare Prüfwerte der Kette
+python -m pytest -q -m "not slow"   # Entwicklerlauf: ohne die langen Simulationen (< 5 min)
+python -m pytest -q                 # Abnahmelauf: komplett, inklusive der mit "slow" markierten Tests
+python -m voicechain selftest       # messbare Prüfwerte der Kette
 ```
+
+Beide Läufe brauchen keine Audiogeräte (Container/CI). Der Marker `slow` (pytest.ini) kennzeichnet
+Simulationen mit mehr als etwa 30 s Audio und die vollständige Kalibrierung eines 60-s-Samples.
 
 Die Tests ersetzen `sounddevice` durch Attrappen; der Live-Teil (`voicechain/runtime.py`)
 importiert PortAudio erst beim Aufruf, alle anderen Module sind geräteunabhängig.

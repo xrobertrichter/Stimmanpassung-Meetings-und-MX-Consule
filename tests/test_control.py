@@ -505,3 +505,32 @@ def test_action_scripts_are_valid_bash_and_documented():
         name = script.stem
         assert "`{}`".format(name) in docs, "docs/05 has no row for {}".format(name)
         assert name in readme
+
+
+def test_non_finite_numbers_never_leave_or_enter_the_protocol(sock_path):
+    """NaN/Infinity are not JSON: a handler answer with NaN becomes an error response,
+    a request carrying NaN is rejected before the handler, the client refuses to send it."""
+
+    def responder(cmd):
+        if cmd.get("cmd") == "nan":
+            return {"ok": True, "state": {"snr_lu": float("nan")}, "message": "x"}
+        if cmd.get("cmd") == "inf":
+            return {"ok": True, "state": {"loudness_lufs": float("-inf")}, "message": "x"}
+        return {"ok": True, "state": {}, "message": "ok"}
+
+    with PolledServer(sock_path, responder) as polled:
+        for name in ("nan", "inf"):
+            response = send_command({"cmd": name}, sock_path)
+            assert response["ok"] is False and "non-finite" in response["error"]
+        # a raw request with NaN (json.loads would accept it) is a protocol error
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        raw.settimeout(2.0)
+        raw.connect(str(sock_path))
+        raw.sendall(b'{"cmd": "offset", "name": "room_db", "delta": NaN}\n')
+        answer = _read_line(raw)
+        raw.close()
+        assert answer["ok"] is False and "NaN" in answer["error"]
+        assert polled.server.protocol_errors == 1
+        assert polled.server.commands_handled == 3
+    with pytest.raises(ValueError):
+        send_command({"cmd": "offset", "delta": float("inf")}, sock_path)

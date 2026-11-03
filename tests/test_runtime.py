@@ -1084,27 +1084,51 @@ def test_status_line_reports_cpu_load_of_the_chain(fake_sd):
 
 
 # ------------------------------------------------------------ shutdown robustness
-def test_sigterm_requests_an_orderly_stop(fake_sd, short_sock_path):
-    """kill <pid> must behave like Ctrl-C: socket file removed, stream closed, no traceback."""
-    import os
+def test_sigterm_handler_is_installed_and_stops_orderly(fake_sd, short_sock_path, monkeypatch):
+    """kill <pid> must behave like Ctrl-C. The handler is driven directly (no real signal, so a
+    regression fails the test instead of killing the runner): run_forever must install it for
+    SIGTERM, the handler must end the loop, stop() must remove the socket and close the stream,
+    and the previous handler must be restored."""
     import signal
 
+    installed: dict = {}
+    real_signal = signal.signal
+
+    def recording_signal(signum, handler):
+        installed.setdefault(signum, []).append(handler)
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(signal, "signal", recording_signal)
     engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
     engine.attach_control(FakeLiveControl(), short_sock_path)
-
-    def send_term():
-        deadline = time.monotonic() + 3.0
-        while not short_sock_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    threading.Thread(target=send_term, daemon=True).start()
     previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate_once_running():
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            handlers = installed.get(signal.SIGTERM, [])
+            if handlers and handlers[0] == engine.handle_sigterm and short_sock_path.exists():
+                engine.handle_sigterm(signal.SIGTERM, None)  # what the OS would call
+                return
+            time.sleep(0.01)
+        engine._stop_event.set()  # safety net: the asserts below report the failure
+
+    threading.Thread(target=terminate_once_running, daemon=True).start()
     engine.run_forever()  # returns normally
-    assert signal.getsignal(signal.SIGTERM) == previous  # handler restored
+    assert installed[signal.SIGTERM][0] == engine.handle_sigterm  # installed on entry ...
+    assert installed[signal.SIGTERM][-1] == previous  # ... and restored on exit
+    assert signal.getsignal(signal.SIGTERM) == previous
     assert not short_sock_path.exists()
     assert FakeStream.instances[-1].closed
     assert engine.stream is None
+
+
+def test_sigterm_handler_only_sets_the_stop_flag(fake_sd):
+    engine = LiveEngine(base_cfg(), RecordingChain([]))
+    assert not engine._stop_event.is_set()
+    engine.handle_sigterm(15, None)
+    assert engine._stop_event.is_set()
+    assert engine.stream is None  # nothing else happens inside the handler
 
 
 def test_stop_closes_stream_even_if_control_cleanup_fails(fake_sd, capsys):

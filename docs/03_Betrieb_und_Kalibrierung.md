@@ -514,3 +514,10 @@ Kalibrierbasis); die Datei lässt sich mit `run --config` laden und ist dann die
 - **Metadaten in der YAML.** Der Block `_calibration` (Messwerte, Begründungen) steht in der
   kalibrierten YAML; `voicechain.config` behandelt Schlüssel mit führendem Unterstrich als
   Metadaten.
+
+
+## Tests ausführen
+
+- Entwicklerlauf (unter 5 min): `python -m pytest -q -m "not slow"`
+- Abnahmelauf (komplett, inkl. Langzeitsimulationen mit Marker `slow`): `python -m pytest -q`
+- Selbsttest der Kette ohne Mikrofon: `python -m voicechain selftest`

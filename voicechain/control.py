@@ -100,11 +100,31 @@ def check_socket_path(path) -> Path:
 
 
 def _encode(obj: dict) -> bytes:
-    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    """One JSON line. ``allow_nan=False``: NaN/Infinity are not JSON (docs/06 section 7);
+    a response containing them raises ValueError and is replaced by an error response."""
+    return (json.dumps(obj, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _encode_response(obj: dict) -> bytes:
+    try:
+        return _encode(obj)
+    except ValueError as exc:
+        return _encode(_error_response("response contained a non-finite number: {}".format(exc)))
 
 
 def _error_response(message: str) -> dict:
     return {"ok": False, "error": message}
+
+
+def _contains_non_finite(value) -> bool:
+    """True if a float NaN/Infinity hides anywhere in a parsed request (json.loads accepts them)."""
+    if isinstance(value, float):
+        return value != value or value in (float("inf"), float("-inf"))
+    if isinstance(value, dict):
+        return any(_contains_non_finite(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_non_finite(v) for v in value)
+    return False
 
 
 class _Connection:
@@ -248,7 +268,7 @@ class ControlServer:
         for conn in list(self._connections.values()):
             while handled < self.max_commands_per_poll and b"\n" in conn.inbuf:
                 line, _, conn.inbuf = conn.inbuf.partition(b"\n")
-                conn.outbuf += _encode(self._dispatch(line))
+                conn.outbuf += _encode_response(self._dispatch(line))
                 handled += 1
             if len(conn.inbuf) > MAX_LINE_BYTES:
                 self.protocol_errors += 1
@@ -305,6 +325,9 @@ class ControlServer:
         if not isinstance(cmd, dict):
             self.protocol_errors += 1
             return _error_response("request must be a JSON object, got {}".format(type(cmd).__name__))
+        if _contains_non_finite(cmd):
+            self.protocol_errors += 1
+            return _error_response("request contains NaN or Infinity, which is not valid JSON")
         try:
             response = self.handler(cmd)
         except Exception as exc:  # noqa: BLE001 - a bad command must not kill the audio service thread
@@ -406,6 +429,8 @@ def send_command(cmd: dict, socket_path, timeout: float = 1.0) -> dict:
     """
     if not isinstance(cmd, dict) or "cmd" not in cmd:
         raise ValueError("cmd must be a dict with a 'cmd' key, got {!r}".format(cmd))
+    if _contains_non_finite(cmd):
+        raise ValueError("command contains NaN or Infinity: {!r}".format(cmd))
     path = check_socket_path(socket_path)
     if not path.exists():
         raise ControlError(
