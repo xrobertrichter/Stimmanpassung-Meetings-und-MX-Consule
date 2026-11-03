@@ -1,17 +1,24 @@
-"""Tests for voicechain.adaptive with a FakeChain and scripted meters."""
+"""Tests for voicechain.adaptive with a FakeChain, scripted meters, the real
+LiveAnalyzer on synthetic signals and one closed loop with the real chain."""
 import copy
 import json
 
 import numpy as np
 import pytest
 
-from voicechain import adaptive, meters, synth
-from voicechain.calibrate import DEFAULT_CONFIG
+from voicechain import adaptive, calibrate as cal, meters, synth
+from voicechain.config import default_config_path, load_config
 
 SR = 48000
 LEARN_S = 30.0
 INTERVAL_S = 2.0
 STEP_DB = 0.5
+OVERSHOOT = cal.deesser_overshoot_db(4.0)   # 5.33 dB at ratio 4
+
+
+@pytest.fixture(scope="module")
+def base_cfg():
+    return load_config(default_config_path())
 
 
 class FakeChain:
@@ -42,28 +49,31 @@ class FakeChain:
         return copy.deepcopy(self.meters)
 
 
-def analysis(floor=-60.0, speech=-20.0, sib=-15.0, active=True, ready=True, detected=True):
+def analysis(floor=-60.0, speech=-20.0, sib=-15.0, band_peak=-25.0, active=True, ready=True,
+             detected=True, ratio=0.7, dynamic=None):
     return {"ready": ready, "speech_detected": detected, "noise_floor_dbfs": floor,
-            "speech_level_dbfs": speech, "sibilance_ratio_db": sib, "speech_active": active,
-            "speech_ratio": 0.7, "frames": 400, "history_s": 20.0}
+            "speech_level_dbfs": speech, "dynamic_range_db": speech - floor if dynamic is None else dynamic,
+            "sibilance_ratio_db": sib, "band_peak_p95_dbfs": band_peak, "band_hz": (6500.0, 1.0),
+            "speech_active": active, "speech_ratio": ratio,
+            "recent_speech_ratio": 1.0 if active else 0.0, "frames": 400, "history_s": 20.0}
 
 
 def meters_dict(limiter_gr=0.0, expander_gr=0.0, norm_gain=0.0, **analysis_kw):
-    return {"limiter": {"gain_reduction_db": limiter_gr},
-            "expander": {"gain_reduction_db": expander_gr},
+    return {"limiter": {"gain_reduction_mean_db": limiter_gr, "gain_reduction_max_db": limiter_gr},
+            "expander": {"gain_reduction_mean_db": expander_gr, "gain_reduction_max_db": expander_gr},
             "normalizer": {"gain_db": norm_gain},
             "output": {"peak_dbfs": -3.0, "rms_dbfs": -20.0},
             "analysis": analysis(**analysis_kw)}
 
 
-def make(cfg_overrides=None, log_path=None):
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
+def make(cfg_overrides=None, log_path=None, clock=lambda: 0.0):
+    cfg = load_config(default_config_path())
     cfg["adaptive"].update({"learn_s": LEARN_S, "interval_s": INTERVAL_S, "max_step_db": STEP_DB})
     if cfg_overrides:
         for stage, values in cfg_overrides.items():
             cfg["chain"][stage].update(values)
     chain = FakeChain(cfg)
-    ctrl = adaptive.AdaptiveController(cfg, chain, clock=lambda: 0.0, log_path=log_path)
+    ctrl = adaptive.AdaptiveController(cfg, chain, clock=clock, log_path=log_path)
     return cfg, chain, ctrl
 
 
@@ -74,6 +84,10 @@ def run(ctrl, meters_fn, n_intervals, t0=LEARN_S):
         t = t0 + i * INTERVAL_S
         changes.extend(ctrl.update(meters_fn(i), now=t))
     return changes
+
+
+def events(log_path):
+    return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
 
 # --------------------------------------------------------------------------- learning phase
@@ -88,16 +102,13 @@ def test_no_change_before_learn_s_and_first_change_after(tmp_path):
     assert len(first) >= 1
     assert first[0]["stage"] == "expander" and first[0]["reason"] == "noise_floor_track"
     ctrl.close()
-    events = [json.loads(l)["event"] for l in log.read_text().splitlines() if "event" in json.loads(l)]
-    assert events.count("learning") == 15
-    assert "learn_done" in events
+    names = [e["event"] for e in events(log) if "event" in e]
+    assert names.count("learning") == 15
+    assert "learn_done" in names
 
 
 def test_learning_phase_is_measured_from_construction_with_the_given_clock():
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
-    cfg["adaptive"].update({"learn_s": LEARN_S, "interval_s": INTERVAL_S, "max_step_db": STEP_DB})
-    chain = FakeChain(cfg)
-    ctrl = adaptive.AdaptiveController(cfg, chain, clock=lambda: 100.0)
+    cfg, chain, ctrl = make(clock=lambda: 100.0)
     assert ctrl.update(meters_dict(floor=-70.0), now=100.0) == []
     assert ctrl.update(meters_dict(floor=-70.0), now=100.0 + LEARN_S - 1.0) == []
     assert len(ctrl.update(meters_dict(floor=-70.0), now=100.0 + LEARN_S)) >= 1
@@ -116,19 +127,17 @@ def test_expander_converges_within_40_intervals_and_moves_in_one_direction():
     steps = [c["new"] - c["old"] for c in changes if c["stage"] == "expander"]
     assert len(steps) >= 6   # 5 dB error, dead zone 2 dB -> at least 3 dB = 6 steps
     assert all(s == pytest.approx(-STEP_DB) for s in steps)
-    # Converged: no further changes in the next 20 intervals.
     more = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-20.0), 20, t0=LEARN_S + 40 * INTERVAL_S)
     assert [c for c in more if c["stage"] == "expander"] == []
 
 
 def test_deesser_and_compressor_converge_to_targets():
     cfg, chain, ctrl = make()
-    # speech -26, sibilance -13: de-esser target = min(-30, -26 - 13 + 6 - 4/(1-1/4)) = -38.33
-    # (8.3 dB away, 14 steps until inside the 1.5 dB dead zone -> 28 intervals);
-    # compressor target = speech = -26; start -20 (6 dB away, 8 steps -> 16 intervals).
-    changes = run(ctrl, lambda i: meters_dict(speech=-26.0, sib=-13.0), 40)
-    assert abs(chain.get_param("deesser", "threshold_db") - (-38.33)) <= adaptive.DEESSER_DEADZONE_DB
-    assert chain.get_param("deesser", "threshold_db") < -36.0
+    # speech -26 (plausible: within -20 +- 6), band peak -22, sibilance -4 (engaged):
+    # de-esser target = -22 - 5.33 = -27.33 (start -30, up); compressor target = -26 (start -20, down).
+    changes = run(ctrl, lambda i: meters_dict(speech=-26.0, sib=-4.0, band_peak=-22.0), 40)
+    assert abs(chain.get_param("deesser", "threshold_db") - (-22.0 - OVERSHOOT)) <= adaptive.DEESSER_DEADZONE_DB
+    assert chain.get_param("deesser", "threshold_db") > -30.0
     assert abs(chain.get_param("compressor", "threshold_db") - (-26.0)) <= adaptive.COMPRESSOR_DEADZONE_DB
     assert chain.get_param("compressor", "threshold_db") <= -24.0
     for stage in ("deesser", "compressor"):
@@ -138,9 +147,17 @@ def test_deesser_and_compressor_converge_to_targets():
     assert {"sibilance_track", "speech_level_track"} <= reasons
 
 
+def test_deesser_threshold_can_rise_above_the_calibrated_value_within_bounds():
+    cfg, chain, ctrl = make()
+    hi = cfg["adaptive"]["bounds"]["deesser.threshold_db"][1]
+    # Band peak -8 dBFS -> target -13.3, clipped to the -15 bound; start -30.
+    run(ctrl, lambda i: meters_dict(sib=-4.0, band_peak=-8.0), 80)
+    assert hi - adaptive.DEESSER_DEADZONE_DB <= chain.get_param("deesser", "threshold_db") <= hi
+
+
 def test_deesser_returns_to_rest_threshold_when_sibilance_is_low():
     cfg, chain, ctrl = make({"deesser": {"threshold_db": -40.0}})
-    ctrl.deesser_rest_threshold_db = -30.0   # calibrated resting value differs from current
+    ctrl.rest_values[("deesser", "threshold_db")] = -30.0   # calibrated resting value differs from current
     changes = run(ctrl, lambda i: meters_dict(sib=-25.0), 40)
     assert abs(chain.get_param("deesser", "threshold_db") - (-30.0)) <= adaptive.DEESSER_DEADZONE_DB
     assert all(c["reason"] == "sibilance_rest" for c in changes if c["stage"] == "deesser")
@@ -163,7 +180,7 @@ def test_changes_to_one_parameter_are_two_intervals_apart():
 
 def test_step_never_exceeds_max_step_db():
     cfg, chain, ctrl = make()
-    changes = run(ctrl, lambda i: meters_dict(floor=-80.0, speech=-5.0, sib=10.0), 40)
+    changes = run(ctrl, lambda i: meters_dict(floor=-80.0, speech=-16.0, sib=10.0, band_peak=0.0), 40)
     assert changes
     assert max(abs(c["new"] - c["old"]) for c in changes) <= STEP_DB + 1e-9
 
@@ -172,45 +189,160 @@ def test_bounds_are_never_violated():
     cfg, chain, ctrl = make()
     lo_e, hi_e = cfg["adaptive"]["bounds"]["expander.threshold_db"]
     lo_c, hi_c = cfg["adaptive"]["bounds"]["compressor.threshold_db"]
-    # floor -95 -> target -87 (below -70); speech -45 -> compressor target -51 (below -35).
-    changes = run(ctrl, lambda i: meters_dict(floor=-95.0, speech=-45.0), 120)
+    # floor -95 -> target -85 (below -70); speech -25 -> compressor target -25 (plausible).
+    changes = run(ctrl, lambda i: meters_dict(floor=-95.0, speech=-25.0), 120)
     for c in changes:
         lo, hi = cfg["adaptive"]["bounds"][f"{c['stage']}.{c['name']}"]
         assert lo <= c["new"] <= hi
-    # The clipped target sits on the bound; tracking stops inside the dead zone.
     assert lo_e <= chain.get_param("expander", "threshold_db") <= lo_e + adaptive.EXPANDER_DEADZONE_DB
-    assert lo_c <= chain.get_param("compressor", "threshold_db") <= lo_c + adaptive.COMPRESSOR_DEADZONE_DB
-    # Upper side: speech -5 -> compressor target -5 is clipped to the -10 bound; floor -30
-    # -> expander target -22 is clipped to the -30 bound; heavy sibilance keeps the -30 rest threshold.
-    # From about -68 up to -30 is 38 dB = 76 steps of 0.5 dB, one per two intervals.
-    changes = run(ctrl, lambda i: meters_dict(floor=-30.0, speech=-5.0, sib=20.0), 160,
+    # Upper side: speech -15 -> compressor target -15 (inside -10 bound); floor -30 -> expander
+    # target -20 is clipped to the -30 bound; band peak 0 -> de-esser clipped to -15.
+    changes = run(ctrl, lambda i: meters_dict(floor=-30.0, speech=-15.0, sib=20.0, band_peak=0.0), 160,
                   t0=LEARN_S + 120 * INTERVAL_S)
     for c in changes:
         lo, hi = cfg["adaptive"]["bounds"][f"{c['stage']}.{c['name']}"]
         assert lo <= c["new"] <= hi
     assert hi_e - adaptive.EXPANDER_DEADZONE_DB <= chain.get_param("expander", "threshold_db") <= hi_e
-    assert chain.get_param("deesser", "threshold_db") == pytest.approx(-30.0)
-    assert hi_c - adaptive.COMPRESSOR_DEADZONE_DB <= chain.get_param("compressor", "threshold_db") <= hi_c
+    hi_d = cfg["adaptive"]["bounds"]["deesser.threshold_db"][1]
+    assert hi_d - adaptive.DEESSER_DEADZONE_DB <= chain.get_param("deesser", "threshold_db") <= hi_d
+    assert chain.get_param("compressor", "threshold_db") == pytest.approx(-15.0, abs=adaptive.COMPRESSOR_DEADZONE_DB)
 
 
-def test_deesser_rest_threshold_outside_bounds_is_walked_to_the_bound_in_steps():
-    cfg, chain, ctrl = make({"deesser": {"threshold_db": -10.0}})   # above the -15 upper bound
+def test_apply_clamps_to_bounds_even_for_immediate_steps_m12():
+    """Mutation M12: the safety-net clamp in _apply. speech_cut at the lower bound
+    must not push the expander below the bound (the target clamp in _track is bypassed)."""
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -70.0}})
+    lo = cfg["adaptive"]["bounds"]["expander.threshold_db"][0]
+    assert chain.get_param("expander", "threshold_db") == lo
+    changes = ctrl.update(meters_dict(expander_gr=9.0, floor=-90.0, active=True), now=LEARN_S)
+    assert [c for c in changes if c["stage"] == "expander"] == []
+    assert chain.get_param("expander", "threshold_db") == lo
+    # One step above the bound: the immediate step lands exactly on the bound, not below.
+    chain.set_param("expander", "threshold_db", lo + 0.3)
+    changes = ctrl.update(meters_dict(expander_gr=9.0, floor=-90.0, active=True), now=LEARN_S + INTERVAL_S)
+    assert [c["new"] for c in changes if c["stage"] == "expander"] == [pytest.approx(lo)]
+
+
+def test_value_outside_bounds_is_walked_back_in_steps_bl10():
+    """BL-10: the validator refuses files with values outside bounds; at run time
+    (set_param) the controller walks such a value back, never jumps."""
+    cfg, chain, ctrl = make()
+    chain.set_param("deesser", "threshold_db", -10.0)      # above the -15 upper bound
+    chain.history.clear()
     lo_d, hi_d = cfg["adaptive"]["bounds"]["deesser.threshold_db"]
     changes = run(ctrl, lambda i: meters_dict(sib=-25.0), 40)
     steps = [c for c in changes if c["stage"] == "deesser"]
-    # -10 -> -15 is 5 dB; the dead zone (1.5 dB) stops tracking at -13.5: 7 steps of 0.5 dB.
-    assert len(steps) == 7
+    # Rest value -30 is the target (sibilance below reference): walked down in 0.5 dB
+    # steps; every intermediate value stays inside [old, hi] and never leaves further.
+    assert len(steps) >= 10
     assert all(c["new"] - c["old"] == pytest.approx(-STEP_DB) for c in steps)
-    assert all(c["new"] > hi_d - adaptive.DEESSER_DEADZONE_DB - 1e-9 for c in steps)
-    assert chain.get_param("deesser", "threshold_db") == pytest.approx(-13.5)
+    assert all(c["new"] <= -10.0 for c in steps)
+    assert chain.get_param("deesser", "threshold_db") <= hi_d
 
 
 def test_input_trim_is_added_to_analysis_levels():
     cfg, chain, ctrl = make({"input_trim": {"gain_db": 6.0}})
-    # Measured floor -60 before trim -> -54 after trim -> target -44 (not -50).
+    # Measured floor -60 before trim -> -54 after trim -> target -44 (not -50); speech -26 -> -20.
     run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-26.0), 40)
     assert abs(chain.get_param("expander", "threshold_db") - (-44.0)) <= adaptive.EXPANDER_DEADZONE_DB
     assert chain.get_param("expander", "threshold_db") > -46.0
+
+
+# --------------------------------------------------------------------------- plausibility (PO-2)
+
+@pytest.mark.parametrize("kw,expected_reason", [
+    (dict(speech=-40.0, ratio=0.15), "level"),                 # keyboard clicks
+    (dict(speech=-42.0, ratio=0.6), "level"),                  # colleague / playback
+    (dict(speech=-20.0, ratio=0.2), "speech_ratio"),           # sparse speech
+    (dict(speech=-20.0, ratio=0.6, dynamic=10.0), "dynamic"),  # too little dynamics
+    (dict(speech=-20.0, ratio=0.6, detected=False), "no_speech"),
+])
+def test_implausible_speech_holds_deesser_and_compressor(tmp_path, kw, expected_reason):
+    log = tmp_path / "p.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    # Targets that would move both: band peak -12 (de-esser up), speech far from -20 (compressor).
+    changes = run(ctrl, lambda i: meters_dict(sib=-4.0, band_peak=-12.0, floor=-70.0, **kw), 20)
+    assert [c for c in changes if c["stage"] in ("deesser", "compressor")] == []
+    # The expander still follows the floor (floor rule only).
+    assert any(c["stage"] == "expander" for c in changes)
+    ctrl.close()
+    impl = [e for e in events(log) if e.get("event") == "implausible_speech"]
+    assert len(impl) == 20
+    assert any(expected_reason in r for r in impl[0]["reasons"])
+
+
+def test_expander_speech_cap_only_applies_to_plausible_speech():
+    # Plausible speech -20: target min(-60+10, -20-12) = -50. Implausible "speech" at -45
+    # would cap the target at -57, but the cap is ignored: target stays -50.
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -52.0}})
+    changes = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-45.0, ratio=0.6), 20)
+    assert [c for c in changes if c["stage"] == "expander"] == []
+
+
+def test_rest_after_60_s_without_plausible_speech(tmp_path):
+    log = tmp_path / "r.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    # Earlier drift (simulated): de-esser -36, compressor -25; calibrated values -30 / -20.
+    chain.set_param("deesser", "threshold_db", -36.0)
+    chain.set_param("compressor", "threshold_db", -25.0)
+    chain.history.clear()
+    impl = lambda i: meters_dict(speech=-40.0, ratio=0.15, floor=-60.0)
+    # 30 s learning + up to 60 s implausible: nothing but expander tracking.
+    changes = run(ctrl, impl, 15, t0=LEARN_S)          # 30..58 s
+    assert [c for c in changes if c["stage"] in ("deesser", "compressor")] == []
+    changes = run(ctrl, impl, 40, t0=LEARN_S + 30.0)   # 60..138 s: rest kicks in at 60 s
+    rest = [c for c in changes if c["reason"] == "rest"]
+    assert rest and all(c["stage"] in ("deesser", "compressor") for c in rest)
+    assert rest[0]["t"] == pytest.approx(60.0)
+    assert all(abs(c["new"] - c["old"]) == pytest.approx(STEP_DB) for c in rest)
+    assert chain.get_param("deesser", "threshold_db") == pytest.approx(-30.0)
+    assert chain.get_param("compressor", "threshold_db") == pytest.approx(-20.0)
+    # Plausible speech again: tracking resumes, no further rest steps.
+    changes = run(ctrl, lambda i: meters_dict(speech=-24.0, band_peak=-22.0, sib=-4.0), 10, t0=LEARN_S + 110.0)
+    assert all(c["reason"] != "rest" for c in changes)
+    ctrl.close()
+    since = [e["since_s"] for e in events(log) if e.get("event") == "implausible_speech"]
+    assert since[0] == pytest.approx(30.0) and max(since) >= 100.0
+
+
+def test_keyboard_clicks_do_not_move_deesser_or_compressor(tmp_path):
+    """PO-2 simulation: 3 min of typing (3 strokes/s, -30 dBFS) on -55 dBFS noise."""
+    log = tmp_path / "k.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    x = synth.make_keyboard_clicks(180.0, SR, rate_per_s=3.0, level_dbfs=-30.0, noise_floor_dbfs=-55.0, seed=1)
+    la = adaptive.LiveAnalyzer(SR)
+    changes = []
+    block = int(INTERVAL_S * SR)
+    for i in range(0, x.size, block):
+        la.push(x[i:i + block])
+        m = meters_dict()
+        m["analysis"] = la.snapshot()
+        changes.extend(ctrl.update(m, now=(i + block) / SR))
+    assert [c for c in changes if c["stage"] in ("deesser", "compressor")] == []
+    ctrl.close()
+    impl = [e for e in events(log) if e.get("event") == "implausible_speech"]
+    assert len(impl) >= 60
+    assert chain.get_param("deesser", "threshold_db") == cfg["chain"]["deesser"]["threshold_db"]
+    assert chain.get_param("compressor", "threshold_db") == cfg["chain"]["compressor"]["threshold_db"]
+
+
+def test_distant_quiet_voice_does_not_move_deesser_or_compressor(tmp_path):
+    """PO-2 simulation: 3 min of a quiet voice at -42 dBFS (colleague, playback)."""
+    log = tmp_path / "f.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    x = synth.make_speech_like(180.0, SR, level_dbfs=-42.0, noise_floor_dbfs=-55.0, sibilance_db=3.0, seed=2)
+    la = adaptive.LiveAnalyzer(SR)
+    changes = []
+    block = int(INTERVAL_S * SR)
+    for i in range(0, x.size, block):
+        la.push(x[i:i + block])
+        m = meters_dict()
+        m["analysis"] = la.snapshot()
+        changes.extend(ctrl.update(m, now=(i + block) / SR))
+    assert [c for c in changes if c["stage"] in ("deesser", "compressor")] == []
+    assert la.snapshot()["speech_level_dbfs"] == pytest.approx(-42.0, abs=2.0)
+    ctrl.close()
+    assert any(e.get("event") == "implausible_speech" for e in events(log))
 
 
 # --------------------------------------------------------------------------- protection rules
@@ -228,49 +360,61 @@ def test_speech_cut_lowers_expander_immediately_even_inside_deadzone():
     assert chain.get_param("expander", "threshold_db") == pytest.approx(-51.0)
 
 
+def test_speech_cut_uses_the_max_meter_not_the_mean():
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})
+    m = meters_dict(floor=-60.0, active=True)
+    m["expander"] = {"gain_reduction_mean_db": 1.0, "gain_reduction_max_db": 7.0}
+    changes = ctrl.update(m, now=LEARN_S)
+    assert [c["reason"] for c in changes if c["stage"] == "expander"] == ["speech_cut"]
+
+
 def test_expander_reduction_in_pauses_is_not_speech_cut():
     cfg, chain, ctrl = make({"expander": {"threshold_db": -50.0}})
     changes = ctrl.update(meters_dict(expander_gr=15.0, floor=-60.0, active=False), now=LEARN_S)
+    assert [c for c in changes if c["stage"] == "expander"] == []
+    # An interval with a pause inside (90 % speech) cannot attribute the maximum to speech.
+    m = meters_dict(expander_gr=15.0, floor=-60.0, active=True)
+    m["analysis"]["recent_speech_ratio"] = 0.9
+    changes = ctrl.update(m, now=LEARN_S + INTERVAL_S)
     assert [c for c in changes if c["stage"] == "expander"] == []
 
 
 def test_limiter_overload_blocks_compressor_raise_and_holds_normalizer(tmp_path):
     log = tmp_path / "lim.jsonl"
     cfg, chain, ctrl = make(log_path=log)
-    # speech -10 -> compressor target -10 (above the current -20): a raise is wanted.
-    changes = ctrl.update(meters_dict(limiter_gr=5.0, norm_gain=4.0, speech=-10.0), now=LEARN_S)
-    comp = [c for c in changes if c["stage"] == "compressor"]
-    assert comp == []
+    # speech -15 -> compressor target -15 (above the current -20): a raise is wanted.
+    changes = ctrl.update(meters_dict(limiter_gr=5.0, norm_gain=4.0, speech=-15.0), now=LEARN_S)
+    assert [c for c in changes if c["stage"] == "compressor"] == []
     hold = [c for c in changes if c["stage"] == "normalizer"]
     assert len(hold) == 1 and hold[0]["reason"] == "limiter_overload"
     assert hold[0]["old"] == 12.0 and hold[0]["new"] == pytest.approx(4.0)
     assert chain.get_param("normalizer", "max_gain_db") == pytest.approx(4.0)
     assert ctrl.limiter_protect_active
     # Lowering the compressor threshold is still allowed under protection.
-    changes = ctrl.update(meters_dict(limiter_gr=5.0, norm_gain=4.0, speech=-30.0), now=LEARN_S + INTERVAL_S)
+    changes = ctrl.update(meters_dict(limiter_gr=5.0, norm_gain=4.0, speech=-25.0), now=LEARN_S + INTERVAL_S)
     assert [c["new"] - c["old"] for c in changes if c["stage"] == "compressor"] == [pytest.approx(-STEP_DB)]
     # Limiter relaxes: normalizer restored and the raise proceeds.
-    changes = ctrl.update(meters_dict(limiter_gr=0.0, norm_gain=1.0, speech=-10.0), now=LEARN_S + 2 * INTERVAL_S)
+    changes = ctrl.update(meters_dict(limiter_gr=0.0, norm_gain=1.0, speech=-15.0), now=LEARN_S + 2 * INTERVAL_S)
     rel = [c for c in changes if c["stage"] == "normalizer"]
     assert len(rel) == 1 and rel[0]["reason"] == "limiter_recovered" and rel[0]["new"] == 12.0
     assert not ctrl.limiter_protect_active
-    changes = ctrl.update(meters_dict(limiter_gr=0.0, speech=-10.0), now=LEARN_S + 4 * INTERVAL_S)
+    changes = ctrl.update(meters_dict(limiter_gr=0.0, speech=-15.0), now=LEARN_S + 4 * INTERVAL_S)
     assert [c["new"] - c["old"] for c in changes if c["stage"] == "compressor"] == [pytest.approx(STEP_DB)]
     ctrl.close()
-    flags = [json.loads(l) for l in log.read_text().splitlines()]
-    protect = [e for e in flags if e.get("event") == "limiter_protect"]
+    protect = [e for e in events(log) if e.get("event") == "limiter_protect"]
     assert protect[0]["active"] is True and protect[0]["hold_normalizer_gain"] is True
     assert protect[1]["active"] is False
 
 
-def test_limiter_mean_is_averaged_over_calls_within_an_interval():
+def test_limiter_protection_reads_the_interval_mean_meter():
     cfg, chain, ctrl = make()
-    # Four samples at 2 dB and one at 5 dB -> mean 2.6 dB < 3 dB: no protection.
-    for k, gr in enumerate((2.0, 2.0, 2.0, 2.0)):
-        ctrl.update(meters_dict(limiter_gr=gr), now=LEARN_S - 1.0 + 0.1 * k)
-    changes = ctrl.update(meters_dict(limiter_gr=5.0), now=LEARN_S)
-    assert not ctrl.limiter_protect_active
-    assert [c for c in changes if c["stage"] == "normalizer"] == []
+    m = meters_dict(norm_gain=4.0)
+    m["limiter"] = {"gain_reduction_mean_db": 2.9, "gain_reduction_max_db": 12.0}
+    ctrl.update(m, now=LEARN_S)
+    assert not ctrl.limiter_protect_active          # mean below 3 dB although the max is 12 dB
+    m["limiter"] = {"gain_reduction_mean_db": 3.1, "gain_reduction_max_db": 3.1}
+    ctrl.update(m, now=LEARN_S + INTERVAL_S)
+    assert ctrl.limiter_protect_active
 
 
 # --------------------------------------------------------------------------- freeze / logging
@@ -288,7 +432,7 @@ def test_freeze_stops_changes_but_keeps_logging(tmp_path):
     assert [c["stage"] for c in changes] == ["expander"]
     assert changes[0]["new"] == pytest.approx(-45.0 - STEP_DB)
     ctrl.close()
-    entries = [json.loads(l) for l in log.read_text().splitlines()]
+    entries = events(log)
     frozen = [e for e in entries if e.get("event") == "frozen"]
     assert len(frozen) == 5
     assert frozen[0]["proposed"]["stage"] == "expander"
@@ -298,8 +442,8 @@ def test_freeze_stops_changes_but_keeps_logging(tmp_path):
 def test_jsonl_lines_are_valid_and_complete(tmp_path):
     log = tmp_path / "log" / "adaptive.jsonl"
     cfg, chain, ctrl = make(log_path=log)
-    changes = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-20.0, sib=-4.0), 10, t0=0.0)
-    changes += run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-20.0, sib=-4.0), 10)
+    changes = run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-24.0, sib=-4.0, band_peak=-22.0), 10, t0=0.0)
+    changes += run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-24.0, sib=-4.0, band_peak=-22.0), 10)
     ctrl.close()
     lines = log.read_text(encoding="utf-8").splitlines()
     assert len(lines) >= len(changes) + 10
@@ -324,18 +468,21 @@ def test_missing_analysis_is_logged_and_skipped(tmp_path):
     assert ctrl.update(m, now=LEARN_S) == []
     assert ctrl.update(meters_dict(ready=False), now=LEARN_S + INTERVAL_S) == []
     ctrl.close()
-    events = [json.loads(l).get("event") for l in log.read_text().splitlines()]
-    assert events.count("no_analysis") == 2
+    assert [e.get("event") for e in events(log)].count("no_analysis") == 2
 
 
-def test_invalid_adaptive_settings_raise():
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
+def test_invalid_adaptive_settings_raise(base_cfg):
+    cfg = copy.deepcopy(base_cfg)
     cfg["adaptive"]["interval_s"] = 0.0
     with pytest.raises(ValueError):
         adaptive.AdaptiveController(cfg, FakeChain(cfg))
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg = copy.deepcopy(base_cfg)
     cfg["adaptive"]["bounds"]["expander.threshold_db"] = [-30.0, -70.0]
     with pytest.raises(ValueError):
+        adaptive.AdaptiveController(cfg, FakeChain(cfg))
+    cfg = copy.deepcopy(base_cfg)
+    del cfg["adaptive"]["bounds"]["compressor.threshold_db"]
+    with pytest.raises(ValueError, match="compressor.threshold_db"):
         adaptive.AdaptiveController(cfg, FakeChain(cfg))
 
 
@@ -350,11 +497,12 @@ def test_live_analyzer_not_ready_before_two_seconds():
     assert snap["ready"] is True
     assert snap["speech_detected"] is False
     assert snap["frames"] == 42
+    assert snap["band_hz"] == (6500.0, 1.0)
 
 
 def test_live_analyzer_matches_offline_meters_on_synth():
     x = synth.make_speech_like(30.0, SR, level_dbfs=-24.0, noise_floor_dbfs=-52.0, sibilance_db=0.0, seed=12)
-    la = adaptive.LiveAnalyzer(SR)
+    la = adaptive.LiveAnalyzer(SR, deesser_freq_hz=6800.0, deesser_bandwidth_oct=1.0)
     for i in range(0, x.size, 256):
         la.push(x[i:i + 256])
     snap = la.snapshot()
@@ -363,7 +511,9 @@ def test_live_analyzer_matches_offline_meters_on_synth():
     assert snap["speech_detected"] is True
     assert snap["noise_floor_dbfs"] == pytest.approx(meters.noise_floor_dbfs(tail, SR, meters.ANALYSIS_FRAME_MS), abs=1.0)
     assert snap["speech_level_dbfs"] == pytest.approx(meters.speech_level_dbfs(tail, SR), abs=1.0)
+    assert snap["dynamic_range_db"] == pytest.approx(meters.dynamic_range_db(meters.frame_rms_db(tail, SR)), abs=1.0)
     assert snap["sibilance_ratio_db"] == pytest.approx(meters.sibilance_ratio_db(tail, SR), abs=1.5)
+    assert snap["band_peak_p95_dbfs"] == pytest.approx(meters.band_peak_dbfs(tail, SR, 6800.0, 1.0), abs=1.5)
     assert 0.5 <= snap["speech_ratio"] <= 0.85
 
 
@@ -375,10 +525,12 @@ def test_live_analyzer_block_size_independent_and_resettable():
     for i in range(0, x.size, 64):
         b.push(x[i:i + 64])
     sa, sb = a.snapshot(), b.snapshot()
-    for key in ("noise_floor_dbfs", "speech_level_dbfs", "sibilance_ratio_db"):
+    for key in ("noise_floor_dbfs", "speech_level_dbfs", "sibilance_ratio_db", "band_peak_p95_dbfs"):
         assert sa[key] == pytest.approx(sb[key], abs=1e-9)
     a.reset()
     assert a.snapshot()["frames"] == 0
+    a.set_deesser_band(7000.0, 0.5)
+    assert a.band_hz == (7000.0, 0.5)
 
 
 def test_live_analyzer_speech_active_flag_follows_signal():
@@ -391,3 +543,61 @@ def test_live_analyzer_speech_active_flag_follows_signal():
     assert la.snapshot()["speech_active"] is True
     la.push(noise[: SR])
     assert la.snapshot()["speech_active"] is False
+
+
+# --------------------------------------------------------------------------- closed loop with the real chain (SW-5)
+
+def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_cfg):
+    """Chain + LiveAnalyzer + AdaptiveController over 200 s: floor -55 dBFS for 100 s,
+    then -45 dBFS. Learning phase untouched, expander follows monotonically, bounds
+    hold, every change is logged with a reason, de-esser/compressor stay quiet."""
+    from voicechain.dsp.chain import Chain
+    quiet = synth.make_speech_like(100.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-55.0, sibilance_db=-6.0,
+                                   seed=21, long_pause_s=6.0)
+    loud = synth.make_speech_like(100.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-45.0, sibilance_db=-6.0,
+                                  seed=22, long_pause_s=6.0)
+    x = np.concatenate([quiet, loud])
+    cfg = cal.recommend(cal.analyze(quiet, SR), base_cfg)
+    cfg["adaptive"].update({"learn_s": LEARN_S, "interval_s": INTERVAL_S, "max_step_db": STEP_DB})
+    chain = Chain.from_config(cfg)
+    la = adaptive.LiveAnalyzer(SR, deesser_freq_hz=cfg["chain"]["deesser"]["freq_hz"],
+                               deesser_bandwidth_oct=cfg["chain"]["deesser"]["bandwidth_oct"])
+    log = tmp_path / "loop.jsonl"
+    ctrl = adaptive.AdaptiveController(cfg, chain, clock=lambda: 0.0, log_path=log)
+    start_thr = chain.get_param("expander", "threshold_db")
+    trim = chain.get_param("input_trim", "gain_db")
+    block = 2048
+    tick = int(INTERVAL_S * SR)
+    changes = []
+    next_tick = tick
+    for i in range(0, x.size, block):
+        blk = x[i:i + block]
+        la.push(blk)
+        chain.process(blk)
+        if i + block >= next_tick:
+            m = chain.get_meters()
+            m["analysis"] = la.snapshot()
+            changes.extend(ctrl.update(m, now=next_tick / SR))
+            next_tick += tick
+    ctrl.close()
+    exp = [c for c in changes if c["stage"] == "expander"]
+    assert changes and all(c["t"] >= LEARN_S for c in changes)
+    # First 100 s: the calibrated threshold already matches the floor -> no expander step.
+    assert all(c["t"] > 100.0 for c in exp)
+    steps = [c["new"] - c["old"] for c in exp]
+    assert len(steps) >= 10 and all(s == pytest.approx(STEP_DB) for s in steps)   # monotone, +0.5 each
+    assert all(np.diff([c["t"] for c in exp]) >= 2 * INTERVAL_S - 1e-9)
+    lo, hi = cfg["adaptive"]["bounds"]["expander.threshold_db"]
+    assert all(lo <= c["new"] <= hi for c in exp)
+    target = min(-45.0 + trim + cal.EXPANDER_FLOOR_MARGIN_DB, -20.0 - cal.EXPANDER_SPEECH_MARGIN_DB)
+    final = chain.get_param("expander", "threshold_db")
+    assert start_thr == pytest.approx(-55.0 + trim + cal.EXPANDER_FLOOR_MARGIN_DB, abs=1.0)
+    assert abs(final - target) <= adaptive.EXPANDER_DEADZONE_DB + 0.5
+    other = [c for c in changes if c["stage"] != "expander"]
+    assert len(other) <= 2, other                                   # speaker unchanged
+    entries = events(log)
+    logged = [e for e in entries if "stage" in e]
+    assert len(logged) == len(changes)
+    assert all(set(e) == {"t", "stage", "name", "old", "new", "reason"} for e in logged)
+    # Ticks at 2, 4, ..., 28 s fall into the 30 s learning phase: 14 entries.
+    assert [e["event"] for e in entries if "event" in e].count("learning") == 14

@@ -2,17 +2,19 @@
 
 Workflow (:func:`run_calibration`):
 
-1. read the WAV (soundfile), mix to mono, require the configured sample rate;
-2. :func:`analyze` -> measurements (noise floor, speech level, sibilance, tilt,
-   peaks, loudness, band energies);
+1. load the base configuration (``voicechain.config.load_config``; default
+   ``config/chain.default.yaml``) and read the WAV (:func:`read_mono_wav`,
+   mixed to mono, sample rate must match, values must be finite);
+2. :func:`analyze` -> measurements (noise floor, speech level and peaks,
+   sibilance, de-esser band peaks, fundamental frequency, tilt, loudness, band
+   energies, longest pause);
 3. :func:`recommend` -> new configuration (deep copy of the base config) with a
    reason per changed value under ``cfg["_calibration"]["reasons"]``;
-4. process the sample through the chain built from the new configuration
-   (``voicechain.dsp.chain.Chain`` is imported lazily so this module stays
-   importable without the DSP package; tests may pass a ``processor`` callable);
-5. :func:`evaluate` -> before/after measurements and the acceptance criteria of
-   docs/00_Beauftragung.md section 6.3;
-6. write the YAML and a German Markdown report.
+4. first pass through the chain, then :func:`refine_normalizer` derives the
+   normalizer gate and gain limit from the pause loudness after the chain;
+5. second pass and :func:`evaluate` -> before/after measurements and the
+   acceptance criteria of docs/00_Beauftragung.md section 6.3;
+6. write the YAML (``voicechain.config.save_config``) and a German Markdown report.
 
 The control laws (``*_target`` functions) are shared with ``voicechain.adaptive``
 so that calibration and live tracking aim at the same operating point.
@@ -27,6 +29,8 @@ from pathlib import Path
 import numpy as np
 
 from voicechain import meters
+from voicechain.config import default_config_path, load_config, save_config
+from voicechain.dsp.chain import Chain
 
 # --------------------------------------------------------------------------- #
 # Control-law constants (see docs/03 for the German explanation)
@@ -40,11 +44,12 @@ TRIM_BOUNDS_DB = (-12.0, 24.0)
 #: Expander threshold above the noise floor. Common practice for gate/expander
 #: thresholds is 8-12 dB above the noise floor (E1, memory/04): the expander
 #: stays closed during noise fluctuation (+-3 dB for fan/room noise). 10 dB is
-#: chosen because with ratio 2.5 and a 6 dB knee the attenuation at the floor
-#: level is (10 - 3) * 1.5 = 10.5 dB, which leaves enough reserve against the
-#: compressor's ~6 dB gain reduction to meet the >= 6 dB SNR criterion (with
-#: 8 dB the self-test measured 5.8 dB). Shared with voicechain.adaptive via
-#: expander_threshold_target(); project decision 2026-11-03.
+#: chosen because the chain's static curve (ratio 2.5, knee 6 dB, Giannoulis)
+#: attenuates a signal 10 dB below the threshold by 15 dB, which leaves enough
+#: reserve against the compressor's ~6 dB gain reduction to meet the >= 6 dB
+#: SNR criterion (with 8 dB the self-test measured 5.8 dB SNR gain, with 10 dB
+#: 8.7 dB). Shared with voicechain.adaptive via expander_threshold_target();
+#: project decision 2026-11-03.
 EXPANDER_FLOOR_MARGIN_DB = 10.0
 #: ... but at least this far below the speech level so soft syllables pass.
 EXPANDER_SPEECH_MARGIN_DB = 12.0
@@ -53,14 +58,14 @@ EXPANDER_SPEECH_MARGIN_DB = 12.0
 #: spectrum (LTASS, approx. -6 dB/oct above 500 Hz, steeper above 4 kHz): about
 #: -15 dB. Values above it call for de-essing.
 SIBILANCE_REFERENCE_DB = -15.0
-#: A sibilant is short; during the burst the band level exceeds the long-term
-#: sibilance ratio. Assumption: 6 dB (bursts occupy roughly a quarter of the
-#: active time, 10*log10(4) = 6 dB).
-SIBILANCE_BURST_CREST_DB = 6.0
-#: Minimum gain reduction the de-esser should reach on measured sibilants.
+#: Minimum gain reduction the de-esser should reach on the loud sibilants
+#: (95th percentile of the band peaks, see meters.band_peak_dbfs).
 DEESSER_MIN_REDUCTION_DB = 4.0
 #: De-esser centre frequency limits (memory/04: 5-9 kHz).
 DEESSER_FREQ_BOUNDS_HZ = (5000.0, 9000.0)
+#: Band width used by analyze() when no configuration is given; equals the
+#: shipped default so stand-alone analyses match the calibrated chain.
+DEESSER_ANALYSIS_BANDWIDTH_OCT = 1.0
 #: Compressor threshold relative to the speech RMS level. The chain's compressor
 #: uses a sample-peak detector; syllable peaks of speech lie ~10 dB above the
 #: frame RMS (measured crest of 50 ms frames, see ``speech_crest_db``), so a
@@ -70,16 +75,16 @@ DEESSER_FREQ_BOUNDS_HZ = (5000.0, 9000.0)
 #: the expander's signal-to-noise gain (measured on the real chain: +3 dB instead
 #: of +7 dB), so it was dropped.
 COMPRESSOR_SPEECH_MARGIN_DB = 0.0
-#: Static soft-knee characteristic (Giannoulis, Massberg, Reiss 2012) used to
-#: predict the compressor's mean gain reduction from the syllable peak level.
-#: The prediction matched the real chain within 0.6 dB for thresholds from
-#: -26 to -14 dBFS on synthetic speech.
-#: Makeup gain limits; 12 dB mirrors the normalizer's max_gain_db.
+#: Makeup gain limits; 12 dB mirrors the normalizer's default max_gain_db.
 MAKEUP_BOUNDS_DB = (0.0, 12.0)
-#: EQ reference curve for speech: flat power spectral density below the knee,
-#: -6 dB/oct above. Assumption based on the typical long-term speech spectrum.
+#: EQ reference curve for speech (power spectral density): flat below 500 Hz,
+#: -6 dB/oct up to 4 kHz, -10 dB/oct above (the long-term speech spectrum falls
+#: clearly steeper above 4 kHz; -10 is the middle of the -9...-12 dB/oct range).
+#: Assumption based on the typical long-term speech spectrum, not a norm.
 EQ_REFERENCE_KNEE_HZ = 500.0
-EQ_REFERENCE_SLOPE_DB_PER_OCT = -6.0
+EQ_REFERENCE_SLOPE_MID_DB_PER_OCT = -6.0
+EQ_REFERENCE_KNEE_HIGH_HZ = 4000.0
+EQ_REFERENCE_SLOPE_HIGH_DB_PER_OCT = -10.0
 #: Only half of a measured deviation is corrected: the measurement mixes the
 #: microphone response with the speaker's own timbre, which should survive.
 #: Assumption.
@@ -92,19 +97,43 @@ EQ_MAX_GAIN_DB = 4.0
 EQ_SHELF_Q = 0.7
 EQ_PEAK_Q = 1.0
 #: EQ bands the calibration may touch: (type, centre, analysis band lo, hi).
+#: Shelves are cut-only (a low-frequency or top-octave boost lifts rumble,
+#: fan tone, preamp noise and sibilant remains rather than speech); peaks may
+#: boost or cut.
 EQ_TARGET_BANDS = (
     ("low_shelf", 120.0, 80.0, 170.0),
     ("peak", 250.0, 170.0, 350.0),
     ("peak", 3000.0, 2000.0, 4500.0),
     ("high_shelf", 10000.0, 7000.0, 14000.0),
 )
+EQ_CUT_ONLY_TYPES = ("low_shelf", "high_shelf")
+#: The 80-170 Hz band only carries speech when the fundamental lies in or near
+#: it. Voices with f0 above this limit (many female and children's voices) have
+#: no speech energy there, so the low shelf is left alone. Assumption.
+EQ_LOW_SHELF_MAX_F0_HZ = 150.0
 #: Anchor band for relative band levels (speech core, between the EQ bands).
 EQ_ANCHOR_BAND_HZ = (350.0, 1000.0)
 #: Relative tolerance when matching an existing EQ band by frequency.
 EQ_BAND_MATCH_TOLERANCE = 0.2
 
+#: Normalizer gate: above the pause loudness after the chain by this margin so
+#: room noise never opens the gate (assumption: 8 dB, like the expander margin
+#: before the knee), never below GATE_MIN_LUFS (the shipped default; quieter
+#: pauses need no lower gate) and never closer than GATE_SPEECH_MARGIN_LU to the
+#: target so soft speech still opens it.
+NORMALIZER_GATE_MARGIN_DB = 8.0
+NORMALIZER_GATE_MIN_LUFS = -40.0
+NORMALIZER_GATE_SPEECH_MARGIN_LU = 15.0
+#: Normalizer gain limit: the pause loudness plus the maximum gain must stay
+#: this far below the target, so the normalizer can never lift room noise to
+#: speech loudness (PO-7).
+NORMALIZER_PAUSE_HEADROOM_LU = 6.0
+NORMALIZER_MAX_GAIN_LIMIT_DB = 12.0
+
 #: Acceptance criteria (docs/00 section 6.3 and memory/04).
 NOISE_FLOOR_MIN_REDUCTION_DB = 6.0
+PAUSE_LOUDNESS_MARGIN_LU = 20.0
+MIN_PAUSE_S = 5.0
 LOUDNESS_TOLERANCE_LU = 2.0
 #: Sibilance must not get worse by more than this when the de-esser is not
 #: needed (assumption: 1 dB is below audibility for a band-energy ratio).
@@ -118,45 +147,16 @@ TRUE_PEAK_TOLERANCE_DB = 0.1
 RECOMMENDED_DURATION_S = (30.0, 120.0)
 MIN_DURATION_S = 10.0
 
-#: Fallback configuration (schema of docs/00 section 4.1) used when no base
-#: configuration path is given. ``config/chain.default.yaml`` is the normal source.
-DEFAULT_CONFIG: dict = {
-    "sample_rate": 48000,
-    "block_size": 256,
-    "input": {"device": "RØDE NT-USB", "channel": 0},
-    "output": {"device": "BlackHole 2ch", "channels": 2},
-    "chain": {
-        "input_trim": {"gain_db": 0.0},
-        "highpass": {"enabled": True, "freq_hz": 80.0, "order": 4},
-        "expander": {"enabled": True, "threshold_db": -45.0, "ratio": 2.5, "range_db": 20.0,
-                     "attack_ms": 5.0, "hold_ms": 50.0, "release_ms": 150.0, "knee_db": 6.0},
-        "deesser": {"enabled": True, "freq_hz": 6500.0, "bandwidth_oct": 1.0, "threshold_db": -30.0,
-                    "ratio": 4.0, "max_reduction_db": 8.0, "attack_ms": 1.0, "release_ms": 60.0},
-        "eq": {"enabled": True, "bands": [
-            {"type": "low_shelf", "freq_hz": 120.0, "gain_db": 0.0, "q": EQ_SHELF_Q},
-            {"type": "peak", "freq_hz": 250.0, "gain_db": 0.0, "q": EQ_PEAK_Q},
-            {"type": "peak", "freq_hz": 3000.0, "gain_db": 0.0, "q": EQ_PEAK_Q},
-            {"type": "high_shelf", "freq_hz": 10000.0, "gain_db": 0.0, "q": EQ_SHELF_Q},
-        ]},
-        "compressor": {"enabled": True, "threshold_db": -20.0, "ratio": 3.0, "knee_db": 6.0,
-                       "attack_ms": 10.0, "release_ms": 100.0, "makeup_db": 0.0},
-        "normalizer": {"enabled": True, "target_lufs": -18.0, "window_s": 3.0, "max_gain_db": 12.0,
-                       "min_gain_db": -12.0, "rate_db_per_s": 1.0, "gate_lufs": -40.0},
-        "limiter": {"enabled": True, "ceiling_dbfs": -1.0, "lookahead_ms": 5.0, "release_ms": 50.0},
-    },
-    "adaptive": {
-        "enabled": True,
-        "learn_s": 30.0,
-        "interval_s": 2.0,
-        "max_step_db": 0.5,
-        "log_path": "logs/adaptive.jsonl",
-        "bounds": {
-            "expander.threshold_db": [-70.0, -30.0],
-            "deesser.threshold_db": [-45.0, -15.0],
-            "compressor.threshold_db": [-35.0, -10.0],
-        },
-    },
-}
+#: Top-level keys starting with this prefix are calibration metadata, not schema.
+METADATA_PREFIX = "_"
+#: Common dB floor (voicechain.dsp.DB_FLOOR_DBFS via meters).
+DB_FLOOR = meters.DB_FLOOR_DBFS
+
+NO_PAUSE_HINT = (
+    f"Das Sample enthält keine Sprechpause von mindestens {MIN_PAUSE_S:.0f} s nach dem ersten "
+    "gesprochenen Satz. Die Beauftragung §6.3 verlangt sie, weil nur dort messbar ist, wie leise "
+    "die Kette in Pausen bleibt. Bitte neu aufnehmen: 10 s Stille am Anfang, normal sprechen und in "
+    f"der Mitte eine Pause von mindestens {MIN_PAUSE_S:.0f} s einlegen (nicht sprechen, nicht tippen).")
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +171,7 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 def parse_bounds(cfg: dict) -> dict[tuple[str, str], tuple[float, float]]:
     """``cfg["adaptive"]["bounds"]`` -> ``{(stage, name): (lo, hi)}``."""
-    raw = cfg.get("adaptive", {}).get("bounds", {})
+    raw = cfg["adaptive"]["bounds"]
     out = {}
     for key, pair in raw.items():
         if "." not in key:
@@ -184,8 +184,34 @@ def parse_bounds(cfg: dict) -> dict[tuple[str, str], tuple[float, float]]:
     return out
 
 
-def bounds_for(bounds: dict, stage: str, name: str, default: tuple[float, float]) -> tuple[float, float]:
-    return bounds.get((stage, name), default)
+def tracked_bounds(bounds: dict, stage: str, name: str) -> tuple[float, float]:
+    """Bounds of a tracked parameter; a missing entry is a configuration error."""
+    try:
+        return bounds[(stage, name)]
+    except KeyError:
+        raise ValueError(f"adaptive.bounds lacks an entry for {stage}.{name}") from None
+
+
+def strip_metadata(cfg: dict) -> dict:
+    """Deep copy of ``cfg`` without top-level keys that start with ``METADATA_PREFIX``."""
+    return {k: copy.deepcopy(v) for k, v in cfg.items() if not str(k).startswith(METADATA_PREFIX)}
+
+
+def _plain(obj):
+    """Convert numpy scalars/arrays to plain Python for YAML/JSON output."""
+    if isinstance(obj, dict):
+        return {str(k): _plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_plain(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_plain(v) for v in obj.tolist()]
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
 
 
 # --------------------------------------------------------------------------- #
@@ -200,8 +226,8 @@ def input_trim_target(speech_level_dbfs: float) -> float:
 def expander_threshold_target(noise_floor_dbfs: float, speech_level_dbfs: float | None) -> float:
     """Noise floor + margin, but at least ``EXPANDER_SPEECH_MARGIN_DB`` below speech.
 
-    ``speech_level_dbfs`` may be None when no speech is present (then only the
-    floor rule applies). Bounds are applied by the caller.
+    ``speech_level_dbfs`` may be None when no plausible speech is present (then
+    only the floor rule applies). Bounds are applied by the caller.
     """
     target = noise_floor_dbfs + EXPANDER_FLOOR_MARGIN_DB
     if speech_level_dbfs is not None:
@@ -209,25 +235,30 @@ def expander_threshold_target(noise_floor_dbfs: float, speech_level_dbfs: float 
     return float(target)
 
 
-def deesser_threshold_target(speech_level_dbfs: float, sibilance_ratio_db: float,
-                             ratio: float, default_threshold_db: float) -> tuple[float, bool]:
-    """De-esser threshold so that measured sibilants get >= DEESSER_MIN_REDUCTION_DB.
-
-    Returns ``(threshold_db, engaged)``. If the sibilance ratio is at or below
-    the reference, the default threshold is returned and ``engaged`` is False.
-    Model: sideband level during a sibilant ~ speech level + sibilance ratio +
-    burst crest; a ratio R reduces (level - threshold) * (1 - 1/R). The result
-    is never above the default threshold: a lower default already gives more
-    than the minimum reduction, and raising it would de-ess *less* on a
-    sibilant voice.
-    """
+def deesser_overshoot_db(ratio: float) -> float:
+    """Band level above the threshold needed for DEESSER_MIN_REDUCTION_DB at a hard knee."""
     if ratio <= 1.0:
         raise ValueError(f"de-esser ratio must be > 1, got {ratio}")
+    return DEESSER_MIN_REDUCTION_DB / (1.0 - 1.0 / ratio)
+
+
+def deesser_threshold_target(band_peak_dbfs: float, sibilance_ratio_db: float,
+                             ratio: float, default_threshold_db: float) -> tuple[float, bool]:
+    """De-esser threshold from the measured band peak level of the loud sibilants.
+
+    ``band_peak_dbfs`` is what the de-esser's peak detector sees on the loud
+    sibilants (95th percentile of the 50 ms frame peaks of the band-passed
+    signal, after the input trim). Returns ``(threshold_db, engaged)``: if the
+    sibilance ratio is at or below the reference, the voice needs no de-essing
+    and the default threshold is returned; otherwise the threshold is placed
+    ``deesser_overshoot_db(ratio)`` below the peak so those sibilants receive
+    at least ``DEESSER_MIN_REDUCTION_DB`` (hard knee: reduction = (L - T) * (1 - 1/R)).
+    Bounds are applied by the caller.
+    """
+    overshoot = deesser_overshoot_db(ratio)
     if sibilance_ratio_db <= SIBILANCE_REFERENCE_DB:
         return float(default_threshold_db), False
-    sibilant_level = speech_level_dbfs + sibilance_ratio_db + SIBILANCE_BURST_CREST_DB
-    overshoot_needed = DEESSER_MIN_REDUCTION_DB / (1.0 - 1.0 / ratio)
-    return float(min(default_threshold_db, sibilant_level - overshoot_needed)), True
+    return float(band_peak_dbfs - overshoot), True
 
 
 def compressor_threshold_target(speech_level_dbfs: float) -> float:
@@ -236,7 +267,13 @@ def compressor_threshold_target(speech_level_dbfs: float) -> float:
 
 def static_compressor_reduction_db(level_db: float, threshold_db: float, ratio: float,
                                    knee_db: float) -> float:
-    """Gain reduction (>= 0 dB) of a soft-knee compressor at a detector level."""
+    """Gain reduction (>= 0 dB) of a soft-knee compressor at a detector level
+    (Giannoulis, Massberg, Reiss 2012; same curve as the chain's compressor).
+
+    The prediction matched the real chain within 0.6 dB for thresholds from
+    -26 to -14 dBFS on synthetic speech when evaluated at the mean 50 ms frame
+    peak level of the active speech.
+    """
     if ratio <= 0:
         raise ValueError(f"compressor ratio must be positive, got {ratio}")
     if knee_db < 0:
@@ -252,11 +289,7 @@ def static_compressor_reduction_db(level_db: float, threshold_db: float, ratio: 
 
 def compressor_makeup_target(speech_peak_level_dbfs: float, threshold_db: float, ratio: float,
                              knee_db: float) -> float:
-    """Makeup that restores the level the compressor removes from syllable peaks.
-
-    ``speech_peak_level_dbfs`` is the mean 50 ms frame peak level of active
-    speech (``analyze()["speech_peak_level_dbfs"]`` plus the input trim).
-    """
+    """Makeup that restores the level the compressor removes from syllable peaks."""
     return clamp(static_compressor_reduction_db(speech_peak_level_dbfs, threshold_db, ratio, knee_db),
                  *MAKEUP_BOUNDS_DB)
 
@@ -265,7 +298,23 @@ def eq_reference_db(freq_hz: float) -> float:
     """Reference power spectral density (dB, relative) at ``freq_hz``."""
     if freq_hz <= EQ_REFERENCE_KNEE_HZ:
         return 0.0
-    return EQ_REFERENCE_SLOPE_DB_PER_OCT * math.log2(freq_hz / EQ_REFERENCE_KNEE_HZ)
+    mid = EQ_REFERENCE_SLOPE_MID_DB_PER_OCT * math.log2(
+        min(freq_hz, EQ_REFERENCE_KNEE_HIGH_HZ) / EQ_REFERENCE_KNEE_HZ)
+    if freq_hz <= EQ_REFERENCE_KNEE_HIGH_HZ:
+        return mid
+    return mid + EQ_REFERENCE_SLOPE_HIGH_DB_PER_OCT * math.log2(freq_hz / EQ_REFERENCE_KNEE_HIGH_HZ)
+
+
+def normalizer_gate_target(pause_loudness_lufs: float, target_lufs: float) -> float:
+    """Gate above the pause loudness, inside [GATE_MIN, target - speech margin]."""
+    hi = target_lufs - NORMALIZER_GATE_SPEECH_MARGIN_LU
+    return clamp(pause_loudness_lufs + NORMALIZER_GATE_MARGIN_DB, min(NORMALIZER_GATE_MIN_LUFS, hi), hi)
+
+
+def normalizer_max_gain_target(pause_loudness_lufs: float, target_lufs: float) -> float:
+    """Largest gain that keeps pause loudness + gain below target - headroom."""
+    return clamp(target_lufs - (pause_loudness_lufs + NORMALIZER_PAUSE_HEADROOM_LU),
+                 0.0, NORMALIZER_MAX_GAIN_LIMIT_DB)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,15 +331,23 @@ def _usable_eq_bands(sample_rate: int) -> list[tuple[str, float, float, float]]:
     return out
 
 
-def analyze(x: np.ndarray, sample_rate: int) -> dict:
+def analyze(x: np.ndarray, sample_rate: int, deesser_freq_hz: float | None = None,
+            deesser_bandwidth_oct: float = DEESSER_ANALYSIS_BANDWIDTH_OCT) -> dict:
     """Measure everything the recommendation and the report need.
 
+    ``deesser_freq_hz`` / ``deesser_bandwidth_oct`` define the band in which
+    the sibilant peak level is measured; None uses the measured sibilance
+    centroid clipped to the de-esser range (what ``recommend`` will choose).
+
     Keys: duration_s, sample_rate, rms_dbfs, sample_peak_dbfs, true_peak_dbtp,
-    noise_floor_dbfs, speech_level_dbfs, snr_db, speech_detected,
-    speech_activity_ratio, sibilance_ratio_db, sibilance_centroid_hz,
+    noise_floor_dbfs, speech_level_dbfs, speech_peak_level_dbfs, speech_crest_db,
+    snr_db, dynamic_range_db, speech_detected, speech_activity_ratio, f0_hz,
+    voiced_ratio, sibilance_ratio_db, sibilance_centroid_hz,
+    sibilant_band_peak_dbfs, sibilant_band_freq_hz, sibilant_band_width_oct,
     spectral_tilt_db_per_oct, integrated_lufs, short_term_lufs_max,
-    eq_bands (dict label -> {lo_hz, hi_hz, centre_hz, energy_db, density_db}),
-    eq_anchor (same structure for the anchor band).
+    eq_bands (dict label -> {type, freq_hz, lo_hz, hi_hz, centre_hz, energy_db,
+    density_db}), eq_anchor (same band structure), pause (None or {start_s,
+    end_s, max_lufs, median_lufs, rms_dbfs}).
     """
     x = np.asarray(x, dtype=np.float64)
     if x.ndim == 2:
@@ -299,6 +356,8 @@ def analyze(x: np.ndarray, sample_rate: int) -> dict:
         raise ValueError(
             f"sample is {x.size / sample_rate:.1f} s long; at least {MIN_DURATION_S:.0f} s "
             f"with speech pauses are needed to estimate the noise floor")
+    if not np.all(np.isfinite(x)):
+        raise ValueError("Sample enthält nicht-finite Werte (NaN/Inf); Analyse nicht möglich")
     mask, levels = meters.speech_activity(x, sample_rate)
     _, detected = meters.activity_threshold_db(levels)
     noise_floor = meters.noise_floor_dbfs(x, sample_rate)
@@ -309,8 +368,14 @@ def analyze(x: np.ndarray, sample_rate: int) -> dict:
     frame = int(round(sample_rate * meters.ANALYSIS_FRAME_MS / 1000.0))
     frames = np.abs(x[:mask.size * frame].reshape(mask.size, frame))
     peak_frames = frames[mask] if np.any(mask) else frames
-    speech_peak = float(np.mean(20.0 * np.log10(np.maximum(np.max(peak_frames, axis=1),
-                                                            math.sqrt(meters.POWER_FLOOR)))))
+    speech_peak = float(np.mean(meters._amp_to_db(np.max(peak_frames, axis=1))))
+    centroid = meters.sibilance_centroid_hz(x, sample_rate)
+    band_freq = float(deesser_freq_hz) if deesser_freq_hz is not None else clamp(centroid, *DEESSER_FREQ_BOUNDS_HZ)
+    f0, voiced_ratio = meters.fundamental_frequency_hz(x, sample_rate)
+    pause_span = meters.longest_pause(x, sample_rate, MIN_PAUSE_S)
+    pause = None
+    if pause_span is not None:
+        pause = meters.pause_loudness_lufs(x, sample_rate, *pause_span)
 
     def band_info(lo: float, hi: float) -> dict:
         energy = meters.band_energies_db(x, sample_rate, [lo, hi])[0]
@@ -331,15 +396,22 @@ def analyze(x: np.ndarray, sample_rate: int) -> dict:
         "speech_peak_level_dbfs": speech_peak,
         "speech_crest_db": speech_peak - speech,
         "snr_db": speech - noise_floor,
+        "dynamic_range_db": meters.dynamic_range_db(levels),
         "speech_detected": bool(detected),
         "speech_activity_ratio": float(np.mean(mask)) if mask.size else 0.0,
+        "f0_hz": f0,
+        "voiced_ratio": voiced_ratio,
         "sibilance_ratio_db": meters.sibilance_ratio_db(x, sample_rate),
-        "sibilance_centroid_hz": meters.sibilance_centroid_hz(x, sample_rate),
+        "sibilance_centroid_hz": centroid,
+        "sibilant_band_peak_dbfs": meters.band_peak_dbfs(x, sample_rate, band_freq, deesser_bandwidth_oct),
+        "sibilant_band_freq_hz": band_freq,
+        "sibilant_band_width_oct": float(deesser_bandwidth_oct),
         "spectral_tilt_db_per_oct": meters.spectral_tilt_db_per_oct(x, sample_rate),
         "integrated_lufs": meters.integrated_lufs(x, sample_rate),
-        "short_term_lufs_max": float(np.max(st_series)) if st_series.size else meters.DB_FLOOR,
+        "short_term_lufs_max": float(np.max(st_series)) if st_series.size else DB_FLOOR,
         "eq_bands": eq_bands,
         "eq_anchor": band_info(*EQ_ANCHOR_BAND_HZ),
+        "pause": pause,
     }
 
 
@@ -363,20 +435,22 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
     Returns a deep copy of ``base_cfg`` with changed chain values and an extra
     top-level key ``_calibration`` holding ``measurements``, ``reasons`` (one
     German sentence per changed parameter path) and a timestamp. Keys with a
-    leading underscore are metadata and must be ignored by config validators.
+    leading underscore are metadata and are ignored by the config validator.
+    The normalizer gate and gain limit need the pause loudness *after* the
+    chain and are set by :func:`refine_normalizer`.
     """
     cfg = copy.deepcopy(base_cfg)
-    chain = cfg.setdefault("chain", {})
+    chain = cfg["chain"]
     bounds = parse_bounds(cfg)
     reasons: dict[str, str] = {}
     m = measurements
     speech_in = float(m["speech_level_dbfs"])
     floor_in = float(m["noise_floor_dbfs"])
-    speech_detected = bool(m.get("speech_detected", True))
+    speech_detected = bool(m["speech_detected"])
 
     # 0. Input trim
     trim = input_trim_target(speech_in)
-    chain.setdefault("input_trim", {})["gain_db"] = round(trim, 2)
+    chain["input_trim"]["gain_db"] = round(trim, 2)
     speech_after = speech_in + trim
     floor_after = floor_in + trim
     reasons["chain.input_trim.gain_db"] = (
@@ -389,8 +463,8 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
             f"{meters.MIN_SPEECH_SNR_DB:.0f} dB), Sprachpegel ist nur ein Schätzwert.")
 
     # 2. Expander
-    exp = chain.setdefault("expander", {})
-    exp_lo, exp_hi = bounds_for(bounds, "expander", "threshold_db", (-70.0, -30.0))
+    exp = chain["expander"]
+    exp_lo, exp_hi = tracked_bounds(bounds, "expander", "threshold_db")
     exp_raw = expander_threshold_target(floor_after, speech_after if speech_detected else None)
     exp_thr = clamp(exp_raw, exp_lo, exp_hi)
     exp["threshold_db"] = round(exp_thr, 2)
@@ -404,8 +478,8 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
         f"maßgebliche Regel: {limiting_rule}; Grenzen {exp_lo:.0f}…{exp_hi:.0f} → {exp_thr:.1f} dBFS.")
 
     # 3. De-esser
-    de = chain.setdefault("deesser", {})
-    de_lo, de_hi = bounds_for(bounds, "deesser", "threshold_db", (-45.0, -15.0))
+    de = chain["deesser"]
+    de_lo, de_hi = tracked_bounds(bounds, "deesser", "threshold_db")
     sib = float(m["sibilance_ratio_db"])
     centroid = float(m["sibilance_centroid_hz"])
     de_freq = clamp(centroid, *DEESSER_FREQ_BOUNDS_HZ)
@@ -413,25 +487,20 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
     reasons["chain.deesser.freq_hz"] = (
         f"Schwerpunkt der Zischenergie 4–10 kHz bei {centroid:.0f} Hz, begrenzt auf "
         f"{DEESSER_FREQ_BOUNDS_HZ[0]:.0f}…{DEESSER_FREQ_BOUNDS_HZ[1]:.0f} Hz → {de_freq:.0f} Hz.")
-    de_ratio = float(de.get("ratio", DEFAULT_CONFIG["chain"]["deesser"]["ratio"]))
-    de_default = float(de.get("threshold_db", DEFAULT_CONFIG["chain"]["deesser"]["threshold_db"]))
-    de_raw, engaged = deesser_threshold_target(speech_after, sib, de_ratio, de_default)
+    de_ratio = float(de["ratio"])
+    de_default = float(de["threshold_db"])
+    band_peak_after = float(m["sibilant_band_peak_dbfs"]) + trim
+    de_raw, engaged = deesser_threshold_target(band_peak_after, sib, de_ratio, de_default)
     de_thr = clamp(de_raw, de_lo, de_hi)
     de["threshold_db"] = round(de_thr, 2)
     if engaged:
-        sibilant_level = speech_after + sib + SIBILANCE_BURST_CREST_DB
-        computed = sibilant_level - DEESSER_MIN_REDUCTION_DB / (1 - 1 / de_ratio)
         reasons["chain.deesser.threshold_db"] = (
             f"Zischanteil {sib:.1f} dB liegt über der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB (Annahme). "
-            f"Zischpegel ≈ Sprache {speech_after:.1f} + Zischanteil {sib:.1f} + Burst-Crest "
-            f"{SIBILANCE_BURST_CREST_DB:.0f} dB (Annahme) = {sibilant_level:.1f} dBFS; "
-            f"für ≥ {DEESSER_MIN_REDUCTION_DB:.0f} dB Reduktion bei Ratio {de_ratio:g} muss die Schwelle "
-            f"{DEESSER_MIN_REDUCTION_DB / (1 - 1 / de_ratio):.1f} dB darunter liegen → rechnerisch {computed:.1f}; ")
-        if computed >= de_default:
-            reasons["chain.deesser.threshold_db"] += (
-                f"die Standardschwelle {de_default:.1f} liegt bereits tiefer und bleibt "
-                f"(Reduktion ≥ {DEESSER_MIN_REDUCTION_DB:.0f} dB gesichert, Obergrenze max_reduction_db); ")
-        reasons["chain.deesser.threshold_db"] += f"Grenzen {de_lo:.0f}…{de_hi:.0f} → {de_thr:.1f} dBFS."
+            f"Spitzenpegel der lauten Zischlaute im De-Esser-Band ({m['sibilant_band_freq_hz']:.0f} Hz, "
+            f"{m['sibilant_band_width_oct']:.1f} Okt, 95. Perzentil der 50-ms-Spitzen) nach Trim: "
+            f"{band_peak_after:.1f} dBFS; für ≥ {DEESSER_MIN_REDUCTION_DB:.0f} dB Reduktion bei Ratio {de_ratio:g} "
+            f"(hartes Knie) liegt die Schwelle {deesser_overshoot_db(de_ratio):.1f} dB darunter → {de_raw:.1f}; "
+            f"Grenzen {de_lo:.0f}…{de_hi:.0f} → {de_thr:.1f} dBFS.")
     else:
         reasons["chain.deesser.threshold_db"] = (
             f"Zischanteil {sib:.1f} dB liegt nicht über der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB (Annahme); "
@@ -440,19 +509,44 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
     # 4. EQ: the measured correction is *added* to the base value of the matching
     # band. The base value describes the intended voicing for the codec
     # (docs/02), the correction describes microphone and speaker; both apply.
-    eq = chain.setdefault("eq", {})
+    # Shelves are cut-only; the low shelf is skipped for voices with f0 above
+    # EQ_LOW_SHELF_MAX_F0_HZ because their 80-170 Hz band holds no speech.
+    eq = chain["eq"]
     bands = eq.setdefault("bands", [])
     anchor = m["eq_anchor"]
+    f0 = float(m["f0_hz"])
+    ref_curve = (f"flach bis {EQ_REFERENCE_KNEE_HZ:.0f} Hz, {EQ_REFERENCE_SLOPE_MID_DB_PER_OCT:+.0f} dB/Okt bis "
+                 f"{EQ_REFERENCE_KNEE_HIGH_HZ / 1000:.0f} kHz, darüber {EQ_REFERENCE_SLOPE_HIGH_DB_PER_OCT:+.0f} dB/Okt, Annahme")
     for info in m["eq_bands"].values():
         kind, fc = info["type"], float(info["freq_hz"])
         measured_rel = info["density_db"] - anchor["density_db"]
         reference_rel = eq_reference_db(info["centre_hz"]) - eq_reference_db(anchor["centre_hz"])
         deviation = measured_rel - reference_rel
+        band = _find_eq_band(bands, kind, fc)
+        label_freq = float(band["freq_hz"]) if band is not None else fc
+        key = f"chain.eq.{kind}@{label_freq:.0f}.gain_db"
+        prefix = (f"Band {info['lo_hz']:.0f}–{info['hi_hz']:.0f} Hz liegt {measured_rel:+.1f} dB zum Ankerband "
+                  f"{anchor['lo_hz']:.0f}–{anchor['hi_hz']:.0f} Hz; Referenzkurve ({ref_curve}) erwartet "
+                  f"{reference_rel:+.1f} dB → Abweichung {deviation:+.1f} dB; ")
+        if kind == "low_shelf" and not (math.isfinite(f0) and f0 <= EQ_LOW_SHELF_MAX_F0_HZ):
+            f0_text = f"{f0:.0f} Hz" if math.isfinite(f0) else "nicht messbar"
+            reasons[key] = prefix + (
+                f"Grundfrequenz {f0_text} liegt über {EQ_LOW_SHELF_MAX_F0_HZ:.0f} Hz, das Band enthält "
+                "keine Sprache (nur Trittschall/Lüfter) → kein Eingriff"
+                + (f", Basiswert {float(band['gain_db']):+.1f} dB bleibt." if band is not None else "."))
+            continue
         if abs(deviation) < EQ_MIN_DEVIATION_DB:
             correction = 0.0
         else:
             correction = clamp(-EQ_CORRECTION_FRACTION * deviation, -EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB)
-        band = _find_eq_band(bands, kind, fc)
+        cut_only = kind in EQ_CUT_ONLY_TYPES
+        if cut_only:
+            correction = min(correction, 0.0)
+        if band is None and correction == 0.0:
+            reasons[key] = prefix + (f"Korrektur {EQ_CORRECTION_FRACTION:.0%} davon, Totzone ±{EQ_MIN_DEVIATION_DB:.0f} dB"
+                                     + (", Shelf nur als Absenkung" if cut_only else "")
+                                     + " → 0 dB, kein Band angelegt.")
+            continue
         if band is None:
             band = {"type": kind, "freq_hz": fc, "gain_db": 0.0,
                     "q": EQ_SHELF_Q if kind.endswith("shelf") else EQ_PEAK_Q}
@@ -461,27 +555,25 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
         else:
             created = False
         base_gain = float(band.get("gain_db", 0.0))
-        gain = clamp(base_gain + correction, -EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB)
+        hi_gain = 0.0 if cut_only else EQ_MAX_GAIN_DB
+        gain = clamp(base_gain + correction, -EQ_MAX_GAIN_DB, hi_gain)
         band["gain_db"] = round(gain, 2)
-        actual_freq = float(band["freq_hz"])
-        reasons[f"chain.eq.{kind}@{actual_freq:.0f}.gain_db"] = (
-            f"Band {info['lo_hz']:.0f}–{info['hi_hz']:.0f} Hz liegt {measured_rel:+.1f} dB zum Ankerband "
-            f"{anchor['lo_hz']:.0f}–{anchor['hi_hz']:.0f} Hz; Referenzkurve (flach bis {EQ_REFERENCE_KNEE_HZ:.0f} Hz, "
-            f"dann {EQ_REFERENCE_SLOPE_DB_PER_OCT:+.0f} dB/Okt, Annahme) erwartet {reference_rel:+.1f} dB → "
-            f"Abweichung {deviation:+.1f} dB; Korrektur {EQ_CORRECTION_FRACTION:.0%} davon, "
-            f"Totzone ±{EQ_MIN_DEVIATION_DB:.0f} dB → {correction:+.1f} dB "
-            + (f"auf neues Band bei {actual_freq:.0f} Hz" if created
-               else f"zum Basiswert {base_gain:+.1f} dB des Bands bei {actual_freq:.0f} Hz")
-            + f"; Grenze ±{EQ_MAX_GAIN_DB:.0f} dB → {gain:+.1f} dB.")
+        reasons[key] = prefix + (
+            f"Korrektur {EQ_CORRECTION_FRACTION:.0%} davon, Totzone ±{EQ_MIN_DEVIATION_DB:.0f} dB"
+            + (", Shelf nur als Absenkung" if cut_only else "")
+            + f" → {correction:+.1f} dB "
+            + (f"auf neues Band bei {fc:.0f} Hz" if created
+               else f"zum Basiswert {base_gain:+.1f} dB des Bands bei {label_freq:.0f} Hz")
+            + f"; Grenze {-EQ_MAX_GAIN_DB:+.0f}…{hi_gain:+.0f} dB → {gain:+.1f} dB.")
 
     # 5. Compressor
-    comp = chain.setdefault("compressor", {})
-    comp_lo, comp_hi = bounds_for(bounds, "compressor", "threshold_db", (-35.0, -10.0))
+    comp = chain["compressor"]
+    comp_lo, comp_hi = tracked_bounds(bounds, "compressor", "threshold_db")
     comp_thr = clamp(compressor_threshold_target(speech_after), comp_lo, comp_hi)
     comp["threshold_db"] = round(comp_thr, 2)
-    comp_ratio = float(comp.get("ratio", DEFAULT_CONFIG["chain"]["compressor"]["ratio"]))
-    comp_knee = float(comp.get("knee_db", DEFAULT_CONFIG["chain"]["compressor"]["knee_db"]))
-    peak_after = float(m.get("speech_peak_level_dbfs", speech_in)) + trim
+    comp_ratio = float(comp["ratio"])
+    comp_knee = float(comp["knee_db"])
+    peak_after = float(m["speech_peak_level_dbfs"]) + trim
     makeup = compressor_makeup_target(peak_after, comp_thr, comp_ratio, comp_knee)
     comp["makeup_db"] = round(makeup, 2)
     reasons["chain.compressor.threshold_db"] = (
@@ -494,16 +586,13 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
         f"Schwelle; Ratio {comp_ratio:g} mit {comp_knee:.0f} dB Knie nimmt dort {makeup:.1f} dB weg → Makeup "
         f"{makeup:+.1f} dB (Grenzen {MAKEUP_BOUNDS_DB[0]:.0f}…{MAKEUP_BOUNDS_DB[1]:.0f} dB), damit Ausgang ≈ Eingang.")
 
-    # 5b / 6. Normalizer and limiter: keep configured values, document why.
-    norm = chain.setdefault("normalizer", {})
-    norm.setdefault("target_lufs", DEFAULT_CONFIG["chain"]["normalizer"]["target_lufs"])
+    # 5b / 6. Normalizer target and limiter ceiling: keep configured values.
+    norm = chain["normalizer"]
     reasons["chain.normalizer.target_lufs"] = (
         f"Bleibt bei {float(norm['target_lufs']):.0f} LUFS (Zielwert aus Konfiguration, "
         "memory/04: −18 LUFS ± 2 LU für Konferenz, E3).")
-    lim = chain.setdefault("limiter", {})
-    lim.setdefault("ceiling_dbfs", DEFAULT_CONFIG["chain"]["limiter"]["ceiling_dbfs"])
     reasons["chain.limiter.ceiling_dbfs"] = (
-        f"Bleibt bei {float(lim['ceiling_dbfs']):.0f} dBTP (True-Peak-Obergrenze, E3).")
+        f"Bleibt bei {float(chain['limiter']['ceiling_dbfs']):.0f} dBTP (True-Peak-Obergrenze, E3).")
 
     cfg["_calibration"] = {
         "created": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -513,21 +602,42 @@ def recommend(measurements: dict, base_cfg: dict) -> dict:
     return cfg
 
 
-def _plain(obj):
-    """Convert numpy scalars/arrays to plain Python for YAML/JSON output."""
-    if isinstance(obj, dict):
-        return {str(k): _plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_plain(v) for v in obj]
-    if isinstance(obj, np.ndarray):
-        return [_plain(v) for v in obj.tolist()]
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    return obj
+def refine_normalizer(cfg: dict, after_measurements: dict) -> dict:
+    """Set ``normalizer.gate_lufs`` and ``normalizer.max_gain_db`` from the pause
+    loudness measured after a first pass through the chain (PO-1 d / PO-7).
+
+    ``after_measurements["pause"]`` must exist (``analyze`` of the processed
+    sample with a pause >= MIN_PAUSE_S). Returns a deep copy with reasons added
+    under ``_calibration.reasons`` and the after-measurements under
+    ``_calibration.measurements_first_pass``.
+    """
+    pause = after_measurements.get("pause")
+    if pause is None:
+        raise ValueError(NO_PAUSE_HINT)
+    out = copy.deepcopy(cfg)
+    norm = out["chain"]["normalizer"]
+    target = float(norm["target_lufs"])
+    pause_lufs = float(pause["median_lufs"])
+    gate = normalizer_gate_target(pause_lufs, target)
+    max_gain = normalizer_max_gain_target(pause_lufs, target)
+    norm["gate_lufs"] = round(gate, 2)
+    norm["max_gain_db"] = round(max_gain, 2)
+    reasons = out.setdefault("_calibration", {}).setdefault("reasons", {})
+    reasons["chain.normalizer.gate_lufs"] = (
+        f"Pausenlautheit nach Kette (Median der Momentary-Lautheit in der Pause "
+        f"{pause['start_s']:.1f}–{pause['end_s']:.1f} s, erster Durchlauf) {pause_lufs:.1f} LUFS + "
+        f"{NORMALIZER_GATE_MARGIN_DB:.0f} dB Abstand (Annahme) = {pause_lufs + NORMALIZER_GATE_MARGIN_DB:.1f}; "
+        f"mindestens {NORMALIZER_GATE_MIN_LUFS:.0f} LUFS, höchstens Ziel {target:.0f} − "
+        f"{NORMALIZER_GATE_SPEECH_MARGIN_LU:.0f} LU → {gate:.1f} LUFS. Unterhalb hält der Normalizer den Gain, "
+        "Pausenrauschen wird nicht hochgezogen.")
+    reasons["chain.normalizer.max_gain_db"] = (
+        f"Ziel {target:.0f} LUFS − (Pausenlautheit {pause_lufs:.1f} + {NORMALIZER_PAUSE_HEADROOM_LU:.0f} LU Abstand) = "
+        f"{target - (pause_lufs + NORMALIZER_PAUSE_HEADROOM_LU):.1f} dB, begrenzt auf 0…{NORMALIZER_MAX_GAIN_LIMIT_DB:.0f} dB "
+        f"→ {max_gain:.1f} dB: Rauschen kann rechnerisch nie auf Sprachlautheit angehoben werden."
+        + (" ACHTUNG: 0 dB bedeutet, dass die Pausen in diesem Raum bereits zu laut sind; die Kette kann hier "
+           "keine Lautheit hinzufügen." if max_gain <= 0.0 else ""))
+    out["_calibration"]["measurements_first_pass"] = _plain(after_measurements)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -537,16 +647,26 @@ def _plain(obj):
 def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -> dict:
     """Before/after measurements and the acceptance criteria of docs/00 section 6.3.
 
-    Returns ``{"before": dict, "after": dict, "criteria": {key: {"passed": bool,
-    "target": str, "actual": str, "note": str}}, "passed": bool}``.
+    Criteria keys: ``noise_floor_reduction`` (SNR gain >= 6 dB),
+    ``pause_loudness`` (max momentary loudness in the longest pause >= 5 s of
+    the input, measured on the output, <= target - 20 LU), ``sibilance_reduced``,
+    ``loudness_in_target``, ``true_peak_below_ceiling``. Each is
+    ``{"passed": bool, "target": str, "actual": str, "note": str}``.
+    Raises ValueError with a recording hint when the input has no pause >= 5 s.
     """
-    before = analyze(x_in, sample_rate)
-    after = analyze(x_out, sample_rate)
-    chain = cfg.get("chain", {})
-    target_lufs = float(chain.get("normalizer", {}).get("target_lufs",
-                                                        DEFAULT_CONFIG["chain"]["normalizer"]["target_lufs"]))
-    ceiling = float(chain.get("limiter", {}).get("ceiling_dbfs",
-                                                 DEFAULT_CONFIG["chain"]["limiter"]["ceiling_dbfs"]))
+    chain = cfg["chain"]
+    de = chain["deesser"]
+    before = analyze(x_in, sample_rate, float(de["freq_hz"]), float(de["bandwidth_oct"]))
+    after = analyze(x_out, sample_rate, float(de["freq_hz"]), float(de["bandwidth_oct"]))
+    target_lufs = float(chain["normalizer"]["target_lufs"])
+    ceiling = float(chain["limiter"]["ceiling_dbfs"])
+    if before["pause"] is None:
+        raise ValueError(NO_PAUSE_HINT)
+    # The pause is located on the input (the output may be gated) and measured
+    # on both signals in the same time span.
+    span = (before["pause"]["start_s"], before["pause"]["end_s"])
+    pause_out = meters.pause_loudness_lufs(x_out, sample_rate, *span)
+    after["pause"] = pause_out
     criteria: dict[str, dict] = {}
 
     # The normalizer moves the whole signal to the target loudness, so the noise
@@ -563,6 +683,19 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
                 f"Sprachpegel {before['speech_level_dbfs']:.1f} → {after['speech_level_dbfs']:.1f} dBFS.",
     }
 
+    pause_limit = target_lufs - PAUSE_LOUDNESS_MARGIN_LU
+    pause_in = before["pause"]
+    criteria["pause_loudness"] = {
+        "passed": bool(pause_out["max_lufs"] <= pause_limit),
+        "target": f"≤ {pause_limit:.0f} LUFS (Ziel {target_lufs:.0f} − {PAUSE_LOUDNESS_MARGIN_LU:.0f} LU, "
+                  f"Maximum der Momentary-Lautheit in der Pause {span[0]:.1f}–{span[1]:.1f} s)",
+        "actual": f"{pause_out['max_lufs']:.1f} LUFS (Median {pause_out['median_lufs']:.1f}, RMS {pause_out['rms_dbfs']:.1f} dBFS)",
+        "note": f"Vorher {pause_in['max_lufs']:.1f} LUFS maximal, Median {pause_in['median_lufs']:.1f}, "
+                f"RMS {pause_in['rms_dbfs']:.1f} dBFS; absolute Änderung der Pause {pause_out['rms_dbfs'] - pause_in['rms_dbfs']:+.1f} dB."
+                + ("" if pause_out["max_lufs"] <= pause_limit else
+                   " Kette hebt die Pause zu weit an: Raum leiser machen (Lüfter, Abstand) oder normalizer.max_gain_db senken."),
+    }
+
     sib_delta = after["sibilance_ratio_db"] - before["sibilance_ratio_db"]
     deesser_needed = before["sibilance_ratio_db"] > SIBILANCE_REFERENCE_DB
     if deesser_needed:
@@ -577,7 +710,8 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
         "passed": bool(sib_pass),
         "target": "Zischanteil ↓" if deesser_needed else f"Zischanteil ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB",
         "actual": f"{sib_delta:+.1f} dB ({before['sibilance_ratio_db']:.1f} → {after['sibilance_ratio_db']:.1f} dB)",
-        "note": note,
+        "note": note + (f" Zischspitzen im De-Esser-Band {before['sibilant_band_peak_dbfs']:.1f} → "
+                        f"{after['sibilant_band_peak_dbfs']:.1f} dBFS."),
     }
 
     lufs_err = after["integrated_lufs"] - target_lufs
@@ -595,7 +729,6 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
         "note": f"Vorher {before['true_peak_dbtp']:.2f} dBTP.",
     }
 
-    speech_err = after["speech_level_dbfs"] - REFERENCE_SPEECH_LEVEL_DBFS
     return {
         "before": before,
         "after": after,
@@ -603,8 +736,9 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
         "passed": bool(all(c["passed"] for c in criteria.values())),
         "info": {
             "speech_level_after_dbfs": after["speech_level_dbfs"],
-            "speech_level_error_db": speech_err,
-            "snr_gain_db": after["snr_db"] - before["snr_db"],
+            "speech_level_error_db": after["speech_level_dbfs"] - REFERENCE_SPEECH_LEVEL_DBFS,
+            "snr_gain_db": snr_gain,
+            "pause_rms_change_db": pause_out["rms_dbfs"] - pause_in["rms_dbfs"],
         },
     }
 
@@ -614,15 +748,9 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
 # --------------------------------------------------------------------------- #
 
 def process_with_chain(x: np.ndarray, cfg: dict) -> np.ndarray:
-    """Run ``x`` block-wise through ``voicechain.dsp.chain.Chain`` built from ``cfg``."""
-    try:
-        from voicechain.dsp.chain import Chain  # lazy: keeps calibrate importable without DSP
-    except ImportError as exc:
-        raise RuntimeError(
-            "voicechain.dsp.chain is not available; pass processor=... to run_calibration "
-            "or install the DSP package") from exc
+    """Run ``x`` block-wise through a fresh ``Chain`` built from ``cfg``."""
     chain = Chain.from_config(cfg)
-    block = int(cfg.get("block_size", DEFAULT_CONFIG["block_size"]))
+    block = int(cfg["block_size"])
     if block <= 0:
         raise ValueError(f"block_size must be positive, got {block}")
     x32 = np.asarray(x, dtype=np.float32)
@@ -633,121 +761,101 @@ def process_with_chain(x: np.ndarray, cfg: dict) -> np.ndarray:
     return out
 
 
-#: Top-level keys starting with this prefix are calibration metadata, not schema.
-METADATA_PREFIX = "_"
-
-
-def strip_metadata(cfg: dict) -> dict:
-    """Deep copy of ``cfg`` without top-level keys that start with ``METADATA_PREFIX``."""
-    return {k: copy.deepcopy(v) for k, v in cfg.items() if not str(k).startswith(METADATA_PREFIX)}
-
-
-def _validate_with_config_module(cfg: dict, context: str) -> None:
-    """Run ``voicechain.config.validate_config`` on the schema part of ``cfg`` if the module exists.
-
-    The validator is strict about unknown keys, so the ``_calibration`` metadata
-    is removed before validation. Schema errors are re-raised with context.
-    """
-    try:
-        from voicechain.config import validate_config
-    except ImportError:
-        return
-    try:
-        validate_config(strip_metadata(cfg))
-    except ValueError as exc:
-        raise ValueError(f"{context}: {exc}") from exc
-
-
 def load_base_config(base_cfg_path) -> dict:
-    """Load the base YAML (PyYAML), validate it with ``voicechain.config`` if available.
+    """Load and validate the base YAML; None means ``config/chain.default.yaml``.
 
-    ``None`` returns a copy of :data:`DEFAULT_CONFIG`. A previously calibrated
-    file (with ``_calibration`` metadata) is accepted; its metadata is dropped so
-    the new run starts from the plain schema.
+    A previously calibrated file is accepted; its ``_calibration`` metadata is
+    dropped so the new run starts from the plain schema.
     """
-    if base_cfg_path is None:
-        return copy.deepcopy(DEFAULT_CONFIG)
-    path = Path(base_cfg_path)
-    if not path.exists():
-        raise FileNotFoundError(f"base configuration not found: {path}")
-    import yaml
-    with open(path, "r", encoding="utf-8") as fh:
-        try:
-            cfg = yaml.safe_load(fh)
-        except yaml.YAMLError as exc:
-            raise ValueError(f"{path}: YAML syntax error: {exc}") from exc
-    if not isinstance(cfg, dict):
-        raise ValueError(f"{path} does not contain a YAML mapping")
-    cfg = strip_metadata(cfg)
-    _validate_with_config_module(cfg, f"base configuration {path}")
-    return cfg
+    path = Path(base_cfg_path) if base_cfg_path is not None else default_config_path()
+    return strip_metadata(load_config(path))
 
 
-def save_config(cfg: dict, out_cfg_path) -> Path:
-    """Validate the schema part with ``voicechain.config`` (if present) and write the YAML.
+def read_mono_wav(path, expected_sr: int | None = None,
+                  channel: int | None = None) -> tuple[np.ndarray, int]:
+    """Read a WAV with soundfile and return ``(mono float32 samples, sample_rate)``.
 
-    The file keeps the ``_calibration`` metadata block (measurements and reasons)
-    after the schema keys; readers must ignore top-level keys starting with "_".
+    ``channel`` None mixes all channels to mono, an integer picks one channel.
+    Raises FileNotFoundError for a missing file and ValueError (with the path in
+    the message) for an unreadable file, an empty file, a channel that does not
+    exist, non-finite samples or a sample rate different from ``expected_sr``.
     """
-    path = Path(out_cfg_path)
-    _validate_with_config_module(cfg, "calibrated configuration")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    import yaml
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("# Von `python -m voicechain calibrate` erzeugt.\n"
-                 "# Schluessel mit fuehrendem Unterstrich (_calibration) sind Metadaten: Messwerte und\n"
-                 "# Begruendungen je Parameter. Bedeutung der Werte: docs/02_Parameter_Begruendung.md,\n"
-                 "# Ablauf: docs/03_Betrieb_und_Kalibrierung.md.\n")
-        yaml.safe_dump(_plain(cfg), fh, sort_keys=False, allow_unicode=True, default_flow_style=False)
-    return path
-
-
-def read_wav_mono(wav_path) -> tuple[np.ndarray, int]:
-    """Read a WAV with soundfile and mix it to mono float32."""
     import soundfile as sf
-    path = Path(wav_path)
-    if not path.exists():
+    path = Path(path)
+    if not path.is_file():
         raise FileNotFoundError(f"WAV file not found: {path}")
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    try:
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    except (RuntimeError, sf.LibsndfileError) as exc:
+        raise ValueError(f"{path} ist keine lesbare WAV-Datei: {exc}") from exc
     if data.shape[0] == 0:
-        raise ValueError(f"{path} contains no samples")
-    mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
-    return np.ascontiguousarray(mono, dtype=np.float32), int(sr)
+        raise ValueError(f"{path} enthält keine Samples")
+    if channel is None:
+        mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+    else:
+        if not 0 <= channel < data.shape[1]:
+            raise ValueError(f"{path} hat {data.shape[1]} Kanäle, Kanal {channel} existiert nicht")
+        mono = data[:, channel]
+    mono = np.ascontiguousarray(mono, dtype=np.float32)
+    bad = int(np.count_nonzero(~np.isfinite(mono)))
+    if bad:
+        raise ValueError(
+            f"Sample enthält nicht-finite Werte (NaN/Inf): {bad} von {mono.size} Samples in {path}; "
+            "die Datei ist beschädigt oder falsch konvertiert, bitte neu aufnehmen.")
+    sr = int(sr)
+    if expected_sr is not None and sr != int(expected_sr):
+        raise ValueError(
+            f"{path} has a sample rate of {sr} Hz but the configuration expects {int(expected_sr)} Hz "
+            f"(Rode NT-USB works at 48 kHz). Record the sample at {int(expected_sr)} Hz or convert it, "
+            f"e.g. `afconvert -f WAVE -d LEI16@{int(expected_sr)} in.wav out.wav` (macOS) or "
+            f"`ffmpeg -i in.wav -ar {int(expected_sr)} out.wav`; the calibration does not resample.")
+    return mono, sr
 
 
 def run_calibration(wav_path, base_cfg_path, out_cfg_path, report_path, processor=None) -> dict:
     """Full calibration run; see module docstring.
 
     ``processor`` is an optional callable ``x -> y`` (float32 mono) used instead
-    of the real chain, mainly for tests. Returns a dict with keys ``measurements``,
+    of the real chain, mainly for tests; it is called once per pass with the
+    current configuration ignored. Returns a dict with keys ``measurements``,
     ``cfg``, ``evaluation``, ``passed``, ``out_cfg_path``, ``report_path``,
     ``warnings``.
     """
-    x, sr = read_wav_mono(wav_path)
     base_cfg = load_base_config(base_cfg_path)
-    cfg_rate = int(base_cfg.get("sample_rate", DEFAULT_CONFIG["sample_rate"]))
-    if sr != cfg_rate:
-        raise ValueError(
-            f"{wav_path} has a sample rate of {sr} Hz but the configuration expects {cfg_rate} Hz "
-            f"(Rode NT-USB works at 48 kHz). Record the sample at {cfg_rate} Hz or convert it, "
-            f"e.g. `ffmpeg -i in.wav -ar {cfg_rate} out.wav`; the calibration does not resample.")
+    x, sr = read_mono_wav(wav_path, expected_sr=int(base_cfg["sample_rate"]))
     warnings: list[str] = []
     duration = x.size / sr
     if not RECOMMENDED_DURATION_S[0] <= duration <= RECOMMENDED_DURATION_S[1]:
         warnings.append(
             f"Sample ist {duration:.1f} s lang; empfohlen sind {RECOMMENDED_DURATION_S[0]:.0f}–"
             f"{RECOMMENDED_DURATION_S[1]:.0f} s mit Sprechpausen.")
-    measurements = analyze(x, sr)
+    measurements = analyze(x, sr, deesser_bandwidth_oct=float(base_cfg["chain"]["deesser"]["bandwidth_oct"]))
+    if measurements["pause"] is None:
+        raise ValueError(NO_PAUSE_HINT)
     if not measurements["speech_detected"]:
         warnings.append("Keine Sprache erkannt: die Dynamik zwischen leisen und lauten Rahmen ist kleiner als "
                         f"{meters.MIN_SPEECH_SNR_DB:.0f} dB. Alle Sprach-bezogenen Werte sind Schätzungen.")
-    cfg = recommend(measurements, base_cfg)
-    y = processor(x) if processor is not None else process_with_chain(x, cfg)
-    y = np.asarray(y, dtype=np.float32)
-    if y.shape != x.shape:
-        raise ValueError(f"processor returned shape {y.shape}, expected {x.shape}")
+
+    def run_chain(cfg: dict) -> np.ndarray:
+        y = processor(x) if processor is not None else process_with_chain(x, cfg)
+        y = np.asarray(y, dtype=np.float32)
+        if y.shape != x.shape:
+            raise ValueError(f"processor returned shape {y.shape}, expected {x.shape}")
+        return y
+
+    cfg_first = recommend(measurements, base_cfg)
+    y_first = run_chain(cfg_first)
+    de = cfg_first["chain"]["deesser"]
+    after_first = analyze(y_first, sr, float(de["freq_hz"]), float(de["bandwidth_oct"]))
+    if after_first["pause"] is None:
+        # The output pause is located on the input span (the output may be gated).
+        after_first["pause"] = meters.pause_loudness_lufs(
+            y_first, sr, measurements["pause"]["start_s"], measurements["pause"]["end_s"])
+    cfg = refine_normalizer(cfg_first, after_first)
+    y = run_chain(cfg)
     evaluation = evaluate(x, y, sr, cfg)
-    out_path = save_config(cfg, out_cfg_path)
+    out_path = Path(out_cfg_path)
+    save_config(_plain(cfg), out_path)
     rep_path = Path(report_path)
     rep_path.parent.mkdir(parents=True, exist_ok=True)
     rep_path.write_text(
@@ -784,16 +892,28 @@ _MEASUREMENT_ROWS = (
     ("speech_peak_level_dbfs", "Silbenspitzen (Mittel der 50-ms-Rahmenspitzen)", "{:.1f} dBFS"),
     ("speech_crest_db", "Crest-Faktor Sprache (Spitze − RMS)", "{:.1f} dB"),
     ("snr_db", "Störabstand Sprache/Rauschen", "{:.1f} dB"),
+    ("dynamic_range_db", "Dynamik (95. − 10. Perzentil der Rahmen)", "{:.1f} dB"),
     ("speech_activity_ratio", "Sprachanteil", "{:.0%}"),
+    ("f0_hz", "Grundfrequenz (Median stimmhafter Rahmen)", "{:.0f} Hz"),
+    ("voiced_ratio", "Anteil stimmhafter Rahmen", "{:.0%}"),
     ("sibilance_ratio_db", "Zischanteil (5–10 kHz − 0,3–3 kHz)", "{:.1f} dB"),
     ("sibilance_centroid_hz", "Schwerpunkt Zischenergie 4–10 kHz", "{:.0f} Hz"),
+    ("sibilant_band_peak_dbfs", "Zischspitzen im De-Esser-Band (95. Perzentil)", "{:.1f} dBFS"),
     ("spectral_tilt_db_per_oct", "Spektrale Neigung 200 Hz–8 kHz", "{:.1f} dB/Okt"),
     ("integrated_lufs", "Lautheit integriert (gated)", "{:.1f} LUFS"),
     ("short_term_lufs_max", "Lautheit Short-Term maximal", "{:.1f} LUFS"),
 )
 
+_PAUSE_ROWS = (
+    ("max_lufs", "Pause: Momentary-Lautheit maximal", "{:.1f} LUFS"),
+    ("median_lufs", "Pause: Momentary-Lautheit Median", "{:.1f} LUFS"),
+    ("rms_dbfs", "Pause: RMS", "{:.1f} dBFS"),
+)
+
 
 def _fmt(fmt: str, value) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "–"
     try:
         return fmt.format(value)
     except (ValueError, TypeError):
@@ -820,8 +940,8 @@ def render_report(wav_path, base_cfg: dict, cfg: dict, measurements: dict,
     before = evaluation["before"]
     after = evaluation["after"]
     reasons = cfg.get("_calibration", {}).get("reasons", {})
-    old_vals = _flatten_chain(base_cfg.get("chain", {}))
-    new_vals = _flatten_chain(cfg.get("chain", {}))
+    old_vals = _flatten_chain(base_cfg["chain"])
+    new_vals = _flatten_chain(cfg["chain"])
     lines = [
         "# Kalibrierungsbericht voicechain",
         "",
@@ -839,6 +959,11 @@ def render_report(wav_path, base_cfg: dict, cfg: dict, measurements: dict,
     lines += [REPORT_SECTIONS[0], "", "| Messgröße | Wert |", "|---|---|"]
     for key, label, fmt in _MEASUREMENT_ROWS:
         lines.append(f"| {label} | {_fmt(fmt, measurements.get(key))} |")
+    pause = measurements.get("pause")
+    if pause is not None:
+        lines.append(f"| Längste Pause (≥ {MIN_PAUSE_S:.0f} s, nach Sprache) | {pause['start_s']:.1f}–{pause['end_s']:.1f} s |")
+        for key, label, fmt in _PAUSE_ROWS:
+            lines.append(f"| {label} | {_fmt(fmt, pause.get(key))} |")
     lines.append("")
     lines.append("Bandenergien der aktiven Sprachrahmen (Dichte relativ zum Ankerband "
                  f"{measurements['eq_anchor']['lo_hz']:.0f}–{measurements['eq_anchor']['hi_hz']:.0f} Hz):")
@@ -863,18 +988,26 @@ def render_report(wav_path, base_cfg: dict, cfg: dict, measurements: dict,
     lines += [REPORT_SECTIONS[2], "", "| Messgröße | vorher | nachher | Differenz |", "|---|---|---|---|"]
     for key, label, fmt in _MEASUREMENT_ROWS:
         b, a = before.get(key), after.get(key)
-        diff = f"{a - b:+.1f}" if isinstance(a, (int, float)) and isinstance(b, (int, float)) else "–"
+        diff = (f"{a - b:+.1f}" if isinstance(a, (int, float)) and isinstance(b, (int, float))
+                and math.isfinite(a) and math.isfinite(b) else "–")
         lines.append(f"| {label} | {_fmt(fmt, b)} | {_fmt(fmt, a)} | {diff} |")
+    pb, pa = before.get("pause"), after.get("pause")
+    if pb is not None and pa is not None:
+        for key, label, fmt in _PAUSE_ROWS:
+            lines.append(f"| {label} ({pb['start_s']:.1f}–{pb['end_s']:.1f} s) | {_fmt(fmt, pb[key])} | "
+                         f"{_fmt(fmt, pa[key])} | {pa[key] - pb[key]:+.1f} |")
     info = evaluation.get("info", {})
     lines.append("")
     lines.append(f"Sprachpegel nach Kette: {info.get('speech_level_after_dbfs', float('nan')):.1f} dBFS "
                  f"(Referenz {REFERENCE_SPEECH_LEVEL_DBFS:.0f} dBFS vor Normalizer; der Normalizer hebt auf "
-                 f"die Ziel-Lautheit an). Störabstandsgewinn {info.get('snr_gain_db', float('nan')):+.1f} dB.")
+                 f"die Ziel-Lautheit an). Störabstandsgewinn {info.get('snr_gain_db', float('nan')):+.1f} dB, "
+                 f"absolute Änderung des Pausenpegels {info.get('pause_rms_change_db', float('nan')):+.1f} dB.")
     lines.append("")
 
     lines += [REPORT_SECTIONS[3], "", "| Kriterium | Ziel | Ist | Ergebnis | Hinweis |", "|---|---|---|---|---|"]
     titles = {
-        "noise_floor_reduction": "Rauschteppich gesenkt",
+        "noise_floor_reduction": "Störabstand verbessert",
+        "pause_loudness": "Pausenlautheit nach Kette",
         "sibilance_reduced": "Zischanteil",
         "loudness_in_target": "Lautheit im Ziel",
         "true_peak_below_ceiling": "True Peak unter Ceiling",
@@ -887,19 +1020,26 @@ def render_report(wav_path, base_cfg: dict, cfg: dict, measurements: dict,
         "## 5. Annahmen und Grenzen",
         "",
         f"- Referenz-Sprachpegel {REFERENCE_SPEECH_LEVEL_DBFS:.0f} dBFS RMS nach Trim (Praxiswert, memory/04).",
-        f"- Zischanteil-Referenz {SIBILANCE_REFERENCE_DB:.0f} dB und Burst-Crest {SIBILANCE_BURST_CREST_DB:.0f} dB "
-        "sind Annahmen aus dem Langzeit-Sprachspektrum, keine Normwerte.",
-        f"- EQ-Referenzkurve: flach bis {EQ_REFERENCE_KNEE_HZ:.0f} Hz, dann {EQ_REFERENCE_SLOPE_DB_PER_OCT:+.0f} dB/Okt "
-        f"(Annahme), nur {EQ_CORRECTION_FRACTION:.0%} der Abweichung werden korrigiert, maximal ±{EQ_MAX_GAIN_DB:.0f} dB.",
-        "- Die Messung 'nachher' läuft über dieselbe Datei; die Lautheitsregelung braucht einige Sekunden, "
-        "bis sie das Ziel erreicht, was in den integrierten Wert eingeht.",
-        "- Rauschteppich-Kriterium (Beauftragung §6.3) wird bei gleichem Sprachpegel bewertet, also als Gewinn an "
-        "Störabstand: Der Normalizer hebt leise Aufnahmen insgesamt an, ein absoluter Vergleich würde das als "
-        "Verschlechterung werten. Die absoluten Werte stehen daneben. Bei kleinem Störabstand "
+        f"- Zischanteil-Referenz {SIBILANCE_REFERENCE_DB:.0f} dB ist eine Annahme aus dem Langzeit-Sprachspektrum; "
+        "die De-Esser-Schwelle wird aus dem gemessenen Spitzenpegel der Zischlaute im De-Esser-Band abgeleitet.",
+        f"- EQ-Referenzkurve: flach bis {EQ_REFERENCE_KNEE_HZ:.0f} Hz, {EQ_REFERENCE_SLOPE_MID_DB_PER_OCT:+.0f} dB/Okt bis "
+        f"{EQ_REFERENCE_KNEE_HIGH_HZ / 1000:.0f} kHz, darüber {EQ_REFERENCE_SLOPE_HIGH_DB_PER_OCT:+.0f} dB/Okt (Annahme: "
+        f"typisches Langzeit-Sprachspektrum fällt oberhalb 4 kHz steiler); nur {EQ_CORRECTION_FRACTION:.0%} der Abweichung "
+        f"werden korrigiert, maximal ±{EQ_MAX_GAIN_DB:.0f} dB; Shelves nur als Absenkung; Low-Shelf nur bei Grundfrequenz "
+        f"≤ {EQ_LOW_SHELF_MAX_F0_HZ:.0f} Hz.",
+        f"- Normalizer-Gate und -Gainbegrenzung stammen aus der Pausenlautheit nach dem ersten Durchlauf "
+        f"(Abstände {NORMALIZER_GATE_MARGIN_DB:.0f} dB bzw. {NORMALIZER_PAUSE_HEADROOM_LU:.0f} LU, Annahmen).",
+        "- Lautheitskriterium: integrierte Lautheit mit BS.1770-Gating (absolut −70 LUFS, relativ −10 LU), also "
+        "die Lautheit der Sprache ohne Pausen; der Normalizer regelt auf dieselbe gegatete Sprachlautheit. Ungegatete "
+        "3-s-Fenster lesen bei 40 % Pausenanteil 2–3 LU tiefer und sind kein Maßstab. Die Messung 'nachher' läuft "
+        "über dieselbe Datei; die Lautheitsregelung braucht einige Sekunden, bis sie das Ziel erreicht.",
+        "- Rauschteppich-Kriterium (Beauftragung §6.3) wird bei gleichem Sprachpegel bewertet (Störabstandsgewinn); "
+        "die absolute Pausenlautheit nach Kette wird zusätzlich gegen Ziel − "
+        f"{PAUSE_LOUDNESS_MARGIN_LU:.0f} LU geprüft und die Absolutwerte stehen daneben. Bei kleinem Störabstand "
         f"(< {EXPANDER_FLOOR_MARGIN_DB + EXPANDER_SPEECH_MARGIN_DB:.0f} dB) kann der Expander die 6 dB nicht erreichen, "
         "ohne Sprache abzuschneiden; dann hilft nur eine leisere Umgebung oder geringerer Mikrofonabstand.",
         "- Kompressor-Schwelle liegt auf Höhe des Sprach-RMS, weil der Kompressor der Kette Spitzen misst "
-        f"(Silbenspitzen ≈ {evaluation['before'].get('speech_crest_db', float('nan')):.0f} dB über RMS); "
+        f"(Silbenspitzen ≈ {evaluation['before']['speech_crest_db']:.0f} dB über RMS); "
         "eine tiefere Schwelle verdichtet stärker, hebt aber mit Makeup/Normalizer auch das Rauschen wieder an.",
         "",
     ]

@@ -1,9 +1,11 @@
 """Audio measurement functions for voicechain (ITU-R BS.1770 loudness, true peak,
-noise floor, speech level, sibilance, spectral tilt, band energies).
+noise floor, speech level, sibilance, spectral tilt, band energies, fundamental
+frequency, pause detection).
 
 All functions take a mono float signal with full scale = 1.0 and return values
-in dBFS / LUFS / dBTP. The module depends only on numpy and scipy so that it can
-be imported without the DSP chain or audio devices.
+in dBFS / LUFS / dBTP. The K-weighting filter and the dB floor are shared with
+the DSP package (``voicechain.dsp.biquad.k_weighting_sos``,
+``voicechain.dsp.envelope.DB_FLOOR``) so that meters and stages agree.
 
 References:
     E2  ITU-R BS.1770: K-weighting (two biquads: high shelf ~+4 dB above ~1.5 kHz,
@@ -18,15 +20,27 @@ import math
 import numpy as np
 from scipy import signal
 
+from voicechain.dsp import DB_FLOOR_DBFS
+from voicechain.dsp.biquad import bandpass_sos, bandwidth_to_q, k_weighting_sos
+
+__all__ = [
+    "DB_FLOOR_DBFS", "k_weighting_sos", "LoudnessMeter", "integrated_lufs",
+    "short_term_lufs_series", "momentary_lufs_series", "true_peak_dbfs", "sample_peak_dbfs",
+    "rms_dbfs", "frame_rms_db", "activity_threshold_db", "speech_activity", "noise_floor_dbfs",
+    "speech_level_dbfs", "speech_activity_ratio", "dynamic_range_db", "fundamental_frequency_hz",
+    "frame_power_spectrum", "active_power_spectrum", "sibilance_ratio_db", "sibilance_centroid_hz",
+    "band_peak_dbfs", "third_octave_density_db", "spectral_tilt_db_per_oct", "band_energies_db",
+    "longest_pause", "pause_loudness_lufs",
+]
+
 # --------------------------------------------------------------------------- #
 # Numerical constants (each one justified here; see also docs/03)
 # --------------------------------------------------------------------------- #
 
-#: Smallest mean square that is converted to dB. 1e-12 corresponds to -120 dB,
-#: which is below 24-bit quantisation noise (~-144 dBFS peak, but a real
-#: measurement chain never reaches it); it keeps log10 finite for digital silence.
-POWER_FLOOR = 1e-12
-DB_FLOOR = 10.0 * math.log10(POWER_FLOOR)  # -120.0 dB
+#: Common dB floor of the project (voicechain.dsp.DB_FLOOR_DBFS = -150 dB): keeps
+#: log10 finite for digital silence; well below 24-bit quantisation noise.
+POWER_FLOOR = 10.0 ** (DB_FLOOR_DBFS / 10.0)
+AMP_FLOOR = 10.0 ** (DB_FLOOR_DBFS / 20.0)
 
 #: BS.1770 loudness offset so that a 0 dBFS 997 Hz sine reads -3.01 LKFS (E2).
 LUFS_OFFSET = -0.691
@@ -90,74 +104,36 @@ TILT_BANDS_PER_OCTAVE = 3
 #: analyses away from the anti-alias transition region near Nyquist.
 MAX_USABLE_FREQ_FRACTION = 0.45
 
+#: Fundamental-frequency search range for speech (adult voices lie between ~70 Hz
+#: and ~400 Hz; children higher but outside the use case). Assumption.
+F0_RANGE_HZ = (70.0, 400.0)
+#: A frame counts as voiced when its normalised autocorrelation peak within the
+#: search range reaches this value. Assumption: 0.5 separates harmonic frames
+#: from fricatives and noise (their peaks stay below ~0.3).
+F0_MIN_CORRELATION = 0.5
+
+#: Percentile of frame band peaks that stands for "a sibilant" (top 5 % of the
+#: active frames are the loudest sibilants). Assumption.
+BAND_PEAK_PERCENTILE = 95.0
+
+#: Pause measurement: the first part of a pause still carries the decay of the
+#: last syllable and the expander's hold/release (100 + 250 ms in the default
+#: chain), so it is skipped before loudness is measured. Assumption: 0.5 s.
+PAUSE_SETTLE_S = 0.5
+
 
 # --------------------------------------------------------------------------- #
-# K-weighting filter design (BS.1770)
+# Helpers
 # --------------------------------------------------------------------------- #
-
-# Exact coefficients from the BS.1770 tables for 48 kHz.
-_K_SHELF_48K = ([1.53512485958697, -2.69169618940638, 1.19839281085285],
-                [1.0, -1.69065929318241, 0.73248077421585])
-_K_HIGHPASS_48K = ([1.0, -2.0, 1.0],
-                   [1.0, -1.99004745483398, 0.99007225036621])
-
-# Analogue prototype parameters of the two K-weighting stages. They are the
-# values that reproduce the 48 kHz table coefficients to better than 1e-11 via
-# the bilinear transform below (verified in tests/test_meters.py), so the same
-# design can be used for other sample rates.
-_K_SHELF_F0_HZ = 1681.9744509555319
-_K_SHELF_GAIN_DB = 3.99984385397
-_K_SHELF_Q = 0.7071752369554193
-_K_SHELF_MID_EXPONENT = 0.499666774155   # shelf midpoint gain exponent (Vb = Vh**p)
-_K_HIGHPASS_F0_HZ = 38.13547087613982
-_K_HIGHPASS_Q = 0.5003270373253953
-
-
-def k_weighting_sos(sample_rate: int) -> np.ndarray:
-    """Return the BS.1770 K-weighting filter as second-order sections.
-
-    At 48 kHz the exact table coefficients are used; at other rates the stages
-    are re-designed by bilinear transform of the analogue prototypes.
-    """
-    if sample_rate <= 0:
-        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
-    if int(sample_rate) == 48000:
-        b1, a1 = _K_SHELF_48K
-        b2, a2 = _K_HIGHPASS_48K
-        return np.array([b1 + a1, b2 + a2], dtype=np.float64)
-    return design_k_weighting_sos(sample_rate)
-
-
-def design_k_weighting_sos(sample_rate: float) -> np.ndarray:
-    """Design the K-weighting stages for any sample rate by bilinear transform.
-
-    Reproduces the BS.1770 48 kHz table coefficients to ~1e-12 (tested), so it is
-    the reference implementation; :func:`k_weighting_sos` only short-cuts 48 kHz.
-    """
-    if sample_rate <= 0:
-        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
-    # Stage 1: high shelf
-    k = math.tan(math.pi * _K_SHELF_F0_HZ / sample_rate)
-    vh = 10.0 ** (_K_SHELF_GAIN_DB / 20.0)
-    vb = vh ** _K_SHELF_MID_EXPONENT
-    q = _K_SHELF_Q
-    den = 1.0 + k / q + k * k
-    b1 = [(vh + vb * k / q + k * k) / den,
-          2.0 * (k * k - vh) / den,
-          (vh - vb * k / q + k * k) / den]
-    a1 = [1.0, 2.0 * (k * k - 1.0) / den, (1.0 - k / q + k * k) / den]
-    # Stage 2: high-pass (numerator fixed to [1, -2, 1] as in the standard)
-    k = math.tan(math.pi * _K_HIGHPASS_F0_HZ / sample_rate)
-    q = _K_HIGHPASS_Q
-    den = 1.0 + k / q + k * k
-    b2 = [1.0, -2.0, 1.0]
-    a2 = [1.0, 2.0 * (k * k - 1.0) / den, (1.0 - k / q + k * k) / den]
-    return np.array([b1 + a1, b2 + a2], dtype=np.float64)
-
 
 def _power_to_db(power: float | np.ndarray) -> float | np.ndarray:
-    """10*log10 with a floor at POWER_FLOOR (-120 dB)."""
+    """10*log10 with the project floor applied."""
     return 10.0 * np.log10(np.maximum(power, POWER_FLOOR))
+
+
+def _amp_to_db(amp: float | np.ndarray) -> float | np.ndarray:
+    """20*log10(|amp|) with the project floor applied."""
+    return 20.0 * np.log10(np.maximum(np.abs(amp), AMP_FLOOR))
 
 
 def _as_mono_float(x: np.ndarray) -> np.ndarray:
@@ -287,11 +263,11 @@ class LoudnessMeter:
         """Gated integrated loudness over everything pushed so far."""
         blocks = self._block_mean_squares()
         if blocks.size == 0:
-            return float(LUFS_OFFSET + DB_FLOOR)
+            return float(LUFS_OFFSET + DB_FLOOR_DBFS)
         block_lufs = LUFS_OFFSET + _power_to_db(blocks)
         above_abs = block_lufs > ABSOLUTE_GATE_LUFS
         if not np.any(above_abs):
-            return float(LUFS_OFFSET + DB_FLOOR)
+            return float(LUFS_OFFSET + DB_FLOOR_DBFS)
         relative_gate = self._lufs(float(np.mean(blocks[above_abs]))) + RELATIVE_GATE_LU
         gated = above_abs & (block_lufs > relative_gate)
         if not np.any(gated):
@@ -306,20 +282,32 @@ def integrated_lufs(x: np.ndarray, sample_rate: int) -> float:
     return meter.integrated_lufs()
 
 
-def short_term_lufs_series(x: np.ndarray, sample_rate: int,
-                           hop_s: float = GATING_HOP_S) -> np.ndarray:
-    """Short-term loudness (3 s window) sampled every ``hop_s`` seconds."""
+def _windowed_lufs_series(x: np.ndarray, sample_rate: int, window_s: float, hop_s: float) -> np.ndarray:
     x = _as_mono_float(x)
     sos = k_weighting_sos(sample_rate)
     sq = signal.sosfilt(sos, x) ** 2
-    win = int(round(SHORT_TERM_WINDOW_S * sample_rate))
+    win = int(round(window_s * sample_rate))
     hop = max(1, int(round(hop_s * sample_rate)))
+    if sq.size == 0:
+        return np.zeros(0)
     if sq.size < win:
-        return np.array([LUFS_OFFSET + float(_power_to_db(sq.mean()))]) if sq.size else np.zeros(0)
+        return np.array([LUFS_OFFSET + float(_power_to_db(sq.mean()))])
     csum = np.concatenate(([0.0], np.cumsum(sq)))
     ends = np.arange(win, sq.size + 1, hop)
     means = (csum[ends] - csum[ends - win]) / win
     return LUFS_OFFSET + _power_to_db(means)
+
+
+def short_term_lufs_series(x: np.ndarray, sample_rate: int,
+                           hop_s: float = GATING_HOP_S) -> np.ndarray:
+    """Short-term loudness (3 s window) sampled every ``hop_s`` seconds."""
+    return _windowed_lufs_series(x, sample_rate, SHORT_TERM_WINDOW_S, hop_s)
+
+
+def momentary_lufs_series(x: np.ndarray, sample_rate: int,
+                          hop_s: float = GATING_HOP_S) -> np.ndarray:
+    """Momentary loudness (400 ms window) sampled every ``hop_s`` seconds."""
+    return _windowed_lufs_series(x, sample_rate, MOMENTARY_WINDOW_S, hop_s)
 
 
 # --------------------------------------------------------------------------- #
@@ -330,27 +318,27 @@ def true_peak_dbfs(x: np.ndarray, sample_rate: int) -> float:
     """True peak in dBTP using 4x polyphase oversampling (BS.1770 Annex 2)."""
     x = _as_mono_float(x)
     if x.size == 0:
-        return DB_FLOOR
+        return DB_FLOOR_DBFS
     up = signal.resample_poly(x, TRUE_PEAK_OVERSAMPLING, 1)
     peak = float(np.max(np.abs(up)))
     # Oversampling can slightly undershoot the true inter-sample peak; the
     # sample peak is a hard lower bound, so never report less than it.
     peak = max(peak, float(np.max(np.abs(x))))
-    return float(20.0 * math.log10(max(peak, math.sqrt(POWER_FLOOR))))
+    return float(_amp_to_db(peak))
 
 
 def sample_peak_dbfs(x: np.ndarray) -> float:
     x = _as_mono_float(x)
     if x.size == 0:
-        return DB_FLOOR
-    return float(20.0 * math.log10(max(float(np.max(np.abs(x))), math.sqrt(POWER_FLOOR))))
+        return DB_FLOOR_DBFS
+    return float(_amp_to_db(float(np.max(np.abs(x)))))
 
 
 def rms_dbfs(x: np.ndarray) -> float:
-    """RMS level of the whole signal in dBFS (floor -120 dBFS)."""
+    """RMS level of the whole signal in dBFS (floor DB_FLOOR_DBFS)."""
     x = _as_mono_float(x)
     if x.size == 0:
-        return DB_FLOOR
+        return DB_FLOOR_DBFS
     return float(_power_to_db(float(np.mean(x * x))))
 
 
@@ -365,17 +353,21 @@ def _frame_length(sample_rate: int, frame_ms: float) -> int:
     return n
 
 
-def frame_rms_db(x: np.ndarray, sample_rate: int,
-                 frame_ms: float = ANALYSIS_FRAME_MS) -> np.ndarray:
-    """RMS level in dBFS of consecutive non-overlapping frames."""
-    x = _as_mono_float(x)
+def _frames(x: np.ndarray, sample_rate: int, frame_ms: float) -> np.ndarray:
+    """Consecutive non-overlapping frames as a 2-D view (n_frames, frame_len)."""
     n = _frame_length(sample_rate, frame_ms)
     n_frames = x.size // n
     if n_frames == 0:
         raise ValueError(
             f"signal of {x.size} samples is shorter than one {frame_ms} ms frame "
             f"({n} samples at {sample_rate} Hz)")
-    frames = x[:n_frames * n].reshape(n_frames, n)
+    return x[:n_frames * n].reshape(n_frames, n)
+
+
+def frame_rms_db(x: np.ndarray, sample_rate: int,
+                 frame_ms: float = ANALYSIS_FRAME_MS) -> np.ndarray:
+    """RMS level in dBFS of consecutive non-overlapping frames."""
+    frames = _frames(_as_mono_float(x), sample_rate, frame_ms)
     return _power_to_db(np.mean(frames * frames, axis=1))
 
 
@@ -430,6 +422,54 @@ def speech_activity_ratio(x: np.ndarray, sample_rate: int) -> float:
     return float(np.mean(mask)) if mask.size else 0.0
 
 
+def dynamic_range_db(levels_db: np.ndarray) -> float:
+    """Span between the loud-frame and the noise-floor percentile of frame levels."""
+    levels_db = np.asarray(levels_db, dtype=np.float64)
+    return float(np.percentile(levels_db, SPEECH_TOP_PERCENTILE)
+                 - np.percentile(levels_db, NOISE_FLOOR_PERCENTILE))
+
+
+def fundamental_frequency_hz(x: np.ndarray, sample_rate: int,
+                             frame_ms: float = ANALYSIS_FRAME_MS) -> tuple[float, float]:
+    """Median fundamental frequency of the voiced active frames by autocorrelation.
+
+    Returns ``(f0_hz, voiced_ratio)``: ``voiced_ratio`` is the share of active
+    frames whose normalised autocorrelation peak inside ``F0_RANGE_HZ`` reaches
+    ``F0_MIN_CORRELATION``. ``f0_hz`` is ``nan`` when no frame is voiced.
+    """
+    x = _as_mono_float(x)
+    mask, _ = speech_activity(x, sample_rate, frame_ms)
+    frames = _frames(x, sample_rate, frame_ms)
+    active = frames[mask] if np.any(mask) else frames[:0]
+    if active.shape[0] == 0:
+        return float("nan"), 0.0
+    n = active.shape[1]
+    lag_lo = int(math.floor(sample_rate / F0_RANGE_HZ[1]))
+    lag_hi = int(math.ceil(sample_rate / F0_RANGE_HZ[0]))
+    if lag_hi >= n // 2:
+        raise ValueError(
+            f"frame of {frame_ms} ms is too short for an f0 search down to {F0_RANGE_HZ[0]} Hz")
+    centred = active - active.mean(axis=1, keepdims=True)
+    # Autocorrelation via FFT (zero-padded to avoid circular wrap-around).
+    n_fft = 1 << int(math.ceil(math.log2(2 * n)))
+    spec = np.fft.rfft(centred, n_fft, axis=1)
+    acf = np.fft.irfft(spec * np.conj(spec), n_fft, axis=1)[:, :n]
+    energy = np.maximum(acf[:, :1], POWER_FLOOR)
+    norm = acf / energy
+    # Unbiased for the shrinking overlap so long lags are not penalised.
+    lags = np.arange(n)
+    norm[:, 1:] *= n / (n - lags[1:])
+    window = norm[:, lag_lo:lag_hi + 1]
+    best = np.argmax(window, axis=1)
+    peak = window[np.arange(window.shape[0]), best]
+    voiced = peak >= F0_MIN_CORRELATION
+    voiced_ratio = float(np.mean(voiced))
+    if not np.any(voiced):
+        return float("nan"), voiced_ratio
+    f0 = sample_rate / (best[voiced] + lag_lo).astype(np.float64)
+    return float(np.median(f0)), voiced_ratio
+
+
 # --------------------------------------------------------------------------- #
 # Spectral measures (average power spectrum of the active frames)
 # --------------------------------------------------------------------------- #
@@ -458,10 +498,8 @@ def active_power_spectrum(x: np.ndarray, sample_rate: int,
     functions still describe the recording (e.g. for a noise-only sample).
     """
     x = _as_mono_float(x)
-    n = _frame_length(sample_rate, frame_ms)
     mask, _ = speech_activity(x, sample_rate, frame_ms)
-    n_frames = mask.size
-    frames = x[:n_frames * n].reshape(n_frames, n)
+    frames = _frames(x, sample_rate, frame_ms)
     if np.any(mask):
         frames = frames[mask]
     freqs, power = frame_power_spectrum(frames, sample_rate)
@@ -501,6 +539,27 @@ def sibilance_centroid_hz(x: np.ndarray, sample_rate: int) -> float:
     if total <= POWER_FLOOR:
         return float(math.sqrt(lo * hi))  # geometric band centre when there is no energy
     return float(np.sum(freqs[sel] * power[sel]) / total)
+
+
+def band_peak_dbfs(x: np.ndarray, sample_rate: int, freq_hz: float, bandwidth_oct: float,
+                   percentile: float = BAND_PEAK_PERCENTILE,
+                   frame_ms: float = ANALYSIS_FRAME_MS) -> float:
+    """Sample-peak level (dBFS) of the band-passed signal in the loud sibilant frames.
+
+    The band-pass is the de-esser's own design (RBJ, ``freq_hz`` /
+    ``bandwidth_oct``), so the value is what the de-esser's peak detector sees.
+    The result is the ``percentile`` (default 95 %) of the per-frame peaks over
+    the active frames (all frames when no speech is detected).
+    """
+    x = _as_mono_float(x)
+    sos = bandpass_sos(freq_hz, bandwidth_to_q(bandwidth_oct, freq_hz, sample_rate), sample_rate)
+    band = signal.sosfilt(sos, x)
+    mask, _ = speech_activity(x, sample_rate, frame_ms)
+    frames = np.abs(_frames(band, sample_rate, frame_ms))
+    if np.any(mask):
+        frames = frames[mask]
+    peaks = _amp_to_db(np.max(frames, axis=1))
+    return float(np.percentile(peaks, percentile))
 
 
 def third_octave_density_db(freqs: np.ndarray, power: np.ndarray,
@@ -552,3 +611,60 @@ def band_energies_db(x: np.ndarray, sample_rate: int, edges_hz: list[float]) -> 
     for lo, hi in zip(edges_hz[:-1], edges_hz[1:]):
         out.append(float(_power_to_db(_band_power(freqs, power, lo, hi))))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Pauses
+# --------------------------------------------------------------------------- #
+
+def longest_pause(x: np.ndarray, sample_rate: int, min_s: float,
+                  frame_ms: float = ANALYSIS_FRAME_MS) -> tuple[float, float] | None:
+    """Longest stretch of inactive frames of at least ``min_s`` seconds.
+
+    Pauses that follow speech are preferred over leading silence, because the
+    behaviour of the chain after a sentence (expander release, normalizer hold)
+    is what a pause measurement is for. Returns ``(start_s, end_s)`` or None.
+    """
+    mask, _ = speech_activity(_as_mono_float(x), sample_rate, frame_ms)
+    frame_s = _frame_length(sample_rate, frame_ms) / sample_rate
+    min_frames = int(math.ceil(min_s / frame_s))
+    runs: list[tuple[int, int]] = []
+    start = None
+    for i, active in enumerate(np.concatenate((mask, [True]))):
+        if not active and start is None:
+            start = i
+        elif active and start is not None:
+            if i - start >= min_frames:
+                runs.append((start, i))
+            start = None
+    if not runs:
+        return None
+    first_active = int(np.argmax(mask)) if np.any(mask) else 0
+    after_speech = [r for r in runs if r[0] > first_active]
+    pick = max(after_speech or runs, key=lambda r: r[1] - r[0])
+    return pick[0] * frame_s, pick[1] * frame_s
+
+
+def pause_loudness_lufs(x: np.ndarray, sample_rate: int, start_s: float, end_s: float,
+                        settle_s: float = PAUSE_SETTLE_S) -> dict:
+    """Momentary loudness statistics inside a pause ``[start_s, end_s)``.
+
+    The first ``settle_s`` seconds are skipped (syllable decay, expander
+    release). Returns ``{"max_lufs", "median_lufs", "rms_dbfs", "start_s",
+    "end_s"}``; ``max_lufs`` is the quantity the pause criterion uses.
+    """
+    x = _as_mono_float(x)
+    a = int(round((start_s + settle_s) * sample_rate))
+    b = int(round(end_s * sample_rate))
+    if b - a < int(MOMENTARY_WINDOW_S * sample_rate):
+        raise ValueError(
+            f"pause {start_s:.1f}-{end_s:.1f} s is too short to measure after a settle time of {settle_s} s")
+    seg = x[a:b]
+    series = momentary_lufs_series(seg, sample_rate)
+    return {
+        "max_lufs": float(np.max(series)),
+        "median_lufs": float(np.median(series)),
+        "rms_dbfs": rms_dbfs(seg),
+        "start_s": float(start_s),
+        "end_s": float(end_s),
+    }

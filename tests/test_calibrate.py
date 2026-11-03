@@ -1,4 +1,7 @@
-"""Tests for voicechain.calibrate (analysis, recommendation, evaluation, report)."""
+"""Tests for voicechain.calibrate (analysis, recommendation, evaluation, report).
+
+The base configuration is always the shipped ``config/chain.default.yaml``.
+"""
 import copy
 import math
 
@@ -8,27 +11,39 @@ import soundfile as sf
 
 from voicechain import calibrate as cal
 from voicechain import meters, synth
+from voicechain.config import default_config_path, load_config
 
 SR = 48000
+SAMPLE_KW = dict(level_dbfs=-26.0, noise_floor_dbfs=-50.0, pause_ratio=0.3, seed=3,
+                 lead_silence_s=10.0, long_pause_s=6.0)
+
+
+@pytest.fixture(scope="module")
+def base_cfg():
+    return load_config(default_config_path())
 
 
 @pytest.fixture(scope="module")
 def quiet_sample():
-    """-26 dBFS speech, -50 dBFS floor, pronounced sibilance (+3 dB bursts)."""
-    return synth.make_speech_like(60.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-50.0,
-                                  sibilance_db=3.0, pause_ratio=0.3, seed=3)
+    """-26 dBFS speech, -50 dBFS floor, pronounced sibilance, 10 s lead, 6 s pause at 32 s."""
+    return synth.make_speech_like(60.0, SR, sibilance_db=3.0, **SAMPLE_KW)
 
 
 @pytest.fixture(scope="module")
 def noisy_sample():
     """-26 dBFS speech, -40 dBFS floor (SNR 14 dB), mild sibilance."""
-    return synth.make_speech_like(60.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-40.0,
-                                  sibilance_db=-6.0, pause_ratio=0.3, seed=3)
+    kw = dict(SAMPLE_KW, noise_floor_dbfs=-40.0)
+    return synth.make_speech_like(60.0, SR, sibilance_db=-6.0, **kw)
 
 
 def bounds(cfg, stage, name):
     lo, hi = cfg["adaptive"]["bounds"][f"{stage}.{name}"]
     return lo, hi
+
+
+def _write_wav(path, x, sr=SR):
+    sf.write(str(path), x, sr, subtype="PCM_16")
+    return path
 
 
 # --------------------------------------------------------------------------- analyze
@@ -39,24 +54,43 @@ def test_analyze_reports_generated_values(quiet_sample):
     assert m["noise_floor_dbfs"] == pytest.approx(-50.0, abs=1.5)
     assert m["speech_level_dbfs"] == pytest.approx(-26.0, abs=1.5)
     assert m["snr_db"] == pytest.approx(24.0, abs=2.0)
+    assert m["dynamic_range_db"] == pytest.approx(24.0, abs=3.0)
     assert m["speech_detected"] is True
+    assert 100.0 <= m["f0_hz"] <= 140.0 and m["voiced_ratio"] > 0.7
     assert m["sibilance_ratio_db"] > cal.SIBILANCE_REFERENCE_DB
     assert 5000.0 <= m["sibilance_centroid_hz"] <= 9000.0
+    assert m["sibilant_band_freq_hz"] == pytest.approx(m["sibilance_centroid_hz"])
+    assert m["sibilant_band_peak_dbfs"] > m["speech_level_dbfs"]
     assert m["true_peak_dbtp"] >= m["sample_peak_dbfs"]
     assert set(m["eq_bands"]) == {"low_shelf@120", "peak@250", "peak@3000", "high_shelf@10000"}
     assert m["eq_anchor"]["lo_hz"] == 350.0
+    assert m["pause"]["start_s"] == pytest.approx(32.0, abs=0.3)
+    assert m["pause"]["end_s"] == pytest.approx(38.0, abs=0.3)
+    assert m["pause"]["rms_dbfs"] == pytest.approx(-50.0, abs=0.5)
 
 
-def test_analyze_rejects_too_short_sample():
+def test_analyze_uses_the_given_deesser_band(quiet_sample):
+    m_a = cal.analyze(quiet_sample, SR, deesser_freq_hz=6500.0, deesser_bandwidth_oct=1.0)
+    m_b = cal.analyze(quiet_sample, SR, deesser_freq_hz=6500.0, deesser_bandwidth_oct=0.5)
+    assert m_a["sibilant_band_freq_hz"] == 6500.0 and m_b["sibilant_band_width_oct"] == 0.5
+    # A narrower band passes less energy: lower peak level.
+    assert m_b["sibilant_band_peak_dbfs"] < m_a["sibilant_band_peak_dbfs"]
+
+
+def test_analyze_rejects_too_short_and_nonfinite_samples():
     with pytest.raises(ValueError, match="10 s"):
         cal.analyze(synth.make_speech_like(5.0, SR, seed=0), SR)
+    x = synth.make_speech_like(20.0, SR, seed=0).astype(np.float64)
+    x[1000] = np.nan
+    with pytest.raises(ValueError, match="nicht-finite"):
+        cal.analyze(x, SR)
 
 
 # --------------------------------------------------------------------------- recommend
 
-def test_recommend_on_quiet_sample_sets_trim_and_expander(quiet_sample):
+def test_recommend_on_quiet_sample_sets_trim_and_expander(quiet_sample, base_cfg):
     m = cal.analyze(quiet_sample, SR)
-    cfg = cal.recommend(m, cal.DEFAULT_CONFIG)
+    cfg = cal.recommend(m, base_cfg)
     trim = cfg["chain"]["input_trim"]["gain_db"]
     assert trim == pytest.approx(6.0, abs=1.5)
     floor_after = m["noise_floor_dbfs"] + trim
@@ -66,11 +100,12 @@ def test_recommend_on_quiet_sample_sets_trim_and_expander(quiet_sample):
     assert thr == pytest.approx(floor_after + 10.0, abs=2.0)
     assert thr <= speech_after - 12.0 + 1e-6
     assert "Rauschteppich + 10" in cfg["_calibration"]["reasons"]["chain.expander.threshold_db"]
+    assert "_calibration" in cfg and "measurements" in cfg["_calibration"]
 
 
-def test_recommend_on_noisy_sample_caps_expander_below_speech(noisy_sample):
+def test_recommend_on_noisy_sample_caps_expander_below_speech(noisy_sample, base_cfg):
     m = cal.analyze(noisy_sample, SR)
-    cfg = cal.recommend(m, cal.DEFAULT_CONFIG)
+    cfg = cal.recommend(m, base_cfg)
     trim = cfg["chain"]["input_trim"]["gain_db"]
     assert trim == pytest.approx(6.0, abs=1.5)
     speech_after = m["speech_level_dbfs"] + trim
@@ -81,9 +116,9 @@ def test_recommend_on_noisy_sample_caps_expander_below_speech(noisy_sample):
     assert "Sprachpegel" in cfg["_calibration"]["reasons"]["chain.expander.threshold_db"]
 
 
-def test_recommend_compressor_threshold_and_makeup(quiet_sample):
+def test_recommend_compressor_threshold_and_makeup(quiet_sample, base_cfg):
     m = cal.analyze(quiet_sample, SR)
-    cfg = cal.recommend(m, cal.DEFAULT_CONFIG)
+    cfg = cal.recommend(m, base_cfg)
     comp = cfg["chain"]["compressor"]
     trim = cfg["chain"]["input_trim"]["gain_db"]
     speech_after = m["speech_level_dbfs"] + trim
@@ -97,125 +132,158 @@ def test_recommend_compressor_threshold_and_makeup(quiet_sample):
     assert 5.0 <= comp["makeup_db"] <= 8.0
     assert cal.static_compressor_reduction_db(-10.0, -20.0, 3.0, 0.0) == pytest.approx(10.0 * 2 / 3)
     assert cal.static_compressor_reduction_db(-30.0, -20.0, 3.0, 6.0) == 0.0
-    assert cfg["chain"]["normalizer"]["target_lufs"] == -18.0
+    assert cfg["chain"]["normalizer"]["target_lufs"] == base_cfg["chain"]["normalizer"]["target_lufs"]
     assert cfg["chain"]["limiter"]["ceiling_dbfs"] == -1.0
 
 
-def test_deesser_engages_only_above_reference():
-    default_thr = cal.DEFAULT_CONFIG["chain"]["deesser"]["threshold_db"]
-    lo, hi = bounds(cal.DEFAULT_CONFIG, "deesser", "threshold_db")
-
-    def computed(m):
-        return (-20.0 + m["sibilance_ratio_db"] + cal.SIBILANCE_BURST_CREST_DB
-                - cal.DEESSER_MIN_REDUCTION_DB / (1 - 1 / 4.0))
-
-    # Soft voice (sibilance ratio well below -15 dB): default threshold stays.
-    soft = cal.analyze(synth.make_speech_like(40.0, SR, sibilance_db=-20.0, seed=4), SR)
+def test_deesser_threshold_from_band_peak_model(base_cfg):
+    """PO-4: threshold = band peak (95th percentile, after trim) - overshoot for 4 dB."""
+    ratio = base_cfg["chain"]["deesser"]["ratio"]
+    overshoot = cal.deesser_overshoot_db(ratio)
+    assert overshoot == pytest.approx(4.0 / (1 - 1 / ratio))
+    lo, hi = bounds(base_cfg, "deesser", "threshold_db")
+    # Soft voice: default threshold stays.
+    soft = cal.analyze(synth.make_speech_like(40.0, SR, sibilance_db=-20.0, seed=4, long_pause_s=6.0), SR)
     assert soft["sibilance_ratio_db"] < cal.SIBILANCE_REFERENCE_DB
-    cfg_q = cal.recommend(soft, cal.DEFAULT_CONFIG)
-    assert cfg_q["chain"]["deesser"]["threshold_db"] == default_thr
+    cfg_q = cal.recommend(soft, base_cfg)
+    assert cfg_q["chain"]["deesser"]["threshold_db"] == base_cfg["chain"]["deesser"]["threshold_db"]
     assert "nicht über der Referenz" in cfg_q["_calibration"]["reasons"]["chain.deesser.threshold_db"]
-
-    # Mildly sibilant voice (ratio between -15 and about -11 dB): the burst level
-    # would not reach the default threshold, so the threshold is lowered.
-    mild = cal.analyze(synth.make_speech_like(40.0, SR, sibilance_db=-4.0, seed=4), SR)
-    assert cal.SIBILANCE_REFERENCE_DB < mild["sibilance_ratio_db"] < -11.0
-    cfg_m = cal.recommend(mild, cal.DEFAULT_CONFIG)
-    thr_m = cfg_m["chain"]["deesser"]["threshold_db"]
-    assert thr_m == pytest.approx(cal.clamp(computed(mild), lo, hi), abs=0.05)
-    assert thr_m < default_thr
-    assert "rechnerisch" in cfg_m["_calibration"]["reasons"]["chain.deesser.threshold_db"]
-
-    # Strongly sibilant voice: the default threshold already yields > 4 dB
-    # reduction; raising it would de-ess less, so it is kept.
-    strong = cal.analyze(synth.make_speech_like(40.0, SR, sibilance_db=3.0, seed=4), SR)
-    assert strong["sibilance_ratio_db"] > -8.0
-    assert computed(strong) > default_thr
-    cfg_s = cal.recommend(strong, cal.DEFAULT_CONFIG)
-    assert cfg_s["chain"]["deesser"]["threshold_db"] == default_thr
-    assert "bereits tiefer" in cfg_s["_calibration"]["reasons"]["chain.deesser.threshold_db"]
-    assert 5000.0 <= cfg_s["chain"]["deesser"]["freq_hz"] <= 9000.0
+    # Sibilant voices: threshold follows the measured band peak, within bounds.
+    for sib_db in (-6.0, 3.0):
+        m = cal.analyze(synth.make_speech_like(40.0, SR, sibilance_db=sib_db, seed=4, long_pause_s=6.0), SR)
+        assert m["sibilance_ratio_db"] > cal.SIBILANCE_REFERENCE_DB
+        cfg = cal.recommend(m, base_cfg)
+        trim = cfg["chain"]["input_trim"]["gain_db"]
+        expected = cal.clamp(m["sibilant_band_peak_dbfs"] + trim - overshoot, lo, hi)
+        assert cfg["chain"]["deesser"]["threshold_db"] == pytest.approx(expected, abs=0.05)
+        assert "Spitzenpegel" in cfg["_calibration"]["reasons"]["chain.deesser.threshold_db"]
+        assert 5000.0 <= cfg["chain"]["deesser"]["freq_hz"] <= 9000.0
+    with pytest.raises(ValueError):
+        cal.deesser_threshold_target(-10.0, 0.0, 1.0, -30.0)
 
 
-def test_eq_cuts_a_bass_heavy_recording_and_keeps_gain_limits():
-    x = synth.make_speech_like(40.0, SR, seed=5).astype(np.float64)
-    t = np.arange(x.size) / SR
-    # Strong 130 Hz component (proximity effect / rumble) at -18 dBFS RMS.
-    x += 10 ** (-18 / 20) * math.sqrt(2) * np.sin(2 * math.pi * 130.0 * t)
-    cfg = cal.recommend(cal.analyze(x, SR), cal.DEFAULT_CONFIG)
-    gains = {f"{b['type']}@{b['freq_hz']:.0f}": b["gain_db"] for b in cfg["chain"]["eq"]["bands"]}
-    assert gains["low_shelf@120"] <= -2.0
-    assert gains["low_shelf@120"] >= -cal.EQ_MAX_GAIN_DB
-    for g in gains.values():
-        assert -cal.EQ_MAX_GAIN_DB <= g <= cal.EQ_MAX_GAIN_DB
+def test_deesser_reduction_on_sibilants_is_between_4_and_cap_minus_1_db(base_cfg):
+    """PO-4: with the recommended threshold the real de-esser reduces the loud
+    sibilants by >= 4 dB but does not sit at max_reduction_db permanently."""
+    from voicechain.dsp.deesser import DeEsser
+    x = synth.make_speech_like(40.0, SR, sibilance_db=-6.0, seed=4, long_pause_s=6.0)
+    m = cal.analyze(x, SR)
+    cfg = cal.recommend(m, base_cfg)
+    de_cfg = cfg["chain"]["deesser"]
+    trimmed = x.astype(np.float64) * 10 ** (cfg["chain"]["input_trim"]["gain_db"] / 20)
+    stage = DeEsser(SR, **de_cfg)
+    frame = int(SR * meters.ANALYSIS_FRAME_MS / 1000)
+    n_frames = trimmed.size // frame
+    reductions = np.zeros(n_frames)
+    band_levels = np.zeros(n_frames)
+    for i in range(n_frames):
+        stage.process(trimmed[i * frame:(i + 1) * frame])
+        mt = stage.meters()
+        reductions[i] = mt["gain_reduction_max_db"]
+        band_levels[i] = mt["band_level_dbfs"]
+    mask, _ = meters.speech_activity(x, SR)
+    top = mask & (band_levels >= np.percentile(band_levels[mask], meters.BAND_PEAK_PERCENTILE))
+    assert top.sum() >= 10
+    median_red = float(np.median(reductions[top]))
+    assert 4.0 <= median_red <= de_cfg["max_reduction_db"] - 1.0, median_red
+    assert float(np.mean(reductions[top] >= de_cfg["max_reduction_db"] - 0.1)) < 0.5
+    # Frames without sibilants are left alone.
+    quiet = mask & (band_levels < np.percentile(band_levels[mask], 50.0))
+    assert float(np.median(reductions[quiet])) < 0.5
 
 
-def test_recommend_appends_missing_eq_bands_and_keeps_others():
-    base = copy.deepcopy(cal.DEFAULT_CONFIG)
-    base["chain"]["eq"]["bands"] = [{"type": "peak", "freq_hz": 800.0, "gain_db": 2.0, "q": 1.0}]
-    cfg = cal.recommend(cal.analyze(synth.make_speech_like(30.0, SR, seed=1), SR), base)
+def test_eq_shelves_are_cut_only_and_low_shelf_skipped_for_high_voices(base_cfg):
+    """PO-3: a high voice (f0 190-250 Hz) gets no low-frequency boost; shelves never > 0."""
+    x = synth.make_speech_like(40.0, SR, seed=5, pitch_range_hz=(190.0, 250.0), long_pause_s=6.0)
+    m = cal.analyze(x, SR)
+    assert m["f0_hz"] > cal.EQ_LOW_SHELF_MAX_F0_HZ
+    # The 80-170 Hz band is far below the reference (no speech there) ...
+    anchor = m["eq_anchor"]["density_db"]
+    assert m["eq_bands"]["low_shelf@120"]["density_db"] - anchor < -10.0
+    cfg = cal.recommend(m, base_cfg)
     bands = cfg["chain"]["eq"]["bands"]
-    assert bands[0] == {"type": "peak", "freq_hz": 800.0, "gain_db": 2.0, "q": 1.0}
-    assert len(bands) == 5
-    assert base["chain"]["eq"]["bands"] == [{"type": "peak", "freq_hz": 800.0, "gain_db": 2.0, "q": 1.0}]
+    # ... yet no low shelf is created or boosted.
+    assert all(b["type"] != "low_shelf" for b in bands)
+    reason = cfg["_calibration"]["reasons"]["chain.eq.low_shelf@120.gain_db"]
+    assert "kein Eingriff" in reason and "Grundfrequenz" in reason
+    for b in bands:
+        if b["type"] in cal.EQ_CUT_ONLY_TYPES:
+            assert b["gain_db"] <= 0.0
+        assert -cal.EQ_MAX_GAIN_DB <= b["gain_db"] <= cal.EQ_MAX_GAIN_DB
+    # The shipped +1.5 dB high shelf can only go down (cut-only, reference steeper above 4 kHz).
+    high = next(b for b in bands if b["type"] == "high_shelf")
+    assert high["gain_db"] <= 0.0
 
 
-def test_eq_correction_is_added_to_base_voicing_and_labelled_by_actual_frequency():
-    """Base bands at 220/3200/10000 Hz (as in config/chain.default.yaml) keep their
-    voicing; the measured correction is added and the result stays within +-4 dB."""
-    base = copy.deepcopy(cal.DEFAULT_CONFIG)
-    base["chain"]["eq"]["bands"] = [
-        {"type": "peak", "freq_hz": 220.0, "gain_db": -2.0, "q": 1.0},
-        {"type": "peak", "freq_hz": 3200.0, "gain_db": 2.0, "q": 1.2},
-        {"type": "high_shelf", "freq_hz": 10000.0, "gain_db": 3.5, "q": 0.707},
-    ]
-    flat = copy.deepcopy(base)
+def test_eq_low_shelf_cuts_bass_heavy_low_voice_and_never_boosts(base_cfg):
+    x = synth.make_speech_like(40.0, SR, seed=5, long_pause_s=6.0).astype(np.float64)
+    t = np.arange(x.size) / SR
+    # Strong 130 Hz component (proximity effect of a low voice) at -18 dBFS RMS,
+    # present only while the voice is active so the pauses stay pauses.
+    mask, _ = meters.speech_activity(x, SR)
+    frame = int(SR * meters.ANALYSIS_FRAME_MS / 1000)
+    gate = np.repeat(mask.astype(np.float64), frame)
+    gate = np.concatenate([gate, np.zeros(x.size - gate.size)])
+    x += gate * 10 ** (-18 / 20) * math.sqrt(2) * np.sin(2 * math.pi * 130.0 * t)
+    m = cal.analyze(x, SR)
+    assert m["f0_hz"] <= cal.EQ_LOW_SHELF_MAX_F0_HZ
+    cfg = cal.recommend(m, base_cfg)
+    by_key = {f"{b['type']}@{b['freq_hz']:.0f}": b["gain_db"] for b in cfg["chain"]["eq"]["bands"]}
+    assert "low_shelf@120" in by_key
+    assert -cal.EQ_MAX_GAIN_DB <= by_key["low_shelf@120"] <= -2.0
+    # Without the rumble the band is below the reference: cut-only -> no band is created.
+    plain = cal.recommend(cal.analyze(synth.make_speech_like(40.0, SR, seed=5, long_pause_s=6.0), SR), base_cfg)
+    assert all(b["type"] != "low_shelf" for b in plain["chain"]["eq"]["bands"])
+    assert "kein Band angelegt" in plain["_calibration"]["reasons"]["chain.eq.low_shelf@120.gain_db"]
+
+
+def test_eq_reference_curve_is_piecewise():
+    assert cal.eq_reference_db(300.0) == 0.0
+    assert cal.eq_reference_db(1000.0) == pytest.approx(-6.0)
+    assert cal.eq_reference_db(4000.0) == pytest.approx(-18.0)
+    assert cal.eq_reference_db(8000.0) == pytest.approx(-28.0)
+    assert cal.eq_reference_db(16000.0) == pytest.approx(-38.0)
+
+
+def test_eq_correction_is_added_to_base_voicing_and_labelled_by_actual_frequency(base_cfg):
+    """Base bands at 220/3200 Hz keep their voicing; the correction is added within +-4 dB."""
+    flat = copy.deepcopy(base_cfg)
     for band in flat["chain"]["eq"]["bands"]:
         band["gain_db"] = 0.0
-    x = synth.make_speech_like(30.0, SR, seed=5).astype(np.float64)
-    t = np.arange(x.size) / SR
-    x += 10 ** (-18 / 20) * math.sqrt(2) * np.sin(2 * math.pi * 130.0 * t)   # bass-heavy
-    m = cal.analyze(x, SR)
+    m = cal.analyze(synth.make_speech_like(30.0, SR, seed=5), SR)
     voiced = {f"{b['type']}@{b['freq_hz']:.0f}": b["gain_db"]
-              for b in cal.recommend(m, base)["chain"]["eq"]["bands"]}
+              for b in cal.recommend(m, base_cfg)["chain"]["eq"]["bands"]}
     plain = {f"{b['type']}@{b['freq_hz']:.0f}": b["gain_db"]
              for b in cal.recommend(m, flat)["chain"]["eq"]["bands"]}
-    assert set(voiced) == {"peak@220", "peak@3200", "high_shelf@10000", "low_shelf@120"}
-    # No flat band is created at 250/3000 Hz because 220/3200 Hz lie within 20 %.
-    reasons = cal.recommend(m, base)["_calibration"]["reasons"]
+    base = {f"{b['type']}@{b['freq_hz']:.0f}": b["gain_db"] for b in base_cfg["chain"]["eq"]["bands"]}
+    reasons = cal.recommend(m, base_cfg)["_calibration"]["reasons"]
     assert "chain.eq.peak@220.gain_db" in reasons and "chain.eq.peak@3200.gain_db" in reasons
-    assert "chain.eq.low_shelf@120.gain_db" in reasons and "neues Band" in reasons["chain.eq.low_shelf@120.gain_db"]
-    assert "Basiswert +2.0 dB" in reasons["chain.eq.peak@3200.gain_db"]
-    # Same measured correction in both runs; the base voicing is added on top ...
-    assert voiced["peak@220"] == pytest.approx(plain["peak@220"] - 2.0, abs=0.011)
-    assert voiced["peak@3200"] == pytest.approx(plain["peak@3200"] + 2.0, abs=0.011)
-    assert voiced["low_shelf@120"] == pytest.approx(plain["low_shelf@120"], abs=1e-9)
-    # ... and the +3.5 dB shelf is clamped at the +4 dB limit instead of exceeding it.
-    assert voiced["high_shelf@10000"] == pytest.approx(min(cal.EQ_MAX_GAIN_DB, plain["high_shelf@10000"] + 3.5), abs=0.011)
-    # The 130 Hz tone lifts the 80-170 Hz band: the new low shelf cuts.
-    assert plain["low_shelf@120"] <= -2.0
+    for key in ("peak@220", "peak@3200"):
+        assert voiced[key] == pytest.approx(cal.clamp(plain[key] + base[key], -4.0, 4.0), abs=0.011)
+    assert voiced["high_shelf@10000"] == pytest.approx(cal.clamp(plain["high_shelf@10000"] + base["high_shelf@10000"], -4.0, 0.0), abs=0.011)
     for g in list(voiced.values()) + list(plain.values()):
         assert -cal.EQ_MAX_GAIN_DB <= g <= cal.EQ_MAX_GAIN_DB
 
 
-def _measurements(speech, floor, sib, centroid=6500.0):
-    """Hand-made measurement dict with an arbitrary (flat) band layout."""
-    m = cal.analyze(synth.make_speech_like(20.0, SR, seed=0), SR)
-    m = copy.deepcopy(m)
+def _measurements(speech, floor, sib, centroid=6500.0, band_peak=None, f0=120.0):
+    """Hand-made measurement dict on top of a real analysis (band layout, pause)."""
+    m = copy.deepcopy(cal.analyze(synth.make_speech_like(20.0, SR, seed=0), SR))
     m.update({"speech_level_dbfs": speech, "noise_floor_dbfs": floor, "snr_db": speech - floor,
               "speech_peak_level_dbfs": speech + 10.0, "speech_crest_db": 10.0,
-              "sibilance_ratio_db": sib, "sibilance_centroid_hz": centroid, "speech_detected": True})
+              "sibilance_ratio_db": sib, "sibilance_centroid_hz": centroid,
+              "sibilant_band_peak_dbfs": speech + 8.0 if band_peak is None else band_peak,
+              "speech_detected": True, "f0_hz": f0})
     return m
 
 
-@pytest.mark.parametrize("speech,floor,sib,centroid", [
-    (-60.0, -95.0, -30.0, 2000.0),   # far too quiet, dead silent room
-    (-5.0, -8.0, 10.0, 15000.0),     # hot, noisy, extremely sibilant
-    (-26.0, -60.0, -15.0, 6500.0),   # nominal
-    (-45.0, -47.0, 0.0, 9500.0),     # almost no SNR
+@pytest.mark.parametrize("speech,floor,sib,centroid,band_peak", [
+    (-60.0, -95.0, -30.0, 2000.0, -70.0),   # far too quiet, dead silent room
+    (-5.0, -8.0, 10.0, 15000.0, 0.0),       # hot, noisy, extremely sibilant
+    (-26.0, -60.0, -15.0, 6500.0, -20.0),   # nominal
+    (-45.0, -47.0, 0.0, 9500.0, -60.0),     # almost no SNR
 ])
-def test_recommend_respects_all_bounds(speech, floor, sib, centroid):
-    cfg = cal.recommend(_measurements(speech, floor, sib, centroid), cal.DEFAULT_CONFIG)
+def test_recommend_respects_all_bounds(speech, floor, sib, centroid, band_peak, base_cfg):
+    cfg = cal.recommend(_measurements(speech, floor, sib, centroid, band_peak), base_cfg)
     chain = cfg["chain"]
     assert cal.TRIM_BOUNDS_DB[0] <= chain["input_trim"]["gain_db"] <= cal.TRIM_BOUNDS_DB[1]
     for stage in ("expander", "deesser", "compressor"):
@@ -225,139 +293,247 @@ def test_recommend_respects_all_bounds(speech, floor, sib, centroid):
     assert cal.MAKEUP_BOUNDS_DB[0] <= chain["compressor"]["makeup_db"] <= cal.MAKEUP_BOUNDS_DB[1]
     for band in chain["eq"]["bands"]:
         assert -cal.EQ_MAX_GAIN_DB <= band["gain_db"] <= cal.EQ_MAX_GAIN_DB
+        if band["type"] in cal.EQ_CUT_ONLY_TYPES:
+            assert band["gain_db"] <= 0.0
     assert set(cfg["_calibration"]["reasons"]) >= {
         "chain.input_trim.gain_db", "chain.expander.threshold_db", "chain.deesser.freq_hz",
         "chain.deesser.threshold_db", "chain.compressor.threshold_db", "chain.compressor.makeup_db",
         "chain.normalizer.target_lufs", "chain.limiter.ceiling_dbfs"}
 
 
-def test_recommend_does_not_mutate_base_config():
-    base = copy.deepcopy(cal.DEFAULT_CONFIG)
-    snapshot = copy.deepcopy(base)
-    cal.recommend(_measurements(-26.0, -50.0, -5.0), base)
-    assert base == snapshot
+def test_recommend_does_not_mutate_base_config(base_cfg):
+    snapshot = copy.deepcopy(base_cfg)
+    cal.recommend(_measurements(-26.0, -50.0, -5.0), base_cfg)
+    assert base_cfg == snapshot
+
+
+def test_recommend_requires_bounds_for_tracked_parameters(base_cfg):
+    broken = copy.deepcopy(base_cfg)
+    del broken["adaptive"]["bounds"]["deesser.threshold_db"]
+    with pytest.raises(ValueError, match="deesser.threshold_db"):
+        cal.recommend(_measurements(-26.0, -50.0, -5.0), broken)
+
+
+# --------------------------------------------------------------------------- normalizer refinement
+
+def test_refine_normalizer_derives_gate_and_max_gain_from_pause_loudness(base_cfg, quiet_sample):
+    cfg = cal.recommend(cal.analyze(quiet_sample, SR), base_cfg)
+    after = cal.analyze(quiet_sample, SR)
+    target = cfg["chain"]["normalizer"]["target_lufs"]
+    # Quiet pause (-47 LUFS): gate = -47 + 8 = -39, gain limit 12 dB (capped).
+    after["pause"]["median_lufs"] = -47.0
+    out = cal.refine_normalizer(cfg, after)
+    assert out["chain"]["normalizer"]["gate_lufs"] == pytest.approx(-39.0)
+    assert out["chain"]["normalizer"]["max_gain_db"] == pytest.approx(12.0)
+    # Very quiet pause (-60 LUFS): the gate does not go below -40.
+    after["pause"]["median_lufs"] = -60.0
+    assert cal.refine_normalizer(cfg, after)["chain"]["normalizer"]["gate_lufs"] == pytest.approx(-40.0)
+    # Loud pause (-30 LUFS): gate = -22 capped at target - 15 = -33; max gain = -18 - (-24) = 6.
+    after["pause"]["median_lufs"] = -30.0
+    out = cal.refine_normalizer(cfg, after)
+    assert out["chain"]["normalizer"]["gate_lufs"] == pytest.approx(target - 15.0)
+    assert out["chain"]["normalizer"]["max_gain_db"] == pytest.approx(6.0)
+    assert "Pausenlautheit" in out["_calibration"]["reasons"]["chain.normalizer.gate_lufs"]
+    assert "Sprachlautheit" in out["_calibration"]["reasons"]["chain.normalizer.max_gain_db"]
+    # Pause as loud as speech: no gain at all, with a warning in the reason.
+    after["pause"]["median_lufs"] = -14.0
+    out = cal.refine_normalizer(cfg, after)
+    assert out["chain"]["normalizer"]["max_gain_db"] == 0.0
+    assert "ACHTUNG" in out["_calibration"]["reasons"]["chain.normalizer.max_gain_db"]
+    assert cfg["chain"]["normalizer"]["gate_lufs"] == base_cfg["chain"]["normalizer"]["gate_lufs"]  # input untouched
+    after["pause"] = None
+    with pytest.raises(ValueError, match="Pause"):
+        cal.refine_normalizer(cfg, after)
 
 
 # --------------------------------------------------------------------------- evaluate
 
-def test_evaluate_identity_fails_loudness_and_noise_but_passes_peak(quiet_sample):
-    cfg = cal.recommend(cal.analyze(quiet_sample, SR), cal.DEFAULT_CONFIG)
+def test_evaluate_identity_fails_snr_and_loudness_but_passes_peak_and_pause(quiet_sample, base_cfg):
+    cfg = cal.recommend(cal.analyze(quiet_sample, SR), base_cfg)
     ev = cal.evaluate(quiet_sample, quiet_sample, SR, cfg)
     c = ev["criteria"]
+    assert set(c) == {"noise_floor_reduction", "pause_loudness", "sibilance_reduced",
+                      "loudness_in_target", "true_peak_below_ceiling"}
     assert c["noise_floor_reduction"]["passed"] is False      # 0 dB SNR gain < 6 dB
     assert "+0.0 dB" in c["noise_floor_reduction"]["actual"]
-    assert c["loudness_in_target"]["passed"] is False         # ~-25 LUFS vs -18
-    assert c["true_peak_below_ceiling"]["passed"] is True     # ~-8.5 dBTP
+    assert c["pause_loudness"]["passed"] is True              # -47 LUFS <= -38
+    assert c["loudness_in_target"]["passed"] is False         # ~-26 LUFS vs -18
+    assert c["true_peak_below_ceiling"]["passed"] is True     # ~-11 dBTP
     assert c["sibilance_reduced"]["passed"] is False          # de-esser needed, no change
     assert ev["passed"] is False
     assert ev["info"]["snr_gain_db"] == pytest.approx(0.0, abs=1e-9)
+    assert ev["info"]["pause_rms_change_db"] == pytest.approx(0.0, abs=1e-9)
 
 
-def test_evaluate_passes_on_an_ideal_output(quiet_sample):
-    """Build the output the chain is supposed to deliver and check the criteria pass."""
-    cfg = cal.recommend(cal.analyze(quiet_sample, SR), cal.DEFAULT_CONFIG)
-    x = quiet_sample.astype(np.float64)
-    # Gate the pauses by 18 dB (expander range is 20 dB), lower the 5-10 kHz band
-    # by 6 dB, then scale to -18 LUFS (about +7 dB, so the floor ends ~11 dB lower).
+def _ideal_output(x: np.ndarray, gate_db: float = -18.0) -> np.ndarray:
+    """Gate pauses, lower the 5-10 kHz band by 6 dB, scale to -18 LUFS."""
+    from scipy import signal
+    x = x.astype(np.float64)
     mask, _ = meters.speech_activity(x, SR)
     frame = int(SR * meters.ANALYSIS_FRAME_MS / 1000)
-    gain = np.repeat(np.where(mask, 1.0, 10 ** (-18 / 20)), frame)
+    gain = np.repeat(np.where(mask, 1.0, 10 ** (gate_db / 20)), frame)
     gain = np.concatenate([gain, np.full(x.size - gain.size, gain[-1])])
     y = x * gain
-    from scipy import signal
     sos = signal.butter(4, [5000.0, 10000.0], btype="bandpass", fs=SR, output="sos")
-    band = signal.sosfiltfilt(sos, y)
-    y = y - band * (1 - 10 ** (-6 / 20))
-    y *= 10 ** ((-18.0 - meters.integrated_lufs(y, SR)) / 20)
-    ev = cal.evaluate(x, y, SR, cfg)
-    assert ev["criteria"]["noise_floor_reduction"]["passed"] is True
-    assert ev["info"]["snr_gain_db"] == pytest.approx(18.0, abs=1.5)
-    assert ev["criteria"]["sibilance_reduced"]["passed"] is True
-    assert ev["criteria"]["loudness_in_target"]["passed"] is True
-    assert ev["criteria"]["true_peak_below_ceiling"]["passed"] is True
+    y = y - signal.sosfiltfilt(sos, y) * (1 - 10 ** (-6 / 20))
+    return y * 10 ** ((-18.0 - meters.integrated_lufs(y, SR)) / 20)
+
+
+def test_evaluate_passes_on_an_ideal_output(quiet_sample, base_cfg):
+    cfg = cal.recommend(cal.analyze(quiet_sample, SR), base_cfg)
+    y = _ideal_output(quiet_sample)
+    ev = cal.evaluate(quiet_sample, y, SR, cfg)
+    for key, crit in ev["criteria"].items():
+        assert crit["passed"] is True, (key, crit)
     assert ev["passed"] is True
+    assert ev["info"]["snr_gain_db"] == pytest.approx(18.0, abs=1.5)
     assert ev["after"]["integrated_lufs"] == pytest.approx(-18.0, abs=0.1)
+    # The pause is 18 dB quieter and then lifted by ~8 dB: about -10 dB absolute.
+    assert ev["info"]["pause_rms_change_db"] == pytest.approx(-10.0, abs=2.0)
+    assert ev["after"]["pause"]["max_lufs"] < -18.0 - cal.PAUSE_LOUDNESS_MARGIN_LU
+
+
+def test_evaluate_pause_criterion_fails_when_the_pause_is_lifted(quiet_sample, base_cfg):
+    cfg = cal.recommend(cal.analyze(quiet_sample, SR), base_cfg)
+    y = _ideal_output(quiet_sample)
+    a, b = int(33.0 * SR), int(37.5 * SR)
+    y[a:b] *= 10 ** (25.0 / 20)           # normalizer run-up in the pause: +25 dB
+    ev = cal.evaluate(quiet_sample, y, SR, cfg)
+    crit = ev["criteria"]["pause_loudness"]
+    assert crit["passed"] is False
+    assert ev["after"]["pause"]["max_lufs"] > -18.0 - cal.PAUSE_LOUDNESS_MARGIN_LU
+    assert "max_gain_db senken" in crit["note"]
+    assert ev["passed"] is False
+
+
+def test_evaluate_requires_a_pause_of_5_s(base_cfg):
+    x = synth.make_speech_like(30.0, SR, seed=1)      # pauses < 1.5 s only
+    cfg = cal.recommend(cal.analyze(x, SR), base_cfg)
+    with pytest.raises(ValueError) as err:
+        cal.evaluate(x, x, SR, cfg)
+    assert "5 s" in str(err.value) and "neu aufnehmen" in str(err.value)
+
+
+# --------------------------------------------------------------------------- read_mono_wav
+
+def test_read_mono_wav_mixes_picks_channels_and_checks_rate(tmp_path):
+    left = synth.make_speech_like(12.0, SR, seed=1)
+    right = np.zeros_like(left)
+    sf.write(str(tmp_path / "st.wav"), np.stack([left, right], axis=1), SR, subtype="PCM_16")
+    mixed, sr = cal.read_mono_wav(tmp_path / "st.wav")
+    assert sr == SR and mixed.dtype == np.float32
+    assert meters.rms_dbfs(mixed) == pytest.approx(meters.rms_dbfs(left) - 6.02, abs=0.05)
+    picked, _ = cal.read_mono_wav(tmp_path / "st.wav", channel=0)
+    assert meters.rms_dbfs(picked) == pytest.approx(meters.rms_dbfs(left), abs=0.05)
+    with pytest.raises(ValueError, match="Kanal 2"):
+        cal.read_mono_wav(tmp_path / "st.wav", channel=2)
+    with pytest.raises(ValueError, match="44100"):
+        cal.read_mono_wav(tmp_path / "st.wav", expected_sr=44100)
+    with pytest.raises(FileNotFoundError):
+        cal.read_mono_wav(tmp_path / "missing.wav")
+
+
+def test_read_mono_wav_rejects_garbage_empty_and_nonfinite(tmp_path):
+    (tmp_path / "text.wav").write_text("not audio", encoding="utf-8")
+    with pytest.raises(ValueError, match="lesbare WAV"):
+        cal.read_mono_wav(tmp_path / "text.wav")
+    sf.write(str(tmp_path / "empty.wav"), np.zeros((0, 1), dtype=np.float32), SR)
+    with pytest.raises(ValueError, match="keine Samples"):
+        cal.read_mono_wav(tmp_path / "empty.wav")
+    x = synth.make_speech_like(12.0, SR, seed=1)
+    x[100:110] = np.nan
+    x[200] = np.inf
+    sf.write(str(tmp_path / "nan.wav"), x, SR, subtype="FLOAT")
+    with pytest.raises(ValueError, match="nicht-finite") as err:
+        cal.read_mono_wav(tmp_path / "nan.wav")
+    assert "11 von" in str(err.value)
 
 
 # --------------------------------------------------------------------------- run_calibration
 
-def _write_wav(path, x, sr=SR):
-    sf.write(str(path), x, sr, subtype="PCM_16")
-    return path
-
-
-def test_run_calibration_writes_config_and_report(tmp_path, quiet_sample):
+def test_run_calibration_writes_config_and_report(tmp_path, quiet_sample, base_cfg):
     wav = _write_wav(tmp_path / "sample.wav", quiet_sample)
     out_cfg = tmp_path / "out" / "chain.calibrated.yaml"
     report = tmp_path / "reports" / "calibration.md"
+    calls = []
 
     def fake_processor(x):
-        return (x * 10 ** (6.0 / 20)).astype(np.float32)
+        calls.append(x.size)
+        return _ideal_output(x).astype(np.float32)
 
     result = cal.run_calibration(str(wav), None, str(out_cfg), str(report), processor=fake_processor)
+    assert len(calls) == 2                      # first pass + refined pass
     assert out_cfg.exists() and report.exists()
-    assert isinstance(result["passed"], bool)
+    assert result["passed"] is True
     assert result["out_cfg_path"] == str(out_cfg)
-    import yaml
-    loaded = yaml.safe_load(out_cfg.read_text(encoding="utf-8"))
+    loaded = load_config(out_cfg)               # validator accepts the written file
     assert loaded["chain"]["input_trim"]["gain_db"] == pytest.approx(6.0, abs=1.5)
     assert loaded["sample_rate"] == 48000
     assert "_calibration" in loaded and "reasons" in loaded["_calibration"]
+    assert "chain.normalizer.gate_lufs" in loaded["_calibration"]["reasons"]
+    assert loaded["chain"]["normalizer"]["gate_lufs"] == pytest.approx(-40.0)
+    assert loaded["chain"]["normalizer"]["max_gain_db"] == pytest.approx(12.0)
+    assert loaded["chain"]["eq"]["bands"] != base_cfg["chain"]["eq"]["bands"]
     text = report.read_text(encoding="utf-8")
     for section in cal.REPORT_SECTIONS:
         assert section in text
-    assert "bestanden" in text
-    assert "Rauschteppich" in text and "Zischanteil" in text and "True Peak" in text
-    assert "chain.input_trim.gain_db" in text
+    assert "**bestanden**" in text
+    assert "Pausenlautheit nach Kette" in text and "Pause: RMS" in text
+    assert "Störabstand" in text and "Zischanteil" in text and "True Peak" in text
+    assert "chain.input_trim.gain_db" in text and "Grundfrequenz" in text
 
 
-def test_run_calibration_uses_base_config_file(tmp_path, quiet_sample):
+def test_run_calibration_uses_base_config_file_and_accepts_calibrated_input(tmp_path, quiet_sample, base_cfg):
     import yaml
-    base = copy.deepcopy(cal.DEFAULT_CONFIG)
+    base = copy.deepcopy(base_cfg)
     base["chain"]["normalizer"]["target_lufs"] = -16.0
+    base["_calibration"] = {"reasons": {"old": "x"}}
     base_path = tmp_path / "base.yaml"
     base_path.write_text(yaml.safe_dump(base), encoding="utf-8")
     wav = _write_wav(tmp_path / "s.wav", quiet_sample)
     result = cal.run_calibration(str(wav), str(base_path), str(tmp_path / "o.yaml"),
-                                 str(tmp_path / "r.md"), processor=lambda x: x)
+                                 str(tmp_path / "r.md"), processor=lambda x: _ideal_output(x))
     assert result["cfg"]["chain"]["normalizer"]["target_lufs"] == -16.0
+    assert "old" not in result["cfg"]["_calibration"]["reasons"]
     assert "-16 LUFS" in (tmp_path / "r.md").read_text(encoding="utf-8")
 
 
-def test_run_calibration_rejects_wrong_sample_rate(tmp_path):
-    x = synth.make_speech_like(20.0, 44100, seed=0)
+def test_run_calibration_rejects_wrong_sample_rate_and_missing_pause(tmp_path):
+    x = synth.make_speech_like(20.0, 44100, seed=0, long_pause_s=6.0)
     wav = _write_wav(tmp_path / "s44.wav", x, sr=44100)
     with pytest.raises(ValueError) as err:
         cal.run_calibration(str(wav), None, str(tmp_path / "o.yaml"), str(tmp_path / "r.md"),
                             processor=lambda x: x)
     msg = str(err.value)
-    assert "44100" in msg and "48000" in msg and "ffmpeg" in msg
+    assert "44100" in msg and "48000" in msg and "afconvert" in msg
     assert not (tmp_path / "o.yaml").exists()
-
-
-def test_run_calibration_reports_missing_wav(tmp_path):
+    wav = _write_wav(tmp_path / "nopause.wav", synth.make_speech_like(30.0, SR, seed=1))
+    with pytest.raises(ValueError, match="neu aufnehmen"):
+        cal.run_calibration(str(wav), None, str(tmp_path / "o.yaml"), str(tmp_path / "r.md"),
+                            processor=lambda x: x)
     with pytest.raises(FileNotFoundError):
         cal.run_calibration(str(tmp_path / "missing.wav"), None, str(tmp_path / "o.yaml"),
                             str(tmp_path / "r.md"), processor=lambda x: x)
 
 
-def test_end_to_end_with_real_chain(tmp_path):
-    """Acceptance criterion docs/00 section 6.3 against the real DSP chain."""
-    pytest.importorskip("voicechain.dsp.chain")
-    x = synth.make_speech_like(60.0, SR, level_dbfs=-26.0, noise_floor_dbfs=-50.0,
-                               sibilance_db=0.0, pause_ratio=0.3, seed=3, lead_silence_s=5.0)
+def test_end_to_end_with_real_chain(tmp_path, base_cfg):
+    """Acceptance criterion docs/00 section 6.3 against the real DSP chain and the shipped YAML."""
+    x = synth.make_speech_like(60.0, SR, sibilance_db=0.0, **SAMPLE_KW)
     wav = _write_wav(tmp_path / "real.wav", x)
     result = cal.run_calibration(str(wav), None, str(tmp_path / "cal.yaml"), str(tmp_path / "cal.md"))
     c = result["evaluation"]["criteria"]
     before = result["evaluation"]["before"]
     after = result["evaluation"]["after"]
+    target = base_cfg["chain"]["normalizer"]["target_lufs"]
     assert after["true_peak_dbtp"] <= -1.0 + cal.TRUE_PEAK_TOLERANCE_DB
-    assert abs(after["integrated_lufs"] - (-18.0)) <= 2.0
+    assert abs(after["integrated_lufs"] - target) <= 2.0
     assert after["snr_db"] - before["snr_db"] >= 6.0
+    assert after["pause"]["max_lufs"] <= target - cal.PAUSE_LOUDNESS_MARGIN_LU
     assert after["sibilance_ratio_db"] < before["sibilance_ratio_db"]
     # Speech level after the chain sits near the normalizer target (-18 LUFS ~ -18 dBFS RMS).
-    assert after["speech_level_dbfs"] == pytest.approx(-18.0, abs=2.5)
+    assert after["speech_level_dbfs"] == pytest.approx(target, abs=2.5)
     assert all(item["passed"] for item in c.values()), c
     assert result["passed"] is True
+    assert load_config(tmp_path / "cal.yaml")["chain"]["deesser"]["freq_hz"] == result["cfg"]["chain"]["deesser"]["freq_hz"]
     text = (tmp_path / "cal.md").read_text(encoding="utf-8")
     assert "**bestanden**" in text and "nicht bestanden" not in text
