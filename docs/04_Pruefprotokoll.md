@@ -151,5 +151,31 @@ Sprache abzuschneiden.
 Stand nach Runde 4: 336 Tests grün, 1 übersprungen (Rechte-Test unter root), Selftest 12/12,
 0,43 ms je 256er-Block.
 
+## PO-Prüfung Runde 4 und Nacharbeit Runde 5
+
+PO-Prüfung Runde 4 (`docs/pruefungen/08_product_owner_runde4.md`, Stand 6fc21ab): **nicht
+abnehmbar** wegen Regression PO-29 (hoch): Startet der Stream mit Raumrauschen vor dem ersten
+Wort, lernte der Normalizer die Sprachreferenz aus dem Rauschen und verriegelte sich im Zustand
+low_snr; Folge auch für die Kalibrierung (Normalizer-Gain 0, unzischende Stimmen fielen beim
+Lautheitskriterium durch). Weitere Befunde: PO-30 (mittel, low_snr rastet im +8-dB-Raum ein),
+PO-25 teilweise, PO-27 teilweise, PO-31/PO-32 (niedrig). PO bestätigt die Entscheidung, den
+Kompressor im low_snr-Zustand nicht zu entschärfen, mit Auflage zu den Zahlen in §6.4 b.
+
+Nacharbeit Runde 5 (Commits 9d97843 INT, 4fa57bf KAL, dce171f DSP):
+
+| Nr | Änderung | Nachweis |
+|----|----------|----------|
+| PO-29 | Referenz nur aus modulierten Intervallen (Spanne ≥ 6 LU über 2 s) und ≥ Teppich + 13 LU; ohne Referenz wird der Gain gehalten | Vorlauf 3/10 s in −55/−50/−45 dBFS: Gain-Anstieg im Vorlauf 0,00 dB, Sprache danach −16,7…−17,0 LUFS; Kalibrierung mit 10 s Vorlauf: Lautheit bestanden, Gain > 0,5 dB |
+| PO-30 | low_snr lernt weiter aus sicherer Sprache (Teppich + 13 LU) | −45-Raum: low_snr 94–98 %, Gain regelt trotzdem (2,6 dB); +8 dB rosa, Sprecher −6 dB: −19,3 LUFS |
+| PO-25 | Zischkriterium geschlossen: nachher ≤ −15 oder Δ ≤ −1 oder (vorher ≤ −10 und Δ ≤ +1) | 18-Fälle-Tabelle, echte Kette Grenzstimme bestanden |
+| PO-26 Rest | Pegelplausibilität mit 1 dB Hysterese | kein track/rest-Pendeln bei 5,9 ↔ 6,5 dB |
+| PO-27 Rest | docs/03 §8 systemtreu | — |
+| PO-31 | Statuszeile zeigt `snr … LU` bzw. `SNR LOW (… LU)` | Test 4 Fälle |
+| PO-32 | Standard-Rosa im Raumänderungstest; docs/02 §7 Tabelle neu | HPF-Verlust 1,0 statt 3,3 dB |
+| Entscheidung | sichere Sprache = Teppich + 8 + 5 LU (DSP, statt +10): mit +10 endete das Lernen am Betriebspunkt eines 5–8 dB lauteren Raums | docs/02 §7 |
+| Entscheidung | §6.4 a: Abstand ≥ 15 LU oder mindestens Eingangsabstand (Standard-Rosa +8 dB hat am Eingang nur 12,3 LU) | Beauftragung |
+
+Stand nach Runde 5: 371 Tests grün, 1 übersprungen (Rechte-Test unter root), Selftest 12/12.
+
 ## Abschlussreview
-_wird nach der PO-Schlussverifikation ergänzt_
+_wird nach der PO-Schlussverifikation Runde 5 ergänzt_
