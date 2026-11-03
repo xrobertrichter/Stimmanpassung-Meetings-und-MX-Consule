@@ -18,3 +18,7 @@ Umsetzungs-Agenten erstellt und von drei Prüfrollen abgenommen.
 - Nach jeder Änderung: `pytest -q` und `python -m voicechain selftest`.
 - Befunde aus Prüfungen in `docs/04_Pruefprotokoll.md` und offene Fehler in `06_fehlerlog.md`.
 - Branch: `claude/blackhole-rode-ntusb-config-jdoa16`. Kein Push auf andere Branches.
+
+## Projektstand (2026-11-03)
+Drei Prüfrunden durchlaufen (Runde 1 und 2 mit PO, Software, Blind; Runde 3 PO-Abschlussprüfung).
+Offene Punkte stehen in `docs/04_Pruefprotokoll.md`, Abschnitt Abschlussreview.

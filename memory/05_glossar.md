@@ -20,3 +20,13 @@
 - **Zischanteil (Sibilance Ratio)**: Energie im Zischband relativ zum Sprachkernband.
 - **Hysterese**: Totzone, die Hin-und-Her-Regeln bei kleinen Schwankungen verhindert.
 - **Lazy Coding**: Platzhalter, Stubs, stumme Fehler, Tests ohne Aussage, unbegründete Konstanten.
+- **Momentary / Short-Term / Integrated**: Lautheit über 400 ms / 3 s / gesamte Dauer mit Gating (BS.1770).
+- **Relatives Gate**: Einfrieren der Regelung, wenn die Momentary-Lautheit mehr als 10 LU unter der Sprachreferenz liegt.
+- **Teppich-Schätzer (Minimum-Statistik)**: gleitendes Minimum der Lautheit über 10 s als Schätzung des Rauschteppichs.
+- **Störabstandsgewinn**: Verbesserung von (Sprachpegel − Rauschteppich) durch die Kette, in dB.
+- **Plausibilitätsprüfung**: Regelung ändert De-Esser/Kompressor nur, wenn das Signal wie Sprache des Hauptsprechers aussieht.
+- **speech_cut**: Schutzregel, senkt die Expander-Schwelle, wenn der Expander in Sprache zu stark eingreift.
+- **rest**: Rückkehr der Regelung zu den kalibrierten Werten nach 60 s ohne plausible Sprache.
+- **Band-Spitzenpegel p95**: 95. Perzentil der 50-ms-Spitzen im De-Esser-Band über aktive Rahmen.
+- **f0 (Grundfrequenz)**: Tonhöhe der Stimme, per Autokorrelation geschätzt; steuert, ob der Low-Shelf angefasst wird.
+- **Mutationstest**: absichtlicher Codefehler, um zu prüfen, ob die Tests ihn bemerken.
