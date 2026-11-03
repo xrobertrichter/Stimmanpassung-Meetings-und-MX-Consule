@@ -21,17 +21,17 @@ class HighPass(StageBase):
     def __init__(self, sample_rate: int, **params):
         super().__init__(sample_rate)
         self._apply_params(params)
-        self._filter = SosFilter(self._design(), fade_samples=int(round(PARAM_RAMP_MS * 1e-3 * self.sample_rate)))
-        self._update_coefficients()
+        self._filter = SosFilter(self._design_from(self.get_params()),
+                                 fade_samples=int(round(PARAM_RAMP_MS * 1e-3 * self.sample_rate)))
 
-    def _design(self) -> np.ndarray:
-        order = int(round(self.order))
-        if abs(order - self.order) > 1e-9:
-            raise ValueError(f"HighPass.order must be an integer, got {self.order!r}")
-        return butter_highpass_sos(self.freq_hz, order, self.sample_rate)
+    def _design_from(self, params: dict) -> np.ndarray:
+        order = int(round(params["order"]))
+        if abs(order - params["order"]) > 1e-9:
+            raise ValueError(f"HighPass.order must be an integer, got {params['order']!r}")
+        return butter_highpass_sos(params["freq_hz"], order, self.sample_rate)
 
-    def _update_coefficients(self) -> None:
-        self._filter.set_sos(self._design())
+    def _install(self, design: np.ndarray) -> None:
+        self._filter.set_sos(design)
 
     def process(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)

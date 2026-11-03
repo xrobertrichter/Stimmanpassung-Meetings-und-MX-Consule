@@ -20,6 +20,13 @@ def test_default_config_loads(cfg):
     assert set(cfg["chain"]) == set(STAGE_ORDER)
     assert len(cfg["chain"]["eq"]["bands"]) == 3
     assert isinstance(Chain.from_config(cfg), Chain)
+    # start values decided in review round 1 (PO): hold/release 100/250 ms, no high-shelf boost,
+    # expander distance 10 dB to a -55 dBFS floor, asymmetric normaliser rates
+    assert cfg["chain"]["expander"]["hold_ms"] == 100.0 and cfg["chain"]["expander"]["release_ms"] == 250.0
+    assert cfg["chain"]["expander"]["threshold_db"] == -45.0
+    assert cfg["chain"]["eq"]["bands"][2] == {"type": "high_shelf", "freq_hz": 10000.0, "gain_db": 0.0, "q": 0.707}
+    assert cfg["chain"]["normalizer"]["release_rate_db_per_s"] == 3.0
+    assert "+8 dB" not in default_config_path().read_text(encoding="utf-8")
 
 
 def test_round_trip_is_identical(cfg, tmp_path):
@@ -45,6 +52,9 @@ def test_default_yaml_documents_every_value(cfg):
     (lambda c: c["chain"]["limiter"].pop("release_ms"), "chain.limiter.release_ms: missing"),
     (lambda c: c["chain"]["expander"].update(threshold_db="loud"), "chain.expander.threshold_db: must be a number"),
     (lambda c: c["chain"]["compressor"].update(ratio=99.0), "chain.compressor.ratio: value 99.0 outside"),
+    (lambda c: c["chain"]["compressor"].update(ratio=1.0), "chain.compressor.ratio: value 1.0 outside the allowed range [1.1"),
+    (lambda c: c["chain"]["deesser"].update(ratio=1.0), "chain.deesser.ratio: value 1.0 outside the allowed range [1.1"),
+    (lambda c: c["chain"]["normalizer"].update(release_rate_db_per_s=0.0), "chain.normalizer.release_rate_db_per_s: value 0.0 outside"),
     (lambda c: c["chain"]["highpass"].update(enabled="yes"), "chain.highpass.enabled: must be true or false"),
     (lambda c: c["chain"]["highpass"].update(order=4.5), "chain.highpass.order: must be an integer"),
     (lambda c: c["chain"]["eq"]["bands"][0].update(type="notch"), "chain.eq.bands[0].type='notch'"),
@@ -83,10 +93,13 @@ def test_optional_internal_parameters_are_accepted(cfg):
     extended = copy.deepcopy(cfg)
     extended["chain"]["expander"]["detector_ms"] = 8.0
     extended["chain"]["limiter"]["true_peak_margin_db"] = 1.0
+    del extended["chain"]["normalizer"]["release_rate_db_per_s"]         # optional: default 3.0 applies
     validate_config(extended)
     chain = Chain.from_config(extended)
     assert chain.get_param("expander", "detector_ms") == 8.0
     assert chain.get_param("limiter", "true_peak_margin_db") == 1.0
+    assert chain.get_param("normalizer", "release_rate_db_per_s") == 3.0
+    assert cfg["chain"]["expander"]["ratio"] == 2.5 and Chain.from_config({**cfg, "chain": {**cfg["chain"], "expander": {**cfg["chain"]["expander"], "ratio": 1.0}}})
 
 
 def test_underscore_metadata_keys_are_tolerated_and_kept(cfg, tmp_path):

@@ -16,7 +16,11 @@ def test_sibilance_bursts_are_reduced_but_not_beyond_cap(fs, gen):
     reduction = gen.band_rms_db(x[mask], 5000.0, 9000.0, fs) - gen.band_rms_db(y[mask], 5000.0, 9000.0, fs)
     assert reduction >= 4.0
     assert reduction <= DEFAULT["max_reduction_db"] + 0.1
-    assert stage.meters()["gain_reduction_max_db"] <= DEFAULT["max_reduction_db"] + 1e-9
+    m = stage.meters()
+    assert m["gain_reduction_max_db"] <= DEFAULT["max_reduction_db"] + 1e-9
+    assert 7.0 <= m["gain_reduction_max_db"]                                   # since the start: the bursts hit the cap
+    assert 1.0 <= m["gain_reduction_mean_db"] <= 4.0                           # 25 % burst duty cycle of ~8 dB
+    assert stage.meters()["gain_reduction_max_db"] == 0.0                     # drained by the read
 
 
 def test_1khz_tone_untouched(fs, gen):
@@ -79,6 +83,8 @@ def test_disabled_and_validation(fs, gen):
         DeEsser(fs, **{**DEFAULT, "freq_hz": 30000.0})
     with pytest.raises(ValueError):
         DeEsser(fs, **{**DEFAULT, "bandwidth_oct": 0.0})
+    with pytest.raises(ValueError):
+        DeEsser(fs, **{**DEFAULT, "ratio": 1.0})           # schema lower bound 1.1 (review SW-7)
     stage = DeEsser(fs, **DEFAULT)
     stage.set_param("freq_hz", 7000.0)
     assert stage.get_param("freq_hz") == 7000.0

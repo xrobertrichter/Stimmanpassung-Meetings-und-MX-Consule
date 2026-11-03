@@ -73,8 +73,29 @@ def test_disabled_meters_and_validation(fs, gen):
     stage.process(x)
     m = stage.meters()
     assert 5.5 <= m["gain_reduction_max_db"] <= 7.0 and m["gain_reduction_db"] <= m["gain_reduction_max_db"]
+    assert m["gain_reduction_mean_db"] <= m["gain_reduction_max_db"]
     assert abs(m["level_dbfs"] + 10.0) < 0.1
     with pytest.raises(ValueError):
         stage.set_param("ratio", 50.0)
+    with pytest.raises(ValueError):
+        stage.set_param("ratio", 1.0)                      # schema lower bound 1.1 (review SW-7)
+    assert stage.get_param("ratio") == 3.0
     stage.set_param("threshold_db", -25.0)
     assert stage.get_param("threshold_db") == -25.0
+
+
+def test_reduction_accumulator_mean_max_and_drain(fs, gen):
+    """PO-5: 2 s without reduction, then 10 ms with 10 dB -> small mean, max 10; drained by reading."""
+    stage = Compressor(fs, **{**DEFAULT, "attack_ms": 0.1})
+    x = np.concatenate([gen.sine(1000.0, -30.0, 2.0, fs), gen.sine(1000.0, -5.0, 0.010, fs)])  # -5 dBFS: 15 dB over -> 10 dB
+    gen.process_blocks(stage, x, 240)                       # 240 = 5 ms blocks, the burst spans two blocks
+    m = stage.meters()
+    assert 9.5 <= m["gain_reduction_max_db"] <= 10.5
+    assert m["gain_reduction_mean_db"] < 0.2                # 10 dB * 10 ms / 2010 ms = 0.05 dB
+    assert 9.0 <= m["gain_reduction_db"] <= 10.5           # last 5 ms block lies inside the burst
+    drained = stage.meters()
+    assert drained["gain_reduction_mean_db"] == 0.0 and drained["gain_reduction_max_db"] == 0.0
+    gen.process_blocks(stage, gen.sine(1000.0, -30.0, 1.0, fs), 240)   # release tail (100 ms) dies out
+    stage.meters()
+    stage.process(gen.sine(1000.0, -30.0, 0.1, fs))
+    assert stage.meters()["gain_reduction_max_db"] < 0.01   # the burst is forgotten

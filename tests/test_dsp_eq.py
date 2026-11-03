@@ -9,7 +9,7 @@ from voicechain.dsp.biquad import sos_response_db
 DEFAULT_BANDS = [
     {"type": "peak", "freq_hz": 220.0, "gain_db": -2.0, "q": 1.0},
     {"type": "peak", "freq_hz": 3200.0, "gain_db": 2.0, "q": 1.2},
-    {"type": "high_shelf", "freq_hz": 10000.0, "gain_db": 1.5, "q": 0.707},
+    {"type": "high_shelf", "freq_hz": 10000.0, "gain_db": 0.0, "q": 0.707},   # 0 dB: the NT-USB is bright enough
 ]
 
 
@@ -36,7 +36,7 @@ def test_default_bands_each_hit_their_target(fs, gen):
     stage = Equalizer(fs, enabled=True, bands=DEFAULT_BANDS)
     assert abs(_measured_gain_db(stage, 220.0, fs, gen) + 2.0) < 0.5
     assert abs(_measured_gain_db(stage, 3200.0, fs, gen) - 2.0) < 0.5
-    assert abs(_measured_gain_db(stage, 20000.0, fs, gen) - 1.5) < 0.5
+    assert abs(_measured_gain_db(stage, 20000.0, fs, gen)) < 0.5                 # shelf at 0 dB: transparent
     assert abs(_measured_gain_db(stage, 1000.0, fs, gen)) < 0.5
 
 
@@ -59,6 +59,8 @@ def test_runtime_band_parameter_change(fs, gen):
     stage.set_param("bands.1.gain_db", -1.0)
     assert abs(_measured_gain_db(stage, 3200.0, fs, gen) + 1.0) < 0.5
     assert stage.get_params()["bands.1.gain_db"] == -1.0
+    stage.set_param("bands.2.gain_db", 1.5)
+    assert abs(_measured_gain_db(stage, 20000.0, fs, gen) - 1.5) < 0.5
     with pytest.raises(KeyError):
         stage.set_param("bands.7.gain_db", 1.0)
     with pytest.raises(KeyError):

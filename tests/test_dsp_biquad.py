@@ -1,5 +1,8 @@
 """Coefficient designs (RBJ, Butterworth, BS.1770 K-weighting) and the stateful SOS filter."""
 
+import ast
+import pathlib
+
 import numpy as np
 import pytest
 
@@ -126,3 +129,15 @@ def test_sosfilter_set_sos_keeps_state(fs, gen):
     assert np.array_equal(np.concatenate([first, second]), continuous)
     filt.set_sos(butter_highpass_sos(80.0, 2, fs))     # different section count -> fresh state
     assert filt.process(np.zeros(10)).max() == 0.0
+
+
+def test_biquad_is_a_leaf_module_with_public_k_weighting():
+    """SW-10: meters/calibration import the K-weighting from here, so biquad must not import voicechain."""
+    import voicechain.dsp.biquad as biquad
+    source = pathlib.Path(biquad.__file__).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").startswith("voicechain")
+        if isinstance(node, ast.Import):
+            assert not any(alias.name.startswith("voicechain") for alias in node.names)
+    assert callable(biquad.k_weighting_sos) and biquad.k_weighting_sos(48000).shape == (2, 6)

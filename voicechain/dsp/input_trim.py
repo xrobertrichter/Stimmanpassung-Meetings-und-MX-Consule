@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from voicechain.dsp import StageBase
+from voicechain.dsp import DB_FLOOR_DBFS, StageBase
 from voicechain.dsp.envelope import PARAM_RAMP_MS, GainRamp, peak_dbfs, rms_dbfs
 
 
@@ -18,12 +18,15 @@ class InputTrim(StageBase):
         super().__init__(sample_rate)
         self._apply_params(params)
         self._ramp = GainRamp(PARAM_RAMP_MS * 1e-3 * self.sample_rate, self.gain_db)
-        self._last_peak = -150.0
-        self._last_rms = -150.0
-        self._update_coefficients()
+        self._last_peak = DB_FLOOR_DBFS
+        self._last_rms = DB_FLOOR_DBFS
+        self._install_current()
 
-    def _update_coefficients(self) -> None:
-        self._ramp.set_gain_db(self.gain_db)
+    def _design_from(self, params: dict) -> float:
+        return float(params["gain_db"])
+
+    def _install(self, design: float) -> None:
+        self._ramp.set_gain_db(design)
 
     def process(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
@@ -37,5 +40,5 @@ class InputTrim(StageBase):
 
     def reset(self) -> None:
         self._ramp.snap()
-        self._last_peak = -150.0
-        self._last_rms = -150.0
+        self._last_peak = DB_FLOOR_DBFS
+        self._last_rms = DB_FLOOR_DBFS

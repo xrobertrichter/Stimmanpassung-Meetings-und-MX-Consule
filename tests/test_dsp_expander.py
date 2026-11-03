@@ -8,7 +8,7 @@ from voicechain.dsp.envelope import HoldMax
 from voicechain.dsp.expander import expander_gain_db
 
 DEFAULT = dict(enabled=True, threshold_db=-45.0, ratio=2.5, range_db=20.0,
-               attack_ms=5.0, hold_ms=50.0, release_ms=150.0, knee_db=6.0)
+               attack_ms=5.0, hold_ms=100.0, release_ms=250.0, knee_db=6.0)
 
 
 def test_holdmax_matches_naive_running_maximum():
@@ -44,13 +44,13 @@ def test_speech_level_is_untouched(fs, gen):
 
 
 def test_speech_with_pauses(fs, gen):
-    x, active = gen.speech_like(-20.0, 8.0, fs, seed=4, noise_rms_dbfs=-55.0, talk_s=0.6, pause_s=1.0)
+    x, active = gen.speech_like(-20.0, 10.0, fs, seed=4, noise_rms_dbfs=-55.0, talk_s=0.6, pause_s=1.5)
     y = gen.process_blocks(Expander(fs, **DEFAULT), x, 256)
-    # last 0.4 s of every pause: steady state reached
-    period = int(1.6 * fs)
+    # last 0.5 s of every 1.5 s pause: hold (100 ms) + detector (10 ms) + 2.5 release constants are over
+    period = int(2.1 * fs)
     deep = np.zeros(len(x), dtype=bool)
     for start in range(int(0.6 * fs), len(x), period):
-        deep[start + int(0.6 * fs):start + int(1.0 * fs)] = True
+        deep[start + int(1.0 * fs):start + int(1.5 * fs)] = True
     assert gen.rms_db(x[deep]) - gen.rms_db(y[deep]) >= 12.0
     assert gen.rms_db(x[~active]) - gen.rms_db(y[~active]) >= 6.0      # whole pauses on average
     assert abs(gen.rms_db(y[active]) - gen.rms_db(x[active])) < 1.0
@@ -60,19 +60,20 @@ def test_hold_keeps_gate_open_and_release_closes_it(fs, gen):
     stage = Expander(fs, **DEFAULT)
     pre = gen.white_noise(-55.0, 1.0, fs, seed=3)
     tone = gen.sine(1000.0, -17.0, 0.5, fs) + gen.white_noise(-55.0, 0.5, fs, seed=4)
-    post = gen.white_noise(-55.0, 1.5, fs, seed=5)
+    post = gen.white_noise(-55.0, 2.0, fs, seed=5)
     sig = np.concatenate([pre, tone, post])
     gain = np.concatenate([stage.gain_curve(sig[i:i + 256]) for i in range(0, len(sig), 256)])
     t_on, t_off = len(pre), len(pre) + len(tone)
     hold = int(DEFAULT["hold_ms"] * 1e-3 * fs)
     assert gain[t_on - 1] <= -13.0                           # closed before the tone (-15 dB static)
     assert np.all(gain[t_off:t_off + hold] >= -0.5)          # hold: stays open for hold_ms
+    assert gain[t_off + hold + int(0.005 * fs)] >= -0.5        # still open right after the hold (detector window)
     # closing: detector window (10 ms) + exponential release, 63 % after release_ms
     t_close = t_off + hold + int(0.010 * fs)
     at_tau = gain[t_close + int(DEFAULT["release_ms"] * 1e-3 * fs)]
-    assert -12.0 <= at_tau <= -6.0                           # ~63 % of 15 dB = 9.5 dB
+    assert -12.0 <= at_tau <= -6.0                           # ~63 % of 15 dB = 9.5 dB (measured -9.3)
     assert gain[t_close + int(2.5 * DEFAULT["release_ms"] * 1e-3 * fs)] <= -12.0
-    assert gain[-1] <= -12.5     # steady state ~ -13.7 dB: the hold keeps the most open value of the +-1 dB level ripple
+    assert gain[-1] <= -13.0     # steady state ~ -14.3 dB (static -15 dB, +-1 dB level ripple of the 10 ms window)
     # opening: 63 % of the way to 0 dB within attack_ms (+ detector window)
     g0 = gain[t_on - 1]
     t63 = np.argmax(gain[t_on:] >= g0 * (1.0 - 0.632)) / fs * 1e3
@@ -106,6 +107,7 @@ def test_disabled_passthrough_and_meters(fs, gen):
     m = on.meters()
     assert set(m) >= {"gain_reduction_db", "gain_reduction_max_db", "level_dbfs", "enabled"}
     assert 12.0 <= m["gain_reduction_db"] <= 20.0 and m["gain_reduction_max_db"] >= m["gain_reduction_db"]
+    assert m["gain_reduction_mean_db"] <= m["gain_reduction_max_db"] <= 20.0
     assert abs(m["level_dbfs"] + 55.0) < 1.5
 
 
@@ -121,3 +123,19 @@ def test_runtime_parameter_changes(fs, gen):
         stage.set_param("ratio", 0.5)
     with pytest.raises(KeyError):
         stage.get_param("nonexistent")
+
+
+def test_reduction_accumulates_between_meter_reads(fs, gen):
+    """PO-5: mean/max since the last meters() call, drained by reading; last block stays separate."""
+    stage = Expander(fs, **DEFAULT)
+    stage.process(gen.sine(1000.0, -17.0, 0.5, fs))          # open the gate
+    stage.meters()                                            # drain
+    gen.process_blocks(stage, gen.sine(1000.0, -17.0, 2.0, fs), 256)           # 2 s open: reduction 0
+    gen.process_blocks(stage, gen.white_noise(-55.0, 1.0, fs, seed=2), 256)   # closes within ~0.4 s
+    m = stage.meters()
+    assert 12.0 <= m["gain_reduction_max_db"] <= 20.0
+    assert 2.0 <= m["gain_reduction_mean_db"] <= 6.0           # ~0.6 s of ~14 dB over 3 s
+    assert 12.0 <= m["gain_reduction_db"] <= 20.0              # last block alone: closed
+    again = stage.meters()                                    # nothing processed since: accumulators empty
+    assert again["gain_reduction_mean_db"] == 0.0 and again["gain_reduction_max_db"] == 0.0
+    assert again["gain_reduction_db"] == m["gain_reduction_db"]

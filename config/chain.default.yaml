@@ -27,12 +27,13 @@ chain:
 
   expander:
     enabled: true           # false = Bypass; Rauschteppich bleibt dann in Pausen hörbar
-    threshold_db: -45.0     # Rauschteppich eines ruhigen Büros mit NT-USB ~ -53 dBFS + 8 dB Abstand
+    threshold_db: -45.0     # Rauschteppich eines ruhigen Büros mit NT-USB ~ -55 dBFS + 10 dB Abstand;
+                            # 10 dB unter der Schwelle senkt die Kennlinie (Ratio 2,5, Knie 6) um 15 dB
     ratio: 2.5              # sanfte Absenkung statt hartem Gate: Pausen werden leiser, nicht "tot"
     range_db: 20.0          # mehr als 20 dB klingt wie Ein-/Ausschalten des Raums
     attack_ms: 5.0          # öffnet innerhalb eines Silbenanlauts, ohne den ersten Konsonanten zu kappen
-    hold_ms: 50.0           # überbrückt Mikropausen zwischen Wörtern, verhindert Flattern
-    release_ms: 150.0       # schließt langsam genug, dass Ausklänge nicht abgeschnitten werden
+    hold_ms: 100.0          # überbrückt die 80–150 ms zwischen Wörtern, verhindert Flattern (PO: 50 ms zu kurz)
+    release_ms: 250.0       # Zeitkonstante des Schließens: Wortenden langsamer Sprecher bleiben ganz
     knee_db: 6.0            # weicher Übergang: Atmer und leise Silben werden nicht hart geschaltet
 
   deesser:
@@ -40,7 +41,7 @@ chain:
     freq_hz: 6500.0         # Energiemaximum von "s"/"z" beim NT-USB (Kondensator, präsenzbetont)
     bandwidth_oct: 1.0      # 4,6–9,2 kHz: deckt "s", "sch" und "z" ab, lässt "t"-Transienten zu
     threshold_db: -30.0     # Bandpegel, ab dem Zischen bei -20 dBFS Sprachpegel störend wird
-    ratio: 4.0              # kräftig genug, dass der Effekt greift, ohne zu lispeln
+    ratio: 4.0              # kräftig genug, dass der Effekt greift, ohne zu lispeln (Schema: mindestens 1.1)
     max_reduction_db: 8.0   # Schutz vor "Lispeln" bei stark zischenden Stimmen
     attack_ms: 1.0          # Zischlaute sind kurz (50–150 ms): sofort reagieren
     release_ms: 60.0        # löst innerhalb des Lauts wieder, nächste Silbe unbeeinflusst
@@ -50,16 +51,18 @@ chain:
     bands:
       - {type: peak,       freq_hz: 220.0,   gain_db: -2.0, q: 1.0}    # Nahbesprechungs-Mulm der Niere (15–25 cm)
       - {type: peak,       freq_hz: 3200.0,  gain_db: 2.0,  q: 1.2}    # Präsenz: Konsonanten und Sprachverständlichkeit
-      - {type: high_shelf, freq_hz: 10000.0, gain_db: 1.5,  q: 0.707}  # dezente "Luft", gegen dumpfen Codec-Klang
+      - {type: high_shelf, freq_hz: 10000.0, gain_db: 0.0,  q: 0.707}  # 0 dB: das NT-USB ist oben herum hell genug, ein Boost
+                                                                        # hebt nur Preamp-Rauschen und Restzischen an (PO); nur als Cut nutzen
 
   compressor:
     enabled: true           # false = Bypass
     threshold_db: -20.0     # Referenzpegel aktiver Sprache nach Input Trim: Spitzen werden verdichtet
-    ratio: 3.0              # Sprach-Standard: hörbar gleichmäßiger, noch natürlich
+    ratio: 3.0              # Sprach-Standard: hörbar gleichmäßiger, noch natürlich (Schema: mindestens 1.1)
     knee_db: 6.0            # weiches Knie: Einsatz nicht hörbar
     attack_ms: 10.0         # lässt Konsonanten-Transienten durch (Verständlichkeit)
     release_ms: 100.0       # folgt Silben, pumpt nicht
-    makeup_db: 0.0          # Lautheit regelt der Normalizer, nicht der Kompressor
+    makeup_db: 0.0          # Startwert; die Kalibrierung setzt die statische Reduktion an den Sprachspitzen
+                            # (typisch 4–7 dB), die Feinregelung übernimmt der Normalizer
 
   normalizer:
     enabled: true           # false = Bypass, Messung läuft weiter (Meter bleiben gültig)
@@ -67,8 +70,10 @@ chain:
     window_s: 3.0           # Short-Term-Lautheit nach BS.1770 (3 s)
     max_gain_db: 12.0       # mehr würde Rauschen in leisen Passagen hochziehen
     min_gain_db: -12.0      # Schutz gegen "Reinbrüllen"
-    rate_db_per_s: 1.0      # langsam wie eine Hand am Fader: keine hörbare Regelbewegung
-    gate_lufs: -40.0        # unterhalb: Pause → Gain einfrieren, Stille wird nicht hochgezogen
+    rate_db_per_s: 1.0      # Aufwärtsrate, langsam wie eine Hand am Fader: keine hörbare Regelbewegung
+    release_rate_db_per_s: 3.0  # Abwärtsrate (optional, Default 3): ein zu lauter Satzanfang ist in 2 s gezähmt
+    gate_lufs: -40.0        # absolutes Gate auf die Momentary-Lautheit (400 ms): darunter Pause → Gain einfrieren;
+                            # zusätzlich relatives Gate 10 LU unter der Sprachlautheit; Kalibrierung setzt Teppich + 8
 
   limiter:
     enabled: true           # false = Bypass; Achtung: entfernt auch die Lookahead-Latenz
@@ -83,6 +88,6 @@ adaptive:
   max_step_db: 0.5          # maximale Änderung je Eingriff (langsam, unauffällig)
   log_path: "logs/adaptive.jsonl"   # JSONL-Protokoll jeder Änderung mit Grund
   bounds:                   # harte Grenzen je nachgeführtem Parameter [min, max]
-    expander.threshold_db: [-70.0, -30.0]     # folgt dem Rauschteppich (+8 dB), nie über -30 dBFS
+    expander.threshold_db: [-70.0, -30.0]     # folgt dem Rauschteppich (+10 dB), nie über -30 dBFS
     deesser.threshold_db: [-45.0, -15.0]      # folgt dem Zischanteil
     compressor.threshold_db: [-35.0, -10.0]   # folgt dem Sprachpegel

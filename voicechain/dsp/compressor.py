@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from voicechain.dsp import StageBase
-from voicechain.dsp.envelope import PARAM_RAMP_MS, AttackReleaseSmoother, GainRamp, amp_to_db, db_to_amp
+from voicechain.dsp import DB_FLOOR_DBFS, StageBase
+from voicechain.dsp.envelope import (
+    PARAM_RAMP_MS, AttackReleaseSmoother, GainRamp, ReductionAccumulator, amp_to_db, db_to_amp,
+)
 
 
 def compressor_reduction_db(level_db: np.ndarray, threshold_db: float, ratio: float,
@@ -38,7 +40,9 @@ def compressor_reduction_db(level_db: np.ndarray, threshold_db: float, ratio: fl
 class Compressor(StageBase):
     PARAM_RANGES = {
         "threshold_db": (-60.0, 0.0),
-        "ratio": (1.0, 20.0),          # 1 = off, 20 = practically limiting
+        # 1.1 is the smallest ratio that still compresses measurably; exactly 1.0
+        # ("off") would make the calibration's threshold derivation divide by zero.
+        "ratio": (1.1, 20.0),
         "knee_db": (0.0, 24.0),
         "attack_ms": (0.1, 500.0),
         "release_ms": (1.0, 5000.0),
@@ -51,14 +55,17 @@ class Compressor(StageBase):
         self._apply_params(params)
         self._smoother = AttackReleaseSmoother(self.sample_rate, self.attack_ms, self.release_ms)
         self._makeup = GainRamp(PARAM_RAMP_MS * 1e-3 * self.sample_rate, self.makeup_db)
-        self._last_reduction_mean = 0.0
-        self._last_reduction_max = 0.0
-        self._last_level = -150.0
-        self._update_coefficients()
+        self._reduction = ReductionAccumulator()
+        self._last_level = DB_FLOOR_DBFS
+        self._install_current()
 
-    def _update_coefficients(self) -> None:
-        self._smoother.set_times(self.attack_ms, self.release_ms)
-        self._makeup.set_gain_db(self.makeup_db)
+    def _design_from(self, params: dict) -> dict:
+        return {"attack_ms": params["attack_ms"], "release_ms": params["release_ms"],
+                "makeup_db": params["makeup_db"]}
+
+    def _install(self, design: dict) -> None:
+        self._smoother.set_times(design["attack_ms"], design["release_ms"])
+        self._makeup.set_gain_db(design["makeup_db"])
 
     def reduction_curve(self, x: np.ndarray) -> np.ndarray:
         """Smoothed gain reduction in dB (>= 0) for a block, without applying it."""
@@ -70,25 +77,24 @@ class Compressor(StageBase):
     def process(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
         if not self.enabled or x.size == 0:
-            self._last_reduction_mean = 0.0
-            self._last_reduction_max = 0.0
+            self._reduction.add_zeros(x.size)
             return x
         reduction = self.reduction_curve(x)
-        self._last_reduction_mean = float(np.mean(reduction))
-        self._last_reduction_max = float(np.max(reduction))
+        self._reduction.add(reduction)
         return x * (db_to_amp(-reduction) * self._makeup.process(x.size))
 
     def meters(self) -> dict:
+        mean, peak = self._reduction.read()
         return {
             "enabled": float(self.enabled),
-            "gain_reduction_db": self._last_reduction_mean,
-            "gain_reduction_max_db": self._last_reduction_max,
+            "gain_reduction_db": self._reduction.last_mean,
+            "gain_reduction_mean_db": mean,
+            "gain_reduction_max_db": peak,
             "level_dbfs": self._last_level,
         }
 
     def reset(self) -> None:
         self._smoother.reset()
         self._makeup.snap()
-        self._last_reduction_mean = 0.0
-        self._last_reduction_max = 0.0
-        self._last_level = -150.0
+        self._reduction.reset()
+        self._last_level = DB_FLOOR_DBFS

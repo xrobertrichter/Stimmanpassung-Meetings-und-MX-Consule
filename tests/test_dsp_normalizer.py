@@ -29,9 +29,9 @@ def test_reference_loudness_of_sine(fs, gen):
     x = gen.sine(1000.0, -27.0, 5.0, fs)          # -30 dBFS RMS -> -30 LUFS at 1 kHz
     assert abs(loudness_lufs(x, fs) + 30.0) < 0.05
     stage = Normalizer(fs, **DEFAULT)
-    estimate = np.concatenate([stage.loudness_curve(x[i:i + 1024]) for i in range(0, len(x), 1024)])
+    estimate = np.concatenate([stage.momentary_curve(x[i:i + 1024]) for i in range(0, len(x), 1024)])
     assert abs(estimate[-1] + 30.0) < 0.1
-    assert abs(estimate[fs // 2] + 30.0) < 0.1     # bias correction: valid long before window_s
+    assert abs(estimate[fs // 20] + 30.0) < 0.1    # bias correction: valid long before the 400 ms window
 
 
 def test_quiet_signal_is_pulled_to_target_within_rate_limit(fs, gen):
@@ -97,7 +97,10 @@ def test_max_gain_can_be_changed_at_runtime(fs, gen):
     assert stage.get_param("max_gain_db") == 6.0
     _, gains = _run(stage, x[10 * fs:], 1024)
     assert np.all(gains <= 10.0 + 1e-12) and abs(gains[-1] - 6.0) < 0.05   # ramps down to the new cap
-    assert np.min(np.diff(gains)) >= -DEFAULT["rate_db_per_s"] * 1024 / fs * (1 + 1e-9)
+    release_rate = stage.get_param("release_rate_db_per_s")                  # default 3 dB/s downwards
+    assert release_rate == 3.0
+    assert np.min(np.diff(gains)) >= -release_rate * 1024 / fs * (1 + 1e-9)
+    assert abs(np.min(np.diff(gains)) + release_rate * 1024 / fs) < 1e-9     # and it does use the full rate
 
 
 def test_validation(fs):
@@ -108,3 +111,69 @@ def test_validation(fs):
         stage.set_param("target_lufs", 0.0)
     stage.set_param("rate_db_per_s", 2.0)
     assert stage.get_param("rate_db_per_s") == 2.0
+
+
+def _speech_pause_speech(gen, fs, noise_dbfs, seed=11):
+    """PO-1 scenario: 30 s speech, 20 s pause (noise only), 20 s speech; speech at -20 dBFS RMS."""
+    first, _ = gen.speech_like(-20.0, 30.0, fs, seed=seed, noise_rms_dbfs=noise_dbfs)
+    pause = gen.white_noise(noise_dbfs, 20.0, fs, seed=seed + 1)
+    second, _ = gen.speech_like(-20.0, 20.0, fs, seed=seed + 2, noise_rms_dbfs=noise_dbfs)
+    return np.concatenate([first, pause, second])
+
+
+@pytest.mark.parametrize("noise_dbfs, gate_lufs", [
+    (-50.0, DEFAULT["gate_lufs"]),   # quiet room: the default absolute gate (-40 LUFS) sees the pause
+    (-42.0, -30.0),                  # fan: calibrated gate (floor + 8 LU) as calibrate.recommend sets it (PO-1 d)
+])
+def test_long_pause_freezes_gain_and_next_sentence_is_not_louder(fs, gen, noise_dbfs, gate_lufs):
+    """PO-1: the gain must not creep up during a 20 s pause; the first sentence afterwards
+    is at most 1 dB louder than the last one before."""
+    x = _speech_pause_speech(gen, fs, noise_dbfs)
+    y, gains = _run(Normalizer(fs, **{**DEFAULT, "gate_lufs": gate_lufs}), x, 256)
+    per_s = fs / 256
+    in_pause = gains[int(30 * per_s):int(50 * per_s)]
+    assert np.max(in_pause) - np.min(in_pause) <= 1.0
+    assert abs(gains[int(50 * per_s)] - gains[int(30 * per_s)]) <= 1.0
+    before = loudness_lufs(y[29 * fs:30 * fs], fs)
+    after = loudness_lufs(y[int(50.5 * fs):int(51.5 * fs)], fs)
+    assert after <= before + 1.0
+    assert gains[int(30 * per_s)] > 1.0          # it did regulate the quiet speech upwards before the pause
+
+
+def test_relative_gate_freezes_pause_above_absolute_gate(fs, gen):
+    """A pause 13 LU below the speech but above the absolute gate is still frozen (relative gate)."""
+    x = _speech_pause_speech(gen, fs, -45.0, seed=21)                    # pause ~ -41.5 LUFS (K-weighted)
+    y, gains = _run(Normalizer(fs, **{**DEFAULT, "gate_lufs": -60.0}), x, 256)
+    per_s = fs / 256
+    in_pause = gains[int(31 * per_s):int(50 * per_s)]
+    assert np.max(in_pause) - np.min(in_pause) <= 0.5
+    assert loudness_lufs(y[int(50.5 * fs):int(51.5 * fs)], fs) <= loudness_lufs(y[29 * fs:30 * fs], fs) + 1.0
+
+
+def test_gain_does_not_rise_on_a_decaying_envelope(fs, gen):
+    """Sine -30 LUFS that fades out over 2 s: the gain climbs during the plateau, not during the fade."""
+    plateau = gen.sine(1000.0, -27.0, 4.0, fs)
+    t = np.arange(2 * fs) / fs
+    fade = gen.sine(1000.0, -27.0, 2.0, fs) * 10 ** (-30.0 * t / 20.0)   # -30 dB/s: a word end, well above 10 LU/s
+    stage = Normalizer(fs, **DEFAULT)
+    _, g_plateau = _run(stage, plateau, 256)
+    _, g_fade = _run(stage, fade, 256)
+    assert g_plateau[-1] > 3.5                                # ~1 dB/s during the plateau
+    # Without the rule the gain would keep climbing at 1 dB/s (+2 dB over the fade, the gate
+    # only closes after ~0.7 s). The 400 ms detector needs ~0.1 s to register the fall, hence
+    # a residual rise of at most 0.25 dB is tolerated.
+    assert np.max(g_fade) <= g_plateau[-1] + 0.25
+    assert g_fade[-1] <= g_plateau[-1] + 0.25
+
+
+def test_asymmetric_rates(fs, gen):
+    loud = gen.sine(1000.0, 3.0, 10.0, fs)                    # 0 LUFS: 12 dB too loud -> cap -12
+    y, gains = _run(Normalizer(fs, **DEFAULT), loud, 1024)
+    per_s = fs / 1024
+    assert abs(gains[int(2.0 * per_s)] + 6.0) < 0.2           # 3 dB/s downwards
+    quiet = gen.sine(1000.0, -27.0, 10.0, fs)
+    y, gains = _run(Normalizer(fs, **DEFAULT), quiet, 1024)
+    assert abs(gains[int(2.0 * per_s)] - 2.0) < 0.2           # 1 dB/s upwards
+    fast = Normalizer(fs, **{**DEFAULT, "release_rate_db_per_s": 6.0})
+    y, gains = _run(fast, loud, 1024)
+    assert abs(gains[int(1.0 * per_s)] + 6.0) < 0.2

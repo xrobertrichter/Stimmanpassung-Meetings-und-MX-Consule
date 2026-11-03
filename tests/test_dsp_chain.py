@@ -1,5 +1,7 @@
 """Whole chain: contract of docs/00_Beauftragung.md 4.2/4.3 and end-to-end behaviour."""
 
+import copy
+import threading
 import time
 
 import numpy as np
@@ -7,8 +9,18 @@ import pytest
 from scipy.signal import sosfilt
 
 from voicechain.config import default_config_path, load_config
-from voicechain.dsp import Chain, STAGE_ORDER
+from voicechain.dsp import (
+    DB_FLOOR_DBFS, Chain, Compressor, DeEsser, Equalizer, Expander, HighPass, InputTrim, Limiter,
+    Normalizer, STAGE_ORDER,
+)
 from voicechain.dsp.biquad import k_weighting_sos
+
+# The order of the "On Air" reference chain, written out literally (not derived from
+# STAGE_ORDER) so that a mutated constant is caught (review SW-3).
+EXPECTED_ORDER = (
+    ("input_trim", InputTrim), ("highpass", HighPass), ("expander", Expander), ("deesser", DeEsser),
+    ("eq", Equalizer), ("compressor", Compressor), ("normalizer", Normalizer), ("limiter", Limiter),
+)
 
 
 @pytest.fixture
@@ -26,7 +38,10 @@ def _run(chain, x, block):
 
 
 def test_from_config_and_stage_order(chain, cfg):
-    assert tuple(chain.stages) == STAGE_ORDER
+    assert tuple(chain.stages) == tuple(name for name, _ in EXPECTED_ORDER)
+    assert STAGE_ORDER == tuple(name for name, _ in EXPECTED_ORDER)
+    for (name, cls), (actual_name, stage) in zip(EXPECTED_ORDER, chain.stages.items()):
+        assert actual_name == name and type(stage) is cls
     assert chain.sample_rate == cfg["sample_rate"]
     assert chain.latency_samples == int(round(cfg["chain"]["limiter"]["lookahead_ms"] * 1e-3 * cfg["sample_rate"]))
     with pytest.raises(ValueError, match="chain"):
@@ -57,7 +72,8 @@ def test_silence_in_silence_out(chain, fs):
     assert not np.any(np.isnan(y))
     assert np.max(np.abs(y)) < 1e-6
     m = chain.get_meters()
-    assert m["output"]["peak_dbfs"] <= -150.0 and m["normalizer"]["gain_db"] == 0.0
+    assert m["output"]["peak_dbfs"] == DB_FLOOR_DBFS == -150.0 and m["normalizer"]["gain_db"] == 0.0
+    assert m["expander"]["level_dbfs"] == DB_FLOOR_DBFS
 
 
 def test_reset_restores_initial_state(cfg, fs, gen):
@@ -110,8 +126,10 @@ def test_meters_contain_all_contract_keys(chain, fs, gen):
     for stage in ("expander", "deesser", "compressor", "limiter"):
         assert "gain_reduction_db" in m[stage]
     assert "gain_db" in m["normalizer"]
+    assert set(m["input"]) == {"peak_dbfs", "rms_dbfs", "nonfinite_blocks"}
+    assert set(m["output"]) == {"peak_dbfs", "rms_dbfs"}
+    assert m["input"]["nonfinite_blocks"] == 0.0
     for side in ("input", "output"):
-        assert set(m[side]) == {"peak_dbfs", "rms_dbfs"}
         assert -150.0 < m[side]["rms_dbfs"] <= m[side]["peak_dbfs"] <= 0.0
 
 
@@ -134,7 +152,7 @@ def test_impulse_latency(chain, fs):
 
 
 def test_end_to_end_speech(chain, fs, gen):
-    x, active = gen.speech_like(-20.0, 20.0, fs, seed=4, noise_rms_dbfs=-55.0, talk_s=0.6, pause_s=1.0)
+    x, active = gen.speech_like(-20.0, 40.0, fs, seed=4, noise_rms_dbfs=-55.0, talk_s=0.6, pause_s=1.0)
     y = _run(chain, x.astype(np.float32), 256).astype(np.float64)
     d = chain.latency_samples
     y, x, active = y[d:], x[:-d], active[:-d]
@@ -146,12 +164,132 @@ def test_end_to_end_speech(chain, fs, gen):
         return np.percentile(10 * np.log10(np.mean(frames ** 2, axis=1)), 10)
     speech_to_floor_in = gen.rms_db(x[active]) - floor_db(x)
     speech_to_floor_out = gen.rms_db(y[active]) - floor_db(y)
-    assert speech_to_floor_out - speech_to_floor_in >= 6.0
+    assert speech_to_floor_out - speech_to_floor_in >= 6.0          # Beauftragung 6.3: SNR gain
     assert gen.true_peak_dbfs(y) <= -1.0
+    # Loudness target: the normaliser regulates the *speech* (gated, BS.1770 style). After the
+    # settling time (effective ~0.4 dB/s with pauses and falling syllables) the K-weighted
+    # loudness of the active part sits at -18 LUFS +-2 LU; 3 s windows that contain the 40 %
+    # pauses of this synthetic signal read about 2-3 LU lower.
     weighted = sosfilt(k_weighting_sos(fs), y)
-    for start in range(14 * fs, 17 * fs, fs):
+    tail = slice(30 * fs, len(y))
+    active_loudness = -0.691 + 10 * np.log10(np.mean(weighted[tail][active[tail]] ** 2))
+    assert abs(active_loudness + 18.0) <= 2.0
+    for start in range(33 * fs, 37 * fs, fs):
         short_term = -0.691 + 10 * np.log10(np.mean(weighted[start:start + 3 * fs] ** 2))
-        assert abs(short_term + 18.0) <= 2.0
+        assert -22.0 <= short_term <= -16.0
+
+
+def test_long_pause_in_calibrated_chain(cfg, fs, gen):
+    """PO-1 on the whole chain with calibration-like thresholds: speech 30 s, pause 20 s, speech 20 s."""
+    for noise_dbfs in (-50.0, -42.0):
+        first, _ = gen.speech_like(-26.0, 30.0, fs, seed=11, noise_rms_dbfs=noise_dbfs)
+        pause = gen.white_noise(noise_dbfs, 20.0, fs, seed=12)
+        second, _ = gen.speech_like(-26.0, 20.0, fs, seed=13, noise_rms_dbfs=noise_dbfs)
+        x = np.concatenate([first, pause, second])
+        c = copy.deepcopy(cfg)
+        c["chain"]["input_trim"]["gain_db"] = 6.0                          # speech -26 -> -20 dBFS RMS
+        c["chain"]["expander"]["threshold_db"] = noise_dbfs + 6.0 + 10.0   # floor after trim + 10 dB
+        c["chain"]["compressor"]["makeup_db"] = 6.0                        # static reduction at the peaks
+        chain = Chain.from_config(c)
+        out, gains = [], []
+        for i in range(0, len(x), 256):
+            out.append(chain.process(x[i:i + 256].astype(np.float32)))
+            gains.append(chain.get_meters()["normalizer"]["gain_db"])
+        y = np.concatenate(out).astype(np.float64)
+        gains = np.array(gains)
+        per_s = fs / 256
+        in_pause = gains[int(30 * per_s):int(50 * per_s)]
+        assert np.max(in_pause) - np.min(in_pause) <= 1.0                 # gain frozen during the pause
+        snr_in = gen.rms_db(x[20 * fs:30 * fs]) - gen.rms_db(x[32 * fs:49 * fs])
+        snr_out = gen.rms_db(y[20 * fs:30 * fs]) - gen.rms_db(y[32 * fs:49 * fs])
+        assert snr_out - snr_in >= 6.0                                    # pause lowered relative to speech
+        assert gen.rms_db(y[int(50.5 * fs):int(51.5 * fs)]) <= gen.rms_db(y[29 * fs:30 * fs]) + 1.0
+        assert abs(gen.rms_db(y[20 * fs:30 * fs]) + 18.0) <= 2.0          # speech sits near the target
+
+
+def test_nonfinite_input_block_is_replaced_and_state_recovers(chain, fs, gen):
+    """SW-1: a NaN/Inf block must not poison the filter states."""
+    x = gen.sine(1000.0, -20.0, 1.0, fs).astype(np.float32)
+    reference = _run(Chain.from_config(load_config(default_config_path())), x, 256)
+    poisoned = x.copy()
+    poisoned[300] = np.nan
+    poisoned[600] = np.inf
+    y = _run(chain, poisoned, 256)
+    assert np.isfinite(y).all()
+    assert np.max(np.abs(y[256:768])) == 0.0                          # the two bad blocks become silence
+    assert chain.get_meters()["input"]["nonfinite_blocks"] == 2.0
+    # from the reset state on, the chain behaves exactly like a fresh chain fed with the clean tail
+    fresh = Chain.from_config(load_config(default_config_path()))
+    expected = _run(fresh, x[768:], 256)
+    assert np.array_equal(y[768:], expected)
+    assert np.max(np.abs(y[-fs // 2:])) > 0.05 and np.max(np.abs(reference[-fs // 2:])) > 0.05
+
+
+def test_swapping_deesser_and_compressor_changes_the_result(cfg, fs, gen):
+    """SW-3: a behavioural check of the order. Sibilance bursts on a loud tone: with the de-esser
+    *before* the compressor the bursts are tamed before the compressor sees them."""
+    bursts, mask = gen.sibilance_bursts(-10.0, 3.0, fs, seed=5)
+    x = (gen.sine(1000.0, -12.0, 3.0, fs) + bursts).astype(np.float32)
+
+    def run_order(order):
+        c = copy.deepcopy(cfg)
+        stages = {name: Chain.from_config(c).stage(name) for name in order}
+        y = x.astype(np.float64)
+        for name in order:
+            y = stages[name].process(y)
+        return y
+    correct = ("input_trim", "highpass", "expander", "deesser", "eq", "compressor", "normalizer", "limiter")
+    swapped = ("input_trim", "highpass", "expander", "compressor", "eq", "deesser", "normalizer", "limiter")
+    y_chain = _run(Chain.from_config(cfg), x, len(x)).astype(np.float64)
+    y_correct = run_order(correct)
+    y_swapped = run_order(swapped)
+    assert np.max(np.abs(y_chain - y_correct)) < 1e-6
+    band = lambda sig: gen.band_rms_db(sig[mask], 5000.0, 9000.0, fs)
+    assert abs(band(y_correct) - band(y_swapped)) >= 0.5
+    assert np.max(np.abs(y_chain - y_swapped)) > 1e-3
+
+
+def test_concurrent_set_param_and_process(cfg, fs, gen):
+    """SW-9 / mutation M15: without the chain lock this produces shape errors or NaN."""
+    x, _ = gen.speech_like(-20.0, 3.0, fs, seed=1)
+    x = x.astype(np.float32)
+    for _ in range(3):
+        chain = Chain.from_config(cfg)
+        errors, stop = [], threading.Event()
+
+        def setter():
+            k = 0
+            while not stop.is_set():
+                try:
+                    chain.set_param("highpass", "order", 2.0 if k % 2 else 4.0)     # changes the SOS section count
+                    chain.set_param("eq", "bands.1.gain_db", 1.0 + k % 3)
+                    chain.set_param("deesser", "freq_hz", 6000.0 + 100.0 * (k % 5))
+                    chain.set_param("limiter", "lookahead_ms", 5.0 if k % 2 else 6.0)
+                    chain.set_param("expander", "hold_ms", 50.0 + 10.0 * (k % 4))
+                except Exception as exc:                                              # noqa: BLE001 - recorded, asserted below
+                    errors.append(repr(exc))
+                k += 1
+        worker = threading.Thread(target=setter)
+        worker.start()
+        try:
+            for i in range(0, len(x), 256):
+                y = chain.process(x[i:i + 256])
+                assert y.shape == x[i:i + 256].shape
+                assert np.isfinite(y).all()
+        finally:
+            stop.set()
+            worker.join()
+        assert errors == []
+
+
+def test_get_meters_drains_accumulators(chain, fs, gen):
+    x = gen.sine(1000.0, -1.0, 0.5, fs).astype(np.float32)     # above compressor threshold and limiter ceiling
+    _run(chain, x, 256)
+    first = chain.get_meters()
+    assert first["compressor"]["gain_reduction_max_db"] > 5.0 and first["limiter"]["gain_reduction_max_db"] > 0.0
+    second = chain.get_meters()
+    assert second["compressor"]["gain_reduction_max_db"] == 0.0 and second["compressor"]["gain_reduction_mean_db"] == 0.0
+    assert second["compressor"]["gain_reduction_db"] == first["compressor"]["gain_reduction_db"]
 
 
 def test_runtime_budget(chain, fs, gen):

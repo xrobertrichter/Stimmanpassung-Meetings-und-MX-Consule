@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from voicechain.dsp import StageBase
+from voicechain.dsp import DB_FLOOR_DBFS, StageBase
 from voicechain.dsp.envelope import (
-    AttackReleaseSmoother, HoldMax, MovingAverage, db_to_amp, power_to_db,
+    AttackReleaseSmoother, HoldMax, MovingAverage, ReductionAccumulator, db_to_amp, power_to_db,
 )
 
 
@@ -72,24 +72,25 @@ class Expander(StageBase):
     def __init__(self, sample_rate: int, **params):
         super().__init__(sample_rate)
         self._apply_params(params)
-        self._detector = MovingAverage(self._detector_samples())
-        self._hold = HoldMax(self._hold_samples(), fill_value=0.0)
+        self._detector = MovingAverage(1)
+        self._hold = HoldMax(1, fill_value=0.0)
         self._smoother = AttackReleaseSmoother(self.sample_rate, self.attack_ms, self.release_ms)
-        self._last_gain_mean = 0.0
-        self._last_gain_min = 0.0
-        self._last_level = -150.0
-        self._update_coefficients()
+        self._reduction = ReductionAccumulator()
+        self._last_level = DB_FLOOR_DBFS
+        self._install_current()
 
-    def _hold_samples(self) -> int:
-        return int(round(self.hold_ms * 1e-3 * self.sample_rate))
+    def _design_from(self, params: dict) -> dict:
+        return {
+            "detector_samples": int(round(params["detector_ms"] * 1e-3 * self.sample_rate)),
+            "hold_samples": int(round(params["hold_ms"] * 1e-3 * self.sample_rate)),
+            "attack_ms": params["attack_ms"],
+            "release_ms": params["release_ms"],
+        }
 
-    def _detector_samples(self) -> int:
-        return int(round(self.detector_ms * 1e-3 * self.sample_rate))
-
-    def _update_coefficients(self) -> None:
-        self._detector.set_window(self._detector_samples())
-        self._hold.set_hold(self._hold_samples())
-        self._smoother.set_times(self.attack_ms, self.release_ms)
+    def _install(self, design: dict) -> None:
+        self._detector.set_window(design["detector_samples"])
+        self._hold.set_hold(design["hold_samples"])
+        self._smoother.set_times(design["attack_ms"], design["release_ms"])
 
     def gain_curve(self, x: np.ndarray) -> np.ndarray:
         """Return the smoothed gain in dB for a block *without* applying it (analysis)."""
@@ -103,19 +104,19 @@ class Expander(StageBase):
     def process(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
         if not self.enabled or x.size == 0:
-            self._last_gain_mean = 0.0
-            self._last_gain_min = 0.0
+            self._reduction.add_zeros(x.size)
             return x
         gain_db = self.gain_curve(x)
-        self._last_gain_mean = float(np.mean(gain_db))
-        self._last_gain_min = float(np.min(gain_db))
+        self._reduction.add(-gain_db)
         return x * db_to_amp(gain_db)
 
     def meters(self) -> dict:
+        mean, peak = self._reduction.read()
         return {
             "enabled": float(self.enabled),
-            "gain_reduction_db": 0.0 - self._last_gain_mean,
-            "gain_reduction_max_db": 0.0 - self._last_gain_min,
+            "gain_reduction_db": self._reduction.last_mean,
+            "gain_reduction_mean_db": mean,
+            "gain_reduction_max_db": peak,
             "level_dbfs": self._last_level,
         }
 
@@ -123,6 +124,5 @@ class Expander(StageBase):
         self._detector.reset()
         self._hold.reset()
         self._smoother.reset()
-        self._last_gain_mean = 0.0
-        self._last_gain_min = 0.0
-        self._last_level = -150.0
+        self._reduction.reset()
+        self._last_level = DB_FLOOR_DBFS

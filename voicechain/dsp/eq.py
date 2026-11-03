@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 
 from voicechain.dsp import StageBase, _as_bool
@@ -67,16 +69,16 @@ class Equalizer(StageBase):
             raise ValueError(f"Equalizer: 'bands' must be a list, got {type(bands).__name__}")
         self.enabled = _as_bool("enabled", enabled)
         self.bands = [validate_band(b, self.sample_rate, i) for i, b in enumerate(bands)]
-        self._filter = SosFilter(self._design(), fade_samples=int(round(PARAM_RAMP_MS * 1e-3 * self.sample_rate)))
-        self._update_coefficients()
+        self._filter = SosFilter(self._design_from(self.bands),
+                                 fade_samples=int(round(PARAM_RAMP_MS * 1e-3 * self.sample_rate)))
 
-    def _design(self) -> np.ndarray:
-        if not self.bands:
+    def _design_from(self, bands: list) -> np.ndarray:
+        if not bands:
             return _IDENTITY_SOS.copy()
-        return np.vstack([band_sos(b, self.sample_rate) for b in self.bands])
+        return np.vstack([band_sos(b, self.sample_rate) for b in bands])
 
-    def _update_coefficients(self) -> None:
-        self._filter.set_sos(self._design())
+    def _install(self, design: np.ndarray) -> None:
+        self._filter.set_sos(design)
 
     @property
     def sos(self) -> np.ndarray:
@@ -97,15 +99,20 @@ class Equalizer(StageBase):
             raise KeyError(f"Equalizer: band index {index} out of range (have {len(self.bands)} bands)")
         return index, parts[2]
 
-    def set_param(self, name: str, value: float) -> None:
+    def set_param(self, name: str, value: float, lock=None) -> None:
+        """Validate and design outside ``lock``; swap bands and coefficients inside it."""
         if name == "enabled":
             self.enabled = _as_bool(name, value)
             return
         index, field = self._split(name)
         candidate = dict(self.bands[index])
         candidate[field] = float(value)
-        self.bands[index] = validate_band(candidate, self.sample_rate, index)
-        self._update_coefficients()
+        new_bands = list(self.bands)
+        new_bands[index] = validate_band(candidate, self.sample_rate, index)
+        design = self._design_from(new_bands)
+        with (lock if lock is not None else contextlib.nullcontext()):
+            self.bands = new_bands
+            self._install(design)
 
     def get_param(self, name: str) -> float:
         if name == "enabled":

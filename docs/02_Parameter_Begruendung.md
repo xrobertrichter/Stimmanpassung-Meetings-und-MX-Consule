@@ -1,6 +1,6 @@
 # Parameter-Begründung: DSP-Kette voicechain
 
-Stand: 2026-11-02 · Gilt für `config/chain.default.yaml` und die Umsetzung in `voicechain/dsp/`.
+Stand: 2026-11-03 (nach Prüfrunde 1) · Gilt für `config/chain.default.yaml` und die Umsetzung in `voicechain/dsp/`.
 
 Alle Pegel in dBFS (0 dBFS = Vollaussteuerung). Für Sinussignale ist der Pegel als Spitzenwert
 gemeint (AES17: Vollaussteuerungs-Sinus = 0 dBFS), für Rauschen als RMS. Die Startwerte sind für
@@ -24,10 +24,30 @@ unterschiedliche Grenzen haben.
 
 Rechenzeit (gemessen in diesem Container, 4 Kerne, Python 3.13, numpy 2.5, scipy 1.18): 10 s Audio in
 Blöcken von 256 Samples laufen in 0,76–0,83 s durch die ganze Kette, also rund **400–450 µs je Block**
-(Echtzeitfaktor 0,08). Anteile je Stufe (µs/Block): Input Trim 7, HPF 19, Expander 69, De-Esser 69,
-EQ 19, Kompressor 41, Normalizer 55, Limiter 37. Keine Python-Schleife läuft über einzelne Samples;
+(Echtzeitfaktor 0,08). Anteile je Stufe (µs/Block): Input Trim 7, HPF 19, Expander 83, De-Esser 74,
+EQ 19, Kompressor 45, Normalizer 61, Limiter 43. Keine Python-Schleife läuft über einzelne Samples;
 die nichtlinearen Hüllkurven werden geschlossen vektorisiert gerechnet (siehe Abschnitt 9). Auf
 einem M-Chip ist deutlich weniger zu erwarten; das Budget < 1 ms wird auch hier eingehalten.
+
+**Meter und Robustheit (Prüfbefunde PO-5, SW-1):** Expander, De-Esser, Kompressor und Limiter
+liefern in `meters()` neben `gain_reduction_db` (Mittel des letzten Blocks) auch
+`gain_reduction_mean_db` und `gain_reduction_max_db` als Mittel bzw. Maximum **seit dem letzten
+Auslesen**; das Auslesen (`Chain.get_meters()`) leert den Akkumulator. Die adaptive Regelung sieht
+damit alle 2 s das ganze Intervall und nicht einen 5-ms-Schnappschuss. `Chain.process` prüft jeden
+Block auf NaN/Inf: ein nicht-finiter Block wird durch Stille ersetzt, alle Stufen werden in den
+Anfangszustand versetzt und `get_meters()["input"]["nonfinite_blocks"]` zählt das Ereignis; die
+Kette läuft danach exakt wie eine frisch gebaute weiter (Test). Alle Pegelmeter benutzen denselben
+Boden `voicechain.dsp.DB_FLOOR_DBFS = −150 dBFS` (6 dB unter dem Quantisierungsrauschen eines
+24-Bit-Wandlers), damit Stille endliche Zahlen liefert und Stufen-, Analyse- und Statuswerte
+vergleichbar sind.
+
+**Parameteränderungen im Betrieb:** `set_param` validiert den Wert und entwirft die neuen
+Koeffizienten *außerhalb* des Ketten-Locks; nur der Tausch läuft unter dem Lock (Mikrosekunden).
+Schlägt Validierung oder Entwurf fehl, bleibt der alte Wert vollständig erhalten (Test:
+`HighPass.set_param("order", 4.5)` → Fehler, Ordnung bleibt 4, Ausgang identisch). `process`
+hält das Lock für die Dauer eines Blocks (~0,4 ms von 5,3 ms Blockperiode). Ein Test lässt einen
+Thread im Dauerfeuer Parameter setzen (inklusive Ordnungswechsel des HPF), während ein anderer
+verarbeitet; ohne Lock entstehen dabei Formfehler, mit Lock keine.
 
 ## 1. Input Trim (`chain.input_trim`)
 
@@ -82,12 +102,12 @@ Gains selbst hätte die Absenkung im Rauschen um ~1 dB Richtung "offen" verfäls
 | Parameter | Startwert | Bereich | Begründung |
 |---|---|---|---|
 | `enabled` | true | – | |
-| `threshold_db` | −45.0 | −90…0 (adaptiv −70…−30) | Rauschteppich eines ruhigen Büros mit NT-USB liegt bei etwa −53 dBFS; +8 dB Abstand, damit Rauschspitzen die Schwelle nicht erreichen. Die Kalibrierung setzt Rauschteppich + 8 dB. |
+| `threshold_db` | −45.0 | −90…0 (adaptiv −70…−30) | Rauschteppich eines ruhigen Büros mit NT-USB liegt bei etwa −55 dBFS; +10 dB Abstand, damit Rauschspitzen die Schwelle nicht erreichen und die Kennlinie am Teppich voll greift: 10 dB unter der Schwelle ergeben mit Ratio 2,5 und Knie 6 eine Absenkung von 15 dB (Knie wirkt nur ±3 dB um die Schwelle). Die Kalibrierung setzt Rauschteppich + 10 dB (Entscheidung PL 2026-11-03). |
 | `ratio` | 2.5 | 1–10 | Unterhalb der Schwelle wird jedes dB zu 2,5 dB: 10 dB unter der Schwelle → 15 dB leiser. Sanfter als ein Gate (∞), aber hörbar wirksam. |
 | `range_db` | 20.0 | 0–60 | Maximale Absenkung. Mehr als 20 dB klingt wie Ein-/Ausschalten des Raums ("Atmen" der Kette); 20 dB reicht, um Lüfter unter die Wahrnehmungsschwelle der Gegenseite zu bringen. |
 | `attack_ms` | 5.0 | 0.1–500 | Zeit zum Öffnen (63 %). 5 ms + 10 ms Detektorfenster: der erste Konsonant einer Silbe kommt ungekappt durch. |
-| `hold_ms` | 50.0 | 0–1000 | Überbrückt Mikropausen zwischen Wörtern und Silben; verhindert Flattern ("Chattering"). Test: ein 20-ms-Loch im Signal verändert den Gain nicht. |
-| `release_ms` | 150.0 | 1–5000 | Zeitkonstante (63 %) des Schließens nach Hold und Detektorfenster; ~80 % der Absenkung nach 2,5 × release. Schnell genug, dass Pausen ab ~0,4 s hörbar ruhiger werden, langsam genug, dass Wortenden nicht abreißen. |
+| `hold_ms` | 100.0 | 0–1000 | Überbrückt die 80–150 ms zwischen Wörtern, nicht nur Silbenpausen; verhindert Flattern ("Chattering"). Von 50 ms auf 100 ms gesetzt nach PO-Hörurteil ("lieber 100 ms mehr Raum als abgebissene Wortenden bei langsamen Sprechern"). Test: ein 20-ms-Loch im Signal verändert den Gain nicht, nach Signalende bleibt der Gain 100 ms bei 0 dB. |
+| `release_ms` | 250.0 | 1–5000 | Zeitkonstante (63 %) des Schließens nach Hold und Detektorfenster; ~90 % der Absenkung nach 2,5 × release (gemessen −13,8 dB von −15 nach 735 ms). Von 150 ms auf 250 ms gesetzt (PO): Wortenden langsamer Sprecher bleiben vollständig, Pausen ab ~1 s werden trotzdem deutlich ruhiger. |
 | `knee_db` | 6.0 | 0–24 | Weicher Übergang ±3 dB um die Schwelle: leise Silben und Atmer werden graduell leiser statt geschaltet. |
 | `detector_ms` | 10.0 (optional, nicht in der YAML) | 0.5–100 | RMS-Fenster ≈ eine Periode der tiefsten Männerstimme (85 Hz = 11,8 ms), sodass der Pegel nicht mit der Tonhöhe wellt (< 1 dB), aber innerhalb einer Silbe reagiert. Ein Rechteckfenster "vergisst" lautes Signal vollständig nach 10 ms; ein Einpol-Mittler bräuchte für 25 dB Abfall 58 ms und würde das Schließen verzögern. |
 
@@ -96,9 +116,8 @@ Silbenenden und Atmer werden "abgeschnitten", Sprache wirkt abgehackt; Hold/Rele
 Flattern zwischen Wörtern; Release zu lang → Rauschen "fährt" hörbar hoch und runter.
 
 Messwerte (Tests): stationäres Rauschen −55 dBFS → 12–20 dB leiser (statisch 15 dB, gemessen 14,2 dB
-wegen der Pegelschwankung des 10-ms-Fensters); Sprache
-−20 dBFS → < 1 dB Änderung; in 1-s-Pausen sind die letzten 0,4 s ≥ 12 dB leiser, die ganze Pause im
-Mittel ≥ 6 dB.
+wegen der Pegelschwankung des 10-ms-Fensters); Sprache −20 dBFS → < 1 dB Änderung; in 1,5-s-Pausen
+sind die letzten 0,5 s ≥ 12 dB leiser (gemessen 14,2 dB), die ganze Pause im Mittel ≥ 6 dB (7,5 dB).
 
 ## 4. De-Esser (`chain.deesser`)
 
@@ -138,7 +157,7 @@ das Band breiter ist als die 1-Oktav-Glocke), 1-kHz-Ton gleichen Pegels < 0,5 dB
 ## 5. EQ (`chain.eq`)
 
 **Zweck:** Klangfarbe des NT-USB auf Sprachverständlichkeit trimmen: Nahbesprechungs-Mulm
-raus, Präsenz rein, etwas Luft. Kaskade aus RBJ-Biquads (Low-Shelf, Peak, High-Shelf), Anzahl und
+raus, Präsenz rein. Kaskade aus RBJ-Biquads (Low-Shelf, Peak, High-Shelf), Anzahl und
 Typ der Bänder stehen mit der Konfiguration fest; Gain, Frequenz und Q sind zur Laufzeit
 änderbar (`set_param("eq", "bands.<i>.<feld>", wert)`), Koeffizientenwechsel werden über 10 ms
 zwischen altem und neuem Filter überblendet.
@@ -147,18 +166,19 @@ zwischen altem und neuem Filter überblendet.
 |---|---|---|---|---|---|
 | 0 | peak | 220 | −2.0 | 1.0 | Nahbesprechungseffekt der Niere bei 15–25 cm hebt 150–300 Hz an ("Mulm", "Brustigkeit"). −2 dB bei Q 1 (Bandbreite ~1,4 Okt) nimmt das weg, ohne die Stimme dünn zu machen. |
 | 1 | peak | 3200 | +2.0 | 1.2 | Präsenzbereich 2,5–4 kHz trägt Konsonanten und damit Verständlichkeit; +2 dB reicht, mehr wird nach dem Codec hart. |
-| 2 | high_shelf | 10000 | +1.5 | 0.707 | Dezente "Luft" > 10 kHz gegen den dumpfen Eindruck mancher Codecs; der De-Esser davor verhindert, dass dabei Zischen verstärkt wird. |
+| 2 | high_shelf | 10000 | 0.0 | 0.707 | Ursprünglich +1,5 dB "Luft"; nach PO-Urteil auf 0 dB gesetzt: Das NT-USB ist oben herum bereits hell, Zoom/Teams übertragen Sprache codecbedingt höhenbetont, und ein Boost oberhalb des De-Esser-Bands (4,6–9,2 kHz) hebt vor allem Preamp-Rauschen und Restzischen an. Das Band bleibt angelegt, damit die Kalibrierung dort absenken kann (nur Cut). |
 
 Bereiche je Band: `freq_hz` 20 Hz bis unterhalb fs/2, `gain_db` −24…+24, `q` 0.1–20. Alle
-Startwerte bleiben bescheiden (≤ 3 dB), weil ein Konferenzsystem keine Hi-Fi-Wiedergabe ist und
+Startwerte bleiben bescheiden (≤ 2 dB), weil ein Konferenzsystem keine Hi-Fi-Wiedergabe ist und
 starke EQ-Eingriffe nach dem Codec unnatürlich klingen. Bänder mit 0 dB sind bitgenau transparent.
 
 Hörbild: Band 0 zu stark → dünn, "Telefon"; zu schwach → mulmig, undeutlich. Band 1 zu stark →
-nasal, aggressiv, Zischen nimmt zu; zu schwach → "hinter einem Vorhang". Band 2 zu stark →
-Rauschen und Zischen werden hörbar; zu schwach → dumpf.
+nasal, aggressiv, Zischen nimmt zu; zu schwach → "hinter einem Vorhang". Band 2 (High-Shelf) angehoben →
+Rauschen und Zischen werden hörbar; abgesenkt → bei sehr hellen Mikrofonpositionen angenehmer, zu
+stark → dumpf.
 
 Messwerte (Tests): Zeitbereichsmessung je Band stimmt mit Soll ±0,5 dB überein (analytisch ±0,1 dB),
-Nullgain-Bänder sind exakt transparent.
+Nullgain-Bänder (auch der 0-dB-Shelf der Startkonfiguration) sind exakt transparent.
 
 ## 6. Kompressor (`chain.compressor`)
 
@@ -177,7 +197,7 @@ mit 10-ms-Rampe bei Änderung.
 | `knee_db` | 6.0 | 0–24 | Weiches Knie ±3 dB: der Einsatz ist nicht hörbar; am Schwellenpunkt beträgt die Reduktion 0,5 dB. |
 | `attack_ms` | 10.0 | 0.1–500 | Lässt die Transienten von Konsonanten durch (Verständlichkeit) und fängt Silbenspitzen trotzdem ein. |
 | `release_ms` | 100.0 | 1–5000 | Folgt dem Silbenrhythmus (~4/s), pumpt nicht. Gemessener 63-%-Punkt ~110 ms, weil die Attack-Glättung dem Release nachläuft (siehe Abschnitt 9). |
-| `makeup_db` | 0.0 | −12…+24 | Die Lautheit stellt der Normalizer ein; Makeup bleibt 0, damit zwei Regler nicht gegeneinander arbeiten. |
+| `makeup_db` | 0.0 | −12…+24 | Startwert der unkalibrierten Datei. Die Kalibrierung setzt das Makeup auf die statische Reduktion an den gemessenen Sprachspitzen (typisch 4–7 dB, begrenzt auf 0…12 dB), damit der Pegel nach dem Kompressor dem vor dem Kompressor entspricht und der Normalizer nur noch die langsame Feinregelung übernimmt. Makeup ist statisch (10-ms-Rampe bei Änderung), der Normalizer dynamisch; sie arbeiten deshalb nicht gegeneinander. |
 
 Hörbild: Schwelle zu tief / Ratio zu hoch → "gepresst", Atmer und Raum werden hochgezogen,
 Rauschteppich steigt relativ; zu wenig → ungleichmäßige Lautstärke, der Normalizer muss ständig
@@ -192,28 +212,46 @@ Messwerte (Tests): Sinus −10 dBFS → −16,67 dBFS ± 0,3 dB (Ratio 3, Knie 6
 **Zweck:** Langsame automatische Verstärkungsregelung (AGC) auf eine Ziel-Lautheit, damit die
 anderen Teilnehmenden unabhängig von Sprechabstand und Tagesform einen gleichmäßigen Pegel hören.
 
-**Aufbau:** K-Bewertung (BS.1770: Pre-Filter + RLB, lokal in `biquad.k_weighting_sos` entworfen,
-reproduziert die 48-kHz-Tabelle des Standards auf 1e-9) → Quadrat → Einpol-Mittler mit
-τ = `window_s`/2 (varianzäquivalent zum 3-s-Rechteckfenster der Short-Term-Lautheit), mit
-Bias-Korrektur ab dem ersten Sample → Lautheit = −0,691 + 10·log10(Mittelwert) LUFS. Alle 10 ms (auf
-einem absoluten Sampleraster, deshalb blockgrößenunabhängig) wird das Gain-Ziel
-`clip(target − L, min_gain, max_gain)` neu bestimmt, sofern L über dem Gate liegt; der angewandte
-Gain läuft mit höchstens `rate_db_per_s` auf das Ziel zu, je Sample in geschlossener Form. Die
-Regelung ist feedforward (sie misst ihren eigenen Eingang) und kann daher nicht schwingen.
+**Aufbau (Stand nach Prüfbefund PO-1):** K-Bewertung (BS.1770: Pre-Filter + RLB, lokal in
+`biquad.k_weighting_sos` entworfen, reproduziert die 48-kHz-Tabelle des Standards auf 1e-9) →
+Quadrat → Einpol-Mittler mit τ = 0,2 s (varianzäquivalent zum 400-ms-Rechteckfenster der
+**Momentary**-Lautheit), mit Bias-Korrektur ab dem ersten Sample → Momentary-Lautheit
+L_m = −0,691 + 10·log10(Mittelwert) LUFS. Alle 10 ms (absolutes Sampleraster, deshalb
+blockgrößenunabhängig) wird entschieden:
+
+1. **Absolutes Gate:** L_m < `gate_lufs` → Pause, der Gain wird eingefroren.
+2. **Relatives Gate (wie BS.1770):** L_m < Sprachlautheit − 10 LU → ebenfalls eingefroren. Die
+   Sprachlautheit L_s ist die exponentiell geglättete Lautheit (τ = `window_s`/2, entspricht dem
+   3-s-Short-Term-Fenster) nur der Intervalle, die beide Gates passieren **und nicht fallen** – also
+   die Lautheit der Sprache selbst, nicht der Pausen und nicht der Abklingvorgänge in Pausen hinein.
+3. **Gain-Ziel** = `clip(target_lufs − L_s, min_gain_db, max_gain_db)`.
+4. **Fallende Hüllkurve:** Fällt L_m schneller als 10 LU/s und liegt unter L_s (Wort- oder
+   Satzende), darf das Ziel nicht über dem aktuellen Gain liegen – der Gain steigt nie auf einer
+   abklingenden Hüllkurve.
+5. **Asymmetrische Rate:** Der angewandte Gain läuft je Sample mit höchstens `rate_db_per_s`
+   aufwärts und `release_rate_db_per_s` abwärts auf das Ziel zu.
+
+Die Regelung ist feedforward (sie misst ihren eigenen Eingang) und kann daher nicht schwingen.
+Warum Momentary statt Short-Term für das Gate: Mit dem Gate auf der geglätteten Lautheit blieb es
+nach Satzende ~7 s offen, der Gain lief mit 1 dB/s hoch, Pausenrauschen wurde bis 12 dB lauter und
+der nächste Satz setzte zu laut ein (PO-1). Der 400-ms-Detektor schließt das Gate innerhalb von
+0,1–0,5 s nach dem letzten Wort.
 
 | Parameter | Startwert | Bereich | Begründung |
 |---|---|---|---|
-| `enabled` | true | – | Bei Bypass läuft die Messung weiter (Meter bleiben gültig, Wiedereinschalten ohne Sprung). |
-| `target_lufs` | −18.0 | −40…−6 | Konferenzsysteme und ihre automatische Pegelung erwarten Sprache um −18…−16 LUFS; −18 lässt 17 dB Crest-Faktor bis zum Limiter. |
-| `window_s` | 3.0 | 0.4–10 | Short-Term-Fenster nach BS.1770. Kürzer regelt Silben statt Sätze, länger reagiert träge auf einen Wechsel des Sprechabstands. |
-| `max_gain_db` | 12.0 | 0–30 | Mehr würde in leisen Passagen Rauschen und Raum hochziehen; 12 dB fängt einen deutlich zu leisen Sprecher auf. |
+| `enabled` | true | – | Bei Bypass läuft die Messung weiter (Gate-Zustand, Sprachlautheit), der Gain bleibt stehen; Wiedereinschalten ohne Sprung. |
+| `target_lufs` | −18.0 | −40…−6 | Konferenzsysteme und ihre automatische Pegelung erwarten Sprache um −18…−16 LUFS; −18 lässt 17 dB Crest-Faktor bis zum Limiter. Das Ziel gilt für die **gegatete Sprachlautheit** (BS.1770-Logik), nicht für 3-s-Fenster mit Pausen: Enthält ein Fenster 40 % Pause, liest ein ungegatetes Short-Term-Meter 2–3 LU weniger (Chain-Test: aktive Anteile −16,7, 3-s-Fenster −20,6 LUFS bei synthetischer Sprache mit 40 % Pause). **Mono-Konvention (PO-14):** Das Ziel wird am Mono-Signal gemessen; der Ausgang ist Dual-Mono auf BlackHole. Ein Stereo-Meter nach BS.1770 summiert beide Kanäle und zeigt **+3 LU**, also −15 LUFS – für den Mono-Sprachpfad von Zoom/Teams ohne Belang, beim Nachmessen einer Meeting-Aufzeichnung zu beachten. |
+| `window_s` | 3.0 | 0.4–10 | Glättung der Sprachlautheit (Short-Term-Fenster nach BS.1770). Kürzer regelt Silben statt Sätze, länger reagiert träge auf einen Wechsel des Sprechabstands. Das Gate benutzt unabhängig davon das 400-ms-Momentary-Fenster. |
+| `max_gain_db` | 12.0 | 0–30 | Mehr würde in leisen Passagen Rauschen und Raum hochziehen; 12 dB fängt einen deutlich zu leisen Sprecher auf. Die Kalibrierung leitet den Wert aus Sprachpegel und Rauschteppich ab und kann ihn zur Laufzeit per `set_param` ändern (Test: der neue Deckel greift sofort mit der Abwärtsrate). |
 | `min_gain_db` | −12.0 | −30…0 | Schutz gegen "Reinbrüllen"; weiter unten würde der Limiter ohnehin arbeiten. |
-| `rate_db_per_s` | 1.0 | 0.1–20 | So langsam wie eine Hand am Fader: keine hörbare Regelbewegung innerhalb eines Satzes. Ein 12-dB-Versatz ist nach 12 s ausgeglichen. |
-| `gate_lufs` | −40.0 | −80…−20 | Unterhalb gilt "Pause": der Gain wird eingefroren, Stille und Rauschteppich werden nicht hochgezogen. 20 LU unter dem Ziel entspricht dem relativen Gate von BS.1770 (−10 LU) mit Reserve. |
+| `rate_db_per_s` | 1.0 | 0.1–20 | Aufwärtsrate, so langsam wie eine Hand am Fader: keine hörbare Regelbewegung innerhalb eines Satzes. Bei stationärem Signal exakt 1 dB/s (Test); bei bewegter Sprache zählen Pausen und fallende Silbenhüllkurven nicht, die effektive Aufwärtsrate liegt dann bei etwa 0,4 dB/s (Chain-Test: 7,9 dB nach 20 s). |
+| `release_rate_db_per_s` | 3.0 (optional, Default 3) | 0.1–30 | Abwärtsrate. Ein Satz, der 6 dB zu laut einsetzt, ist nach 2 s gezähmt, ohne dass die Bewegung als Pumpen auffällt; ein zu leiser Einsatz darf dagegen langsam kommen (PO: 1 dB/s hoch, 3 dB/s runter). |
+| `gate_lufs` | −40.0 | −80…−20 | Absolutes Gate auf die Momentary-Lautheit: darunter gilt "Pause", der Gain wird eingefroren, Stille und Rauschteppich werden nicht hochgezogen. 22 LU unter dem Ziel reicht für ruhige Räume (Teppich nach Expander ≤ −50 dBFS); bei lauterem Teppich muss die Kalibrierung das Gate auf Pausenpegel nach Kette + 8 dB legen (PO-1 d), denn das relative Gate allein trennt einen Teppich nicht mehr sicher, der nur 11 LU unter der Sprachlautheit liegt (Test mit Teppich −42 dBFS: Gate −30 LUFS). |
 
 Hörbild: Rate zu hoch → hörbares Atmen/Pumpen auf Satzebene; Ziel zu hoch → Limiter arbeitet
-dauerhaft; Gate zu tief → in langen Pausen fährt der Raum hoch; Gate zu hoch → leise Sprecher werden
-nicht geregelt.
+dauerhaft; Gate zu tief → in langen Pausen fährt der Raum hoch (genau der Befund PO-1); Gate zu
+hoch → leise Sprecher werden nicht geregelt; Abwärtsrate zu hoch → der erste Satz nach einer Pause
+"duckt" hörbar weg.
 
 **Position in der Kette (5b, nach Kompressor, vor Limiter):** Der Normalizer sieht das bereits
 verdichtete Signal, dessen Lautheit stabiler ist als die der Rohsprache; die Regelung muss deshalb
@@ -221,13 +259,22 @@ weniger und seltener eingreifen. Vor dem Kompressor platziert würde er dessen S
 "verschieben" (die adaptive Regelung führt die Kompressorschwelle dem Sprachpegel nach – beide
 würden gegeneinander arbeiten). Nach dem Limiter darf er nicht stehen, weil er sonst das Ceiling
 wieder überschreiten könnte. Eine Konsequenz dieser Reihenfolge: Der Normalizer hebt in absoluten
-Zahlen auch den Rauschteppich an. Entscheidend für die Gegenseite ist aber der *Abstand* zwischen
-Sprache und Rauschen, und den verbessert der Expander um ≥ 6 dB (Chain-Test, gemessen als
-10. Perzentil der 100-ms-Rahmen in Pausen wie in der Kalibrierung).
+Zahlen auch den Rauschteppich an (Pause am Ausgang = Pause am Eingang + Trim + Makeup +
+Normalizer-Gain − Expander-Absenkung). Entscheidend für die Gegenseite ist der *Abstand* zwischen
+Sprache und Rauschen (Beauftragung §6.3, Störabstandsgewinn), und den verbessert der Expander um
+≥ 6 dB (Chain-Tests: 10. Perzentil der 100-ms-Rahmen in Pausen wie in der Kalibrierung, und die
+20-s-Pause des PO-Szenarios).
 
-Messwerte (Tests): −30-LUFS-Signal erreicht −18 ± 1 LU, Gain steigt mit exakt 1 dB/s (nach 5 s
-5,0 dB), monoton; Rauschen −60 dBFS bleibt unverändert (Gate), `max_gain_db`/`min_gain_db` werden nie
-überschritten; die Lautheitsschätzung stimmt nach 0,5 s auf 0,1 LU (Bias-Korrektur).
+Messwerte (Tests): −30-LUFS-Sinus erreicht −18 ± 1 LU, Gain steigt mit exakt 1 dB/s (nach 5 s
+5,0 dB), monoton; Rauschen −60 dBFS bleibt unverändert (Gate); `max_gain_db`/`min_gain_db` werden nie
+überschritten; die Momentary-Schätzung stimmt nach 50 ms auf 0,1 LU (Bias-Korrektur). PO-1-Szenario
+(30 s Sprache, 20 s Pause, 20 s Sprache; Teppich −50 dBFS mit Gate −40, Teppich −42 dBFS mit
+kalibriertem Gate −30): Gain-Änderung in der Pause 0,000 dB, erster Satz danach +0,04 dB bzw.
++0,03 dB gegenüber dem letzten Satz davor. Relatives Gate: Teppich −45 dBFS (≈ −41,5 LUFS, über
+einem absoluten Gate von −60) wird eingefroren, weil er 13 LU unter der Sprachlautheit liegt.
+Fallende Hüllkurve (−30 dB/s): Gain steigt höchstens 0,25 dB (Detektorverzögerung) statt 2 dB.
+Komplette kalibrierungsnahe Kette im selben Szenario: Störabstandsgewinn ≥ 6 dB, Gain in der Pause
+unverändert, Satz danach ≤ +1 dB, Sprache bei −18 ± 2 dBFS RMS.
 
 ## 8. Limiter (`chain.limiter`)
 
@@ -293,22 +340,53 @@ Filterkoeffizienten (HPF, EQ, De-Esser-Bandpass) über 10 ms zwischen altem und 
 
 `voicechain.config.load_config` liest und validiert streng (unbekannte, fehlende, falsch typisierte
 und außerhalb des Bereichs liegende Werte werden gesammelt und mit vollem Schlüsselpfad gemeldet).
-`save_config` schreibt über `yaml.safe_dump`; **Kommentare der Quelldatei gehen dabei verloren**
+Top-Level-Schlüssel mit führendem Unterstrich (`_calibration` mit Messwerten und Begründungen der
+Kalibrierung) sind Metadaten: nicht validiert, von `Chain.from_config` ignoriert, beim Speichern
+erhalten. Optionale Stufenparameter (`expander.detector_ms`, `limiter.true_peak_margin_db`,
+`normalizer.release_rate_db_per_s`) dürfen fehlen; dann gilt der im Code begründete Default. Die
+Untergrenze von `deesser.ratio` und `compressor.ratio` ist 1,1, weil die Kalibrierung bei Ratio 1
+durch null teilen würde (SW-7). `save_config` schreibt über `yaml.safe_dump`; **Kommentare der
+Quelldatei gehen dabei verloren**
 (PyYAML erhält sie nicht). Das ist für erzeugte Konfigurationen (Kalibrierungsausgabe) akzeptiert;
 die kommentierte Referenz `config/chain.default.yaml` wird von `save_config` nie überschrieben.
 Laden → Speichern → Laden liefert ein identisches Dictionary (Test).
 
-## 11. Offene Punkte und Risiken
+## 11. Adaptive Parameter (`adaptive.*`)
+
+Die Regelung selbst ist in `voicechain/adaptive.py` umgesetzt und in `docs/03_Betrieb_und_
+Kalibrierung.md` (Abschnitt Regelung) beschrieben; hier stehen die Startwerte und ihre Wirkung
+auf die Kette. Die Regelung verändert ausschließlich die drei Schwellen in `adaptive.bounds`; alle
+anderen Parameter bleiben, wie Datei oder Kalibrierung sie gesetzt haben.
+
+| Parameter | Startwert | Bereich | Begründung und Wirkung |
+|---|---|---|---|
+| `enabled` | true | – | false: Parameter bleiben wie in der Datei; die Kette läuft mit den kalibrierten Werten. |
+| `learn_s` | 30.0 | 0–600 | Lernphase ohne Eingriff ("erst zuhören"): 30 s enthalten bei normaler Sprache mehrere Sätze und Pausen, sodass Rauschteppich, Sprachpegel und Zischanteil belastbar gemessen sind, bevor eine Schwelle bewegt wird. Kürzer riskiert Eingriffe auf Basis eines Räusperns, länger verzögert die erste Korrektur unnötig. |
+| `interval_s` | 2.0 | 0.1–60 | Auswerteintervall der Meter. 2 s sind lang genug, dass die Mittel/Maxima der Gain-Reduction (siehe Abschnitt 0, Meter) ein Intervall mit Sprache und Pause enthalten, und kurz genug, dass eine Lüfteränderung in Minuten nachgeführt ist. |
+| `max_step_db` | 0.5 | 0.01–6 | Maximale Änderung je Eingriff. 0,5 dB sind unterhalb der Hörschwelle für Pegelsprünge in Sprache; zusammen mit `interval_s` ergibt sich eine maximale Drift von 15 dB/min, in der Praxis (Hysterese, Totzone) deutlich weniger – das Verhalten eines vorsichtigen Tontechnikers. In der Kette landet jeder Schritt über `set_param` in den Attack/Release-Glättern der Dynamikstufen und ist deshalb knackfrei. |
+| `bounds.expander.threshold_db` | [−70, −30] | innerhalb −90…0 | Harte Grenzen, in denen die Schwelle dem Rauschteppich (+10 dB) folgen darf. Über −30 dBFS würde der Expander leise Silben beschneiden, unter −70 dBFS ist kein realer Teppich mehr. |
+| `bounds.deesser.threshold_db` | [−45, −15] | innerhalb −60…0 | Folgt dem Zischanteil. Unter −45 dBFS würde jeder Konsonant de-esst (Lispeln), über −15 dBFS greift der De-Esser praktisch nie. |
+| `bounds.compressor.threshold_db` | [−35, −10] | innerhalb −60…0 | Folgt dem Sprachpegel. Unter −35 dBFS komprimiert der Kompressor den Raum mit, über −10 dBFS verdichtet er nichts mehr. |
+| `log_path` | `logs/adaptive.jsonl` | Pfad | Jede Änderung wird mit Grund protokolliert (JSONL); Voraussetzung dafür, Regelverhalten im Nachhinein zu lesen und zu prüfen. |
+
+Der Validator prüft, dass jeder Bounds-Schlüssel eine existierende numerische Stufenparameter
+bezeichnet, dass die Grenzen innerhalb des Stufenbereichs liegen und dass der aktuelle Wert in der
+`chain`-Sektion innerhalb der Grenzen liegt.
+
+## 12. Offene Punkte und Risiken
 
 - Die Startwerte sind Erfahrungswerte für das NT-USB; die Kalibrierung mit einem echten
   Sprachsample ist der eigentliche Abgleich.
 - Der De-Esser reagiert auf Spitzen im Band; bei sehr hellen Stimmen kann die Kalibrierung
   `freq_hz` und `threshold_db` nachführen müssen.
-- Der Normalizer regelt die gefensterte Lautheit; bei sehr vielen kurzen Pausen liegt die aktive
-  Sprache etwas über dem Ziel (Chain-Test: Short-Term ±2 LU erreicht).
+- Der Normalizer regelt die gegatete Sprachlautheit auf das Ziel; ungegatete 3-s-Fenster mit
+  vielen Pausen lesen 2–3 LU weniger (siehe 7). Die effektive Aufwärtsrate bei bewegter Sprache
+  liegt bei etwa 0,4 dB/s; ein Start weit unter dem Ziel braucht entsprechend länger – die
+  Kalibrierung (Input Trim) soll den Startpunkt in die Nähe des Ziels legen.
+- Bei einem Rauschteppich weniger als ~12 LU unter der Sprachlautheit trennt das relative Gate des
+  Normalizers allein nicht mehr sicher; dann muss `gate_lufs` kalibriert sein (PO-1 d).
 - True-Peak-Sicherheit beruht auf der Marge, nicht auf überabgetasteter Detektion (siehe 8).
-- Zusammenspiel mit der Kalibrierung: Setzt `calibrate.recommend` die Kompressorschwelle auf den
-  Sprach-RMS, senkt der Kompressor den Sprach-RMS um ~6 dB; von den ~12 dB Expander-Absenkung
-  (8 dB Abstand zum Rauschteppich, Ratio 2,5) bleiben dann relativ zur Sprache ~6 dB übrig
-  (Selftest misst 5,8 dB). Mehr Abstand (10 dB) oder Ratio 3 bringt die geforderten ≥ 6 dB
-  mit Reserve; das ist eine Entscheidung der Kalibrierung, nicht der Stufe.
+- Zusammenspiel mit der Kalibrierung: Die Kompressorschwelle auf dem Sprach-RMS senkt den
+  Sprach-RMS um ~6 dB; von den 15 dB statischer Expander-Absenkung (10 dB Abstand zum
+  Rauschteppich, Ratio 2,5) bleiben relativ zur Sprache ~8–9 dB Störabstandsgewinn, also Reserve
+  gegenüber den geforderten ≥ 6 dB.

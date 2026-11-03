@@ -37,10 +37,10 @@ import numpy as np
 from scipy import signal
 from scipy.ndimage import maximum_filter1d
 
-# Floor for level measurements: -150 dBFS is 6 dB below the quantisation noise of a
-# 24-bit converter (-144 dBFS) and far below any microphone self-noise, so clamping
-# there never influences a real signal but keeps log10 finite for digital silence.
-DB_FLOOR = -150.0
+from voicechain.dsp import DB_FLOOR_DBFS
+
+# Floor for level measurements (one definition for the whole package, see voicechain.dsp).
+DB_FLOOR = DB_FLOOR_DBFS
 AMP_FLOOR = 10.0 ** (DB_FLOOR / 20.0)
 POWER_FLOOR = 10.0 ** (DB_FLOOR / 10.0)
 
@@ -336,3 +336,43 @@ class GainRamp:
         if self._remaining == 0:
             self._current = self._target
         return out
+
+
+class ReductionAccumulator:
+    """Gain-reduction statistics: last block mean, plus mean and max since the last ``read``.
+
+    The adaptive controller polls the meters every few seconds; a snapshot of the
+    last 5 ms block would miss short events, so the stages accumulate between reads.
+    """
+
+    def __init__(self):
+        self.last_mean = 0.0
+        self._sum = 0.0
+        self._count = 0
+        self._max = 0.0
+
+    def add(self, reduction: np.ndarray) -> None:
+        if reduction.size == 0:
+            return
+        self.last_mean = float(np.mean(reduction))
+        self._sum += float(np.sum(reduction))
+        self._count += reduction.size
+        self._max = max(self._max, float(np.max(reduction)))
+
+    def add_zeros(self, n: int) -> None:
+        """Account for a block in which the stage did not reduce (bypass)."""
+        self.last_mean = 0.0
+        self._count += int(n)
+
+    def read(self) -> tuple[float, float]:
+        """Return (mean, max) since the previous read and restart the accumulation."""
+        mean = self._sum / self._count if self._count else 0.0
+        peak = self._max
+        self._sum = 0.0
+        self._count = 0
+        self._max = 0.0
+        return mean, peak
+
+    def reset(self) -> None:
+        self.last_mean = 0.0
+        self.read()

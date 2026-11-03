@@ -6,6 +6,7 @@ import threading
 
 import numpy as np
 
+from voicechain.dsp import DB_FLOOR_DBFS
 from voicechain.dsp.compressor import Compressor
 from voicechain.dsp.deesser import DeEsser
 from voicechain.dsp.envelope import peak_dbfs, rms_dbfs
@@ -33,9 +34,16 @@ STAGE_CLASSES = {
 class Chain:
     """Runs the stages in order; ``process`` is block-size agnostic and keeps state.
 
-    All public methods take one lock, so ``set_param`` from a control thread and
-    ``process`` from the audio callback never interleave (the lock is held for a
-    few microseconds per block, far below the block period).
+    Threading: one re-entrant lock guards the stage states. ``process`` holds it
+    for the whole block (about 0.4 ms for 256 samples at 48 kHz, i.e. < 10 % of
+    the block period). ``set_param`` validates and designs the new coefficients
+    *outside* the lock and holds it only for the swap (microseconds), so a control
+    thread can never delay the audio callback by a filter design.
+
+    Robustness: a block containing NaN or Inf would poison every filter state
+    for good. ``process`` therefore checks ``np.isfinite`` first, replaces such a
+    block by silence, resets all stages and counts the event
+    (``get_meters()["input"]["nonfinite_blocks"]``).
     """
 
     def __init__(self, sample_rate: int, stages: dict):
@@ -45,10 +53,11 @@ class Chain:
         self.sample_rate = int(sample_rate)
         self._stages = {name: stages[name] for name in STAGE_ORDER}
         self._lock = threading.RLock()
-        self._input_peak = -150.0
-        self._input_rms = -150.0
-        self._output_peak = -150.0
-        self._output_rms = -150.0
+        self._nonfinite_blocks = 0
+        self._input_peak = DB_FLOOR_DBFS
+        self._input_rms = DB_FLOOR_DBFS
+        self._output_peak = DB_FLOOR_DBFS
+        self._output_rms = DB_FLOOR_DBFS
 
     @classmethod
     def from_config(cls, cfg: dict) -> "Chain":
@@ -90,6 +99,10 @@ class Chain:
         limiter = self._stages["limiter"]
         return limiter.latency_samples if limiter.enabled else 0
 
+    @property
+    def nonfinite_blocks(self) -> int:
+        return self._nonfinite_blocks
+
     # -- contract ---------------------------------------------------------------------
     def process(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x)
@@ -97,6 +110,16 @@ class Chain:
             raise ValueError(f"Chain.process expects a mono block of shape (n,), got shape {x.shape}")
         with self._lock:
             y = x.astype(np.float64, copy=False)
+            if not np.isfinite(y).all():
+                # Replace the block by silence and restart every stage from its initial
+                # state; the silent block is not run through the stages, so the chain
+                # continues exactly like a freshly built one.
+                self._nonfinite_blocks += 1
+                for stage in self._stages.values():
+                    stage.reset()
+                self._input_peak = self._input_rms = DB_FLOOR_DBFS
+                self._output_peak = self._output_rms = DB_FLOOR_DBFS
+                return np.zeros(y.shape, dtype=np.float32)
             self._input_peak = peak_dbfs(y)
             self._input_rms = rms_dbfs(y)
             for stage in self._stages.values():
@@ -106,17 +129,22 @@ class Chain:
             return y.astype(np.float32)
 
     def set_param(self, stage: str, name: str, value: float) -> None:
-        with self._lock:
-            self.stage(stage).set_param(name, value)
+        """Validate and design outside the lock; the stage swaps coefficients under it."""
+        self.stage(stage).set_param(name, value, lock=self._lock)
 
     def get_param(self, stage: str, name: str) -> float:
-        with self._lock:
-            return self.stage(stage).get_param(name)
+        return self.stage(stage).get_param(name)
 
     def get_meters(self) -> dict:
+        """Meters of all stages plus input/output levels.
+
+        Reading drains the per-stage accumulators ``gain_reduction_mean_db`` /
+        ``gain_reduction_max_db`` (statistics since the previous read).
+        """
         with self._lock:
             meters = {name: stage.meters() for name, stage in self._stages.items()}
-            meters["input"] = {"peak_dbfs": self._input_peak, "rms_dbfs": self._input_rms}
+            meters["input"] = {"peak_dbfs": self._input_peak, "rms_dbfs": self._input_rms,
+                               "nonfinite_blocks": float(self._nonfinite_blocks)}
             meters["output"] = {"peak_dbfs": self._output_peak, "rms_dbfs": self._output_rms}
             return meters
 
@@ -124,5 +152,5 @@ class Chain:
         with self._lock:
             for stage in self._stages.values():
                 stage.reset()
-            self._input_peak = self._input_rms = -150.0
-            self._output_peak = self._output_rms = -150.0
+            self._input_peak = self._input_rms = DB_FLOOR_DBFS
+            self._output_peak = self._output_rms = DB_FLOOR_DBFS

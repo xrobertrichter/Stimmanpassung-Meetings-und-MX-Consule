@@ -29,7 +29,9 @@ from __future__ import annotations
 import numpy as np
 
 from voicechain.dsp import StageBase
-from voicechain.dsp.envelope import HoldMax, MovingAverage, ReleaseDecay, amp_to_db, db_to_amp
+from voicechain.dsp.envelope import (
+    HoldMax, MovingAverage, ReductionAccumulator, ReleaseDecay, amp_to_db, db_to_amp,
+)
 
 
 class Limiter(StageBase):
@@ -50,19 +52,25 @@ class Limiter(StageBase):
         self._average = MovingAverage(1)
         self._hold = HoldMax(1, fill_value=0.0)
         self._release = ReleaseDecay(self.sample_rate, self.release_ms)
-        self._ceiling_db = self.ceiling_dbfs - self.true_peak_margin_db
-        self._last_reduction_mean = 0.0
-        self._last_reduction_max = 0.0
-        self._update_coefficients()
+        self._ceiling_db = 0.0
+        self._reduction = ReductionAccumulator()
+        self._install_current()
 
     @property
     def latency_samples(self) -> int:
         return self._lookahead
 
-    def _update_coefficients(self) -> None:
-        self._release.set_time(self.release_ms)
-        self._ceiling_db = self.ceiling_dbfs - self.true_peak_margin_db
-        lookahead = max(1, int(round(self.lookahead_ms * 1e-3 * self.sample_rate)))
+    def _design_from(self, params: dict) -> dict:
+        return {
+            "release_ms": params["release_ms"],
+            "ceiling_db": params["ceiling_dbfs"] - params["true_peak_margin_db"],
+            "lookahead": max(1, int(round(params["lookahead_ms"] * 1e-3 * self.sample_rate))),
+        }
+
+    def _install(self, design: dict) -> None:
+        self._release.set_time(design["release_ms"])
+        self._ceiling_db = design["ceiling_db"]
+        lookahead = design["lookahead"]
         if lookahead != self._lookahead:
             # A change of the look-ahead changes the latency; the buffers are re-created
             # (zero-filled). This is the one parameter change that is not click-free.
@@ -75,8 +83,7 @@ class Limiter(StageBase):
         x = np.asarray(x, dtype=np.float64)
         n = x.size
         if not self.enabled or n == 0:
-            self._last_reduction_mean = 0.0
-            self._last_reduction_max = 0.0
+            self._reduction.add_zeros(n)
             return x
         required = amp_to_db(x) - self._ceiling_db
         np.maximum(required, 0.0, out=required)
@@ -84,16 +91,16 @@ class Limiter(StageBase):
         reduction = self._average.process(held)
         delayed = np.concatenate([self._delay, x])
         self._delay = delayed[n:]
-        y = delayed[:n] * db_to_amp(-reduction)
-        self._last_reduction_mean = float(np.mean(reduction))
-        self._last_reduction_max = float(np.max(reduction))
-        return y
+        self._reduction.add(reduction)
+        return delayed[:n] * db_to_amp(-reduction)
 
     def meters(self) -> dict:
+        mean, peak = self._reduction.read()
         return {
             "enabled": float(self.enabled),
-            "gain_reduction_db": self._last_reduction_mean,
-            "gain_reduction_max_db": self._last_reduction_max,
+            "gain_reduction_db": self._reduction.last_mean,
+            "gain_reduction_mean_db": mean,
+            "gain_reduction_max_db": peak,
             "latency_samples": float(self._lookahead),
         }
 
@@ -102,5 +109,4 @@ class Limiter(StageBase):
         self._average.reset()
         self._hold.reset()
         self._release.reset()
-        self._last_reduction_mean = 0.0
-        self._last_reduction_max = 0.0
+        self._reduction.reset()

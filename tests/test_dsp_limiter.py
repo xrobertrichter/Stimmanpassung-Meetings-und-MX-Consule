@@ -42,7 +42,8 @@ def test_quiet_signal_passes_unchanged(fs, gen):
     y = gen.process_blocks(stage, x, 256)
     d = stage.latency_samples
     assert np.max(np.abs(y[d:] - x[:-d])) <= 0.1 * (10 ** (0.01 / 20.0) - 1.0)   # within 0.01 dB
-    assert stage.meters()["gain_reduction_max_db"] == 0.0
+    m = stage.meters()
+    assert m["gain_reduction_max_db"] == 0.0 and m["gain_reduction_mean_db"] == 0.0 and m["gain_reduction_db"] == 0.0
 
 
 def test_release_recovers_after_burst(fs, gen):
@@ -52,6 +53,9 @@ def test_release_recovers_after_burst(fs, gen):
     y = gen.process_blocks(stage, x, 256)
     d = stage.latency_samples
     assert np.max(np.abs(y)) <= CEILING
+    m = stage.meters()
+    assert 8.0 <= m["gain_reduction_max_db"] <= 8.6         # +6 dBFS against the -2.5 dBFS internal ceiling = 8.5 dB
+    assert 0.3 <= m["gain_reduction_mean_db"] <= 1.0        # ~100 ms of 8 dB plus release tail over 2 s
     t_end = fs // 2 + fs // 10 + d
     after = np.abs(y[t_end + int(0.3 * fs):t_end + int(0.4 * fs)])    # 6 release constants later
     assert np.max(after) >= 0.1 * 10 ** (-0.1 / 20.0)

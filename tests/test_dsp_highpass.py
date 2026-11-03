@@ -77,3 +77,18 @@ def test_parameter_validation(fs):
         stage.set_param("slope", 24.0)
     with pytest.raises(ValueError):
         HighPass(fs, enabled=True, freq_hz=80.0)   # missing order
+
+
+def test_invalid_set_param_leaves_stage_untouched(fs, gen):
+    """SW-6: validation and design happen before anything is stored."""
+    stage = HighPass(fs, **DEFAULT)
+    reference = HighPass(fs, **DEFAULT)
+    x = gen.pink_noise(-20.0, 0.5, fs, seed=4)
+    stage.process(x[:fs // 10])
+    reference.process(x[:fs // 10])
+    with pytest.raises(ValueError, match="integer"):
+        stage.set_param("order", 4.5)
+    with pytest.raises(ValueError, match="range"):
+        stage.set_param("freq_hz", 5.0)
+    assert stage.get_param("order") == 4.0 and stage.get_param("freq_hz") == 80.0
+    assert np.array_equal(stage.process(x[fs // 10:]), reference.process(x[fs // 10:]))
