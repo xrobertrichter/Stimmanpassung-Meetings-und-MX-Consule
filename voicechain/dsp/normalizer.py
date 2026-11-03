@@ -22,13 +22,23 @@ of the previous interval:
   whole window). Without any plateau - a speaker who talks without pauses - the
   estimate simply keeps its last value, so dense speech can never masquerade as
   a loud room. The estimate is kept across a non-finite-input recovery;
+* what counts as speech for the reference: an interval is learnt only when the
+  signal has been *modulated* recently (range of the 10 ms interval loudness
+  over the last ``MODULATION_WINDOW_S`` at least ``MODULATION_RANGE_LU``;
+  stationary noise never is, speech always is) and, once a floor is known,
+  when it lies at least ``gate_margin_lu + CERTAIN_SPEECH_ABOVE_GATE_LU`` above the
+  floor (certainly speech, never the room). Pre-roll noise at the start of a stream therefore
+  cannot become the reference, and without a reference the gain is held;
 * low-SNR state: if the floor lies less than ``LOW_SNR_ENTER_LU`` under the
-  speech reference, the room is too loud to be gated. The stage then freezes
-  the gain (decreases for too-loud speech stay allowed), learns no reference
-  and lets none decay, and keeps the gate at floor + margin; it leaves the state
-  with hysteresis once the floor is again ``LOW_SNR_EXIT_LU`` under the
-  reference. Meters ``low_snr`` and ``snr_lu`` expose it so the controller can
-  log it and the status line can show it;
+  speech reference, the room is too loud to be gated. The stage keeps the gate
+  at floor + margin, keeps learning reference and gain from the certain-speech
+  intervals (so the state can resolve itself and a quieter speaker is still
+  followed), but drops the pause-headroom cap (``max_gain_db`` alone limits;
+  otherwise speech in a loud room would stay too quiet for good). Pauses lie
+  far below the certain-speech level and cannot lift the gain. The state ends with
+  hysteresis once the floor is again ``LOW_SNR_EXIT_LU`` under the reference.
+  Meters ``low_snr`` and ``snr_lu`` expose it for the controller's log and the
+  status line;
 * effective gate ``G = max(gate_lufs, L_floor + gate_margin_lu)`` once speech has
   been learnt (before that only ``gate_lufs``, so a signal without any dips can
   still start the regulation);
@@ -105,6 +115,19 @@ FLOOR_RISE_LU_PER_S = 1.0
 LOW_SNR_ENTER_LU = 15.0
 LOW_SNR_EXIT_LU = 17.0
 PAUSE_HEADROOM_LU = 15.0
+# Speech evidence for learning the reference: within 2 s (a word plus a gap, or two
+# syllable groups) the 10 ms interval loudness of speech spans > 7 LU even for the
+# smoothest synthetic test speech and typically 15-30 LU; stationary noise spans
+# < 2 LU (white) to < 4 LU (pink) over the same time. The 400 ms momentary would
+# hide the syllabic modulation (ripple ~1 LU), hence the interval loudness.
+MODULATION_WINDOW_S = 2.0
+MODULATION_RANGE_LU = 6.0
+# Intervals this far above the effective gate (floor + gate margin) are certainly speech:
+# a room plateau fluctuates by <= 3 LU (PLATEAU_RANGE_LU), so floor + 8 + 5 = 13 LU above
+# the floor is never the room. A larger distance (e.g. + 10 LU = 18 LU) would stop the
+# learning exactly at the operating point of a room that is 5-8 dB louder than at
+# calibration (speech 15-17 LU above the floor) and leave such a room unregulated for good.
+CERTAIN_SPEECH_ABOVE_GATE_LU = 5.0
 # While only the relative gate blocks, the speech reference decays at 2 LU/s: a speaker
 # who became 20 LU quieter is re-referenced within 10 s; five times slower than the
 # fastest decay that still counts as a syllable end (FALLING_LU_PER_S), and in pauses
@@ -145,6 +168,9 @@ class Normalizer(StageBase):
         self._plateau_ring = np.full(max(1, int(round(PLATEAU_S / self._interval_s))), np.nan)
         self._plateau_index = 0
         self._plateau_count = 0
+        self._modulation_ring = np.full(max(1, int(round(MODULATION_WINDOW_S / self._interval_s))), np.nan)
+        self._modulation_index = 0
+        self._modulation_count = 0
         self._interval_index = 0                 # intervals since the last (re)start of the signal path
         self._floor_ring = np.full(max(1, int(round(FLOOR_WINDOW_S / self._interval_s))), np.inf)
         self._floor_index = 0
@@ -245,6 +271,12 @@ class Normalizer(StageBase):
         self._plateau_ring[self._plateau_index] = interval_db
         self._plateau_index = (self._plateau_index + 1) % self._plateau_ring.size
         self._plateau_count = min(self._plateau_count + 1, self._plateau_ring.size)
+        if self._interval_index > self._plateau_ring.size:
+            # the first half second after a (re)start carries the filter start-up transient,
+            # which would read as modulation
+            self._modulation_ring[self._modulation_index] = interval_db
+            self._modulation_index = (self._modulation_index + 1) % self._modulation_ring.size
+            self._modulation_count = min(self._modulation_count + 1, self._modulation_ring.size)
         candidate = np.inf
         if self._plateau_count == self._plateau_ring.size:
             high = float(np.max(self._plateau_ring))
@@ -273,6 +305,20 @@ class Normalizer(StageBase):
             else:
                 self._floor_db += rise
 
+    def _modulated_recently(self) -> bool:
+        """True when the interval loudness spanned >= MODULATION_RANGE_LU within the last window."""
+        if self._modulation_count < self._plateau_ring.size:
+            return False                             # less than half a second of evidence
+        values = self._modulation_ring[: self._modulation_count] if self._modulation_count < self._modulation_ring.size \
+            else self._modulation_ring
+        return float(np.max(values)) - float(np.min(values)) >= MODULATION_RANGE_LU
+
+    def _certainly_speech(self, momentary_db: float) -> bool:
+        """Above floor + gate margin + relative gate: cannot be the room."""
+        if not self._floor_known:
+            return True
+        return momentary_db >= self._floor_db + self.gate_margin_lu + CERTAIN_SPEECH_ABOVE_GATE_LU
+
     def _update_low_snr(self) -> None:
         snr = self.snr_lu()
         if self._low_snr:
@@ -295,39 +341,38 @@ class Normalizer(StageBase):
         if falling and self._speech_count > 0 and momentary_db >= self.speech_loudness():
             falling = False   # still above the speech loudness: a syllable, not a decay into a pause
         self._gated = absolute or below_reference
-        if below_reference and momentary_db >= gate and not falling and not self._low_snr:
-            # Steady or rising, above the room floor, yet more than 10 LU under the reference:
-            # a speaker who became quieter (decays into pauses are excluded). Let the reference
-            # sink towards the signal, never below gate + 10 LU (the relative gate stays above
-            # the absolute one).
+        modulated = self._modulated_recently()
+        certain = self._certainly_speech(momentary_db)
+        if below_reference and momentary_db >= gate and not falling and modulated and certain:
+            # Steady or rising, certainly above the room, yet more than 10 LU under the
+            # reference: a speaker who became quieter (decays into pauses are excluded). Let
+            # the reference sink towards the signal, never below gate + 10 LU (the relative
+            # gate stays above the absolute one).
             decayed = max(momentary_db, self.speech_loudness() - REFERENCE_DECAY_LU_PER_S * self._interval_s,
                           gate + RELATIVE_GATE_LU)
             self._set_speech_loudness(decayed)
         if self._gated:
             self._target_db = gain_db                # pause: freeze
             return
-        if not falling and not self._low_snr:
-            # The speech loudness is learnt from rising/steady intervals only: the decay
-            # phases into pauses would drag it down and weaken the relative gate. In the
-            # low-SNR state nothing is learnt: what passes the gate may be the room.
+        if not falling and modulated and certain:
+            # The reference is learnt from rising/steady, modulated intervals that lie clearly
+            # above the floor: the decay phases into pauses would drag it down, stationary
+            # pre-roll noise or a loud room must never become "the speaker".
             power = 10.0 ** ((momentary_db - LOUDNESS_OFFSET_DB) / 10.0)
             self._speech_power = self._speech_coef * self._speech_power + (1.0 - self._speech_coef) * power
             self._speech_count += 1
-            # modulation check only on a full ring that lies behind the filter start-up
-            # transient (the first ring after a (re)start would read the transient as modulation)
-            if (not self._modulated_seen and self._interval_index >= 2 * self._plateau_ring.size
-                    and float(np.max(self._plateau_ring)) - float(np.min(self._plateau_ring)) > PLATEAU_RANGE_LU):
-                self._modulated_seen = True
+            self._modulated_seen = True
         if self._speech_count == 0:
-            self._target_db = gain_db                # nothing learnt yet (first interval is falling)
+            self._target_db = gain_db                # no reference yet: hold (pre-roll noise, start-up)
             return
         gain_cap = self.max_gain_db
         if self._floor_usable() and not self._low_snr:
             gain_cap = min(gain_cap, self.target_lufs - PAUSE_HEADROOM_LU - self._floor_db)
         gain_cap = max(gain_cap, self.min_gain_db)
         target = float(np.clip(self.target_lufs - self.speech_loudness(), self.min_gain_db, gain_cap))
-        if falling or self._low_snr:
-            target = min(target, gain_db)             # never climb on a decaying envelope or in a loud room
+        if falling or not certain:
+            # never climb on a decaying envelope, nor on an interval that might be the room
+            target = min(target, gain_db)
         self._target_db = target
 
     # -- processing --------------------------------------------------------------------
@@ -387,6 +432,9 @@ class Normalizer(StageBase):
         self._plateau_ring[...] = np.nan
         self._plateau_index = 0
         self._plateau_count = 0
+        self._modulation_ring[...] = np.nan
+        self._modulation_index = 0
+        self._modulation_count = 0
         self._interval_index = 0
         self._last_momentary = DB_FLOOR_DBFS
         self._prev_momentary = DB_FLOOR_DBFS

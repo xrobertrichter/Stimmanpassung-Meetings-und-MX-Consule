@@ -1,6 +1,6 @@
 # Parameter-Begründung: DSP-Kette voicechain
 
-Stand: 2026-11-03 (nach Prüfrunde 3) · Gilt für `config/chain.default.yaml` und die Umsetzung in `voicechain/dsp/`.
+Stand: 2026-11-03 (nach Prüfrunde 4) · Gilt für `config/chain.default.yaml` und die Umsetzung in `voicechain/dsp/`.
 
 Alle Pegel in dBFS (0 dBFS = Vollaussteuerung). Für Sinussignale ist der Pegel als Spitzenwert
 gemeint (AES17: Vollaussteuerungs-Sinus = 0 dBFS), für Rauschen als RMS. Die Startwerte sind für
@@ -242,18 +242,32 @@ Alle 10 ms (absolutes Sampleraster, deshalb blockgrößenunabhängig) wird entsc
    selbst gaten.
 2. **Wirksames Gate** G = max(`gate_lufs`, L_T + `gate_margin_lu`), sobald Sprache gelernt ist
    (davor nur `gate_lufs`, damit auch ein Signal ohne Pausen die Regelung starten kann).
-3. **Zustand `low_snr` (Störabstand zu gering):** Liegt L_T weniger als 15 LU unter der
-   Sprachreferenz L_s, kann kein Gate Pausen von Sprache trennen, ohne Sprache abzuschneiden.
-   Der Normalizer friert dann den Gain ein (keine Erhöhung; eine Absenkung bei zu lauter Sprache
-   bleibt erlaubt), lernt keine Sprachreferenz und lässt keine abklingen, und hält das Gate auf
-   L_T + `gate_margin_lu`. Der Zustand endet mit Hysterese, wenn L_T wieder ≥ 17 LU unter L_s liegt
-   (2 LU gegen Flattern auf einem schwankenden Teppich). Meter: `low_snr` (0/1) und `snr_lu`
-   (L_s − L_T, ∞ solange unbekannt); die Regelung protokolliert daraus das Ereignis
-   „Störabstand zu gering“, die Statuszeile zeigt es. Test: Teppich −50 → −36 → −41 → −46 → −50
-   dBFS unter Sprache −20 dBFS: Eintritt bei 6,5 LU, bleibt bei 11,3 LU und bei 16,4 LU
-   (Hysteresefenster), Austritt bei ≥ 17 LU; Gain währenddessen ohne Anstieg, Referenz unverändert.
-3. **Absolutes Gate:** L_m < G → Pause, der Gain wird eingefroren.
-4. **Relatives Gate (wie BS.1770):** L_m < Sprachlautheit − 10 LU → ebenfalls eingefroren. Die
+3. **Was als Sprache gelernt wird:** Die Sprachreferenz L_s wird nur aus Intervallen gelernt, die
+   (a) in einem *modulierten* Signal liegen – Spanne der 10-ms-Intervall-Lautheit innerhalb der
+   letzten 2 s ≥ 6 LU (stationäres Rauschen: weiß < 2 LU, rosa < 4 LU; Sprache ≥ 7 LU selbst beim
+   glattesten Testsignal, typisch 15–30 LU; die 400-ms-Momentary würde die Silbenmodulation auf
+   ~1 LU glätten, deshalb die Intervall-Lautheit) – und (b), sobald ein Teppich bekannt ist,
+   mindestens `gate_margin_lu` + 5 LU = 13 LU über L_T liegen (ein Raumplateau schwankt ≤ 3 LU,
+   13 LU darüber ist nie der Raum). Vorlaufrauschen vor dem ersten Wort kann so nicht zur
+   Referenz werden, und ohne Referenz wird der Gain gehalten (Test: 10 s weißes Rauschen −38 dBFS,
+   20 LU über dem Gate → Gain 0,00 dB, Referenz leer; erst die Sprache danach wird gelernt). Die
+   5 LU statt der zunächst vorgesehenen 10 LU: Mit 18 LU Abstand würde das Lernen genau am
+   Betriebspunkt eines 5–8 dB lauteren Raums (Sprache 15–17 LU über dem Teppich) enden und ein
+   solcher Raum dauerhaft ungeregelt bleiben (gemessen: Raum −45 dBFS, Gain 0,00 statt 2,6 dB).
+4. **Zustand `low_snr` (Störabstand zu gering):** Liegt L_T weniger als 15 LU unter L_s, kann kein
+   Gate Pausen von Sprache trennen, ohne Sprache abzuschneiden. Der Normalizer hält das Gate auf
+   L_T + `gate_margin_lu`, lernt Referenz und Gain weiter – aber ausschließlich aus den sicheren
+   Sprachintervallen (Punkt 3 b), Pausen liegen darunter und können den Gain nicht hochziehen –
+   und setzt den Pausen-Deckel (Punkt 7) außer Kraft; es gilt nur `max_gain_db`, sonst bliebe die
+   Sprache im lauten Raum dauerhaft zu leise. Der Zustand endet mit Hysterese, wenn L_T wieder
+   ≥ 17 LU unter L_s liegt (2 LU gegen Flattern); durch das Weiterlernen ist der Zustand kein
+   Riegel mehr. Meter: `low_snr` (0/1) und `snr_lu` (L_s − L_T, ∞ solange unbekannt); die
+   Regelung protokolliert daraus das Ereignis „Störabstand zu gering“, die Statuszeile zeigt es.
+   Test: Teppich −50 → −36 → −41 → −46 → −50 dBFS unter Sprache −20 dBFS: Eintritt bei ~10 LU,
+   bleibt bei 15,8 LU (Hysteresefenster), Austritt bei ~20 LU; Pausen heben den Gain nicht
+   (≤ 0,5 dB), Referenz bleibt innerhalb 1,5 LU der des ruhigen Raums.
+5. **Absolutes Gate:** L_m < G → Pause, der Gain wird eingefroren.
+6. **Relatives Gate (wie BS.1770):** L_m < Sprachlautheit − 10 LU → ebenfalls eingefroren. Die
    Sprachlautheit L_s ist die exponentiell geglättete Lautheit (τ = `window_s`/2, entspricht dem
    3-s-Short-Term-Fenster) nur der Intervalle, die beide Gates passieren **und nicht fallen** – also
    die Lautheit der Sprache selbst, nicht der Pausen und nicht der Abklingvorgänge in Pausen hinein.
@@ -261,15 +275,16 @@ Alle 10 ms (absolutes Sampleraster, deshalb blockgrößenunabhängig) wird entsc
    leiser gewordener Sprecher; Abklingvorgänge in Pausen zählen nicht), klingt L_s mit 2 LU/s zur
    Momentary-Lautheit hin ab, nie unter G + 10 LU: ein Sprecher, der 20 LU leiser wird (größerer
    Abstand, zweiter Sprecher), ist nach ~10–20 s neu referenziert statt dauerhaft eingefroren.
-   Im Zustand `low_snr` findet weder Lernen noch Abklingen statt.
-5. **Gain-Ziel** = `clip(target_lufs − L_s, min_gain_db, min(max_gain_db, target_lufs − 15 LU − L_T))`
+   Auch das Abklingen gilt nur für sichere Sprachintervalle (Punkt 3).
+7. **Gain-Ziel** = `clip(target_lufs − L_s, min_gain_db, min(max_gain_db, target_lufs − 15 LU − L_T))`
    (Deckel nur außerhalb von `low_snr`): der Gain darf einen gatebaren Teppich nie näher als 15 LU
-   an das Ziel heben (Beauftragung §6.4).
-6. **Fallende Hüllkurve:** Fällt L_m schneller als 10 LU/s und liegt unter L_s (Wort- oder
+   an das Ziel heben (Beauftragung §6.4). Intervalle, die nicht sicher Sprache sind, dürfen den
+   Gain nicht anheben (Ziel ≤ aktueller Gain).
+8. **Fallende Hüllkurve:** Fällt L_m schneller als 10 LU/s und liegt unter L_s (Wort- oder
    Satzende), darf das Ziel nicht über dem aktuellen Gain liegen – der Gain steigt nie auf einer
    abklingenden Hüllkurve.
-7. **Asymmetrische Rate:** Der angewandte Gain läuft je Sample mit höchstens `rate_db_per_s`
-   aufwärts und `release_rate_db_per_s` abwärts auf das Ziel zu; im Zustand `low_snr` nur abwärts.
+9. **Asymmetrische Rate:** Der angewandte Gain läuft je Sample mit höchstens `rate_db_per_s`
+   aufwärts und `release_rate_db_per_s` abwärts auf das Ziel zu.
 
 Die Regelung ist feedforward (sie misst ihren eigenen Eingang) und kann daher nicht schwingen.
 Warum Momentary statt Short-Term für das Gate: Mit dem Gate auf der geglätteten Lautheit blieb es
@@ -284,30 +299,42 @@ Schätzer hängt der Schutz nicht an der Kalibrierung.
 einen Teppich von −50 dBFS (Sprache −26 dBFS, Trim +6, Makeup 6, Gate −40), danach Teppich −42
 (+8 dB) bzw. −38 dBFS (+12 dB), 30 s Sprache / 20 s Pause / 20 s Sprache, Expander-Schwelle so,
 wie die Regelung sie setzt: min(Teppich + 10, Sprache − 12) nach Trim = −32 dBFS (die Sprach-Kappe
-greift in beiden Fällen). Zwei Rauschfarben, weil Lüfter und Raum rosa-ähnlich sind, weißes
-Rauschen aber der härtere Fall für die K-Bewertung ist (Chain-Test
-`test_room_gets_louder_after_calibration`):
+greift in beiden Fällen). Rosa Rauschen ist Standard-Rosa (−3 dB/Okt von 20 Hz bis 20 kHz; das
+frühere 1/√f-Rauschen ab FFT-Bin 1 verlor 3 dB im 80-Hz-Hochpass und las 1,7 LU leiser), weißes
+Rauschen ist der härtere Fall für die K-Bewertung (Chain-Test `test_room_gets_louder_after_calibration`):
 
-| Fall | Abstand Sprache−Pause Eingang → Ausgang | Gain-Anstieg in der Pause | Einsatz nächster Satz | `low_snr` |
-|---|---|---|---|---|
-| +8 dB rosa | 15,5 → **20,9 LU** | 0,00 dB | +0,18 dB | nein |
-| +8 dB weiß | 10,1 → 9,8 LU | 0,14 dB | +0,30 dB | ja (Störabstand 11,5 LU) |
-| +12 dB rosa | 11,7 → 10,9 LU | 0,08 dB | +0,22 dB | ja |
-| +12 dB weiß | 6,7 → 2,2 LU | 0,16 dB | +0,52 dB | ja |
+| Fall | Abstand Sprache−Pause Eingang → Ausgang | Gain-Anstieg in der Pause | Einsatz nächster Satz | `low_snr` in der Pause | Sprache am Ausgang |
+|---|---|---|---|---|---|
+| +8 dB rosa | 12,3 → 12,5 LU | 0,00 dB | +0,04 dB | ja | −18,8 LUFS |
+| +8 dB weiß | 10,1 → 9,8 LU | 0,14 dB | +0,30 dB | ja | −18,8 LUFS |
+| +12 dB rosa | 8,7 → 4,3 LU | 0,12 dB | +0,34 dB | ja | −18,2 LUFS |
+| +12 dB weiß | 6,7 → 2,2 LU | 0,16 dB | +0,52 dB | ja | −18,0 LUFS |
 
-Lesart: §6.4 a (Pause ≤ Sprache − 15 LU, Einsatz ≤ +1,5 dB) ist bei +8 dB mit lüfterähnlichem
-(rosa) Rauschen erfüllt, weil der Expander 4 dB unter seiner Schwelle noch ~6 dB wegnimmt. Bei
-weißem Rauschen (+8 dB) und bei +12 dB ist der Störabstand am Normalizer-Eingang < 15 LU: der
-Normalizer meldet `low_snr`, friert den Gain ein (Anstieg ≤ 0,2 dB statt bis zu 12 dB im
-Fehlerbild PO-1) und der nächste Satz setzt ≤ +0,5 dB lauter ein – §6.4 b. Der Pausenabstand nach
-der Kette bleibt bei rosa Rauschen innerhalb 1 LU des Eingangsabstands; bei weißem Rauschen mit
-+12 dB sinkt er um ~4 LU, weil der Kompressor (Schwelle auf dem Sprach-RMS) die Sprache um 3–6 dB
-verdichtet, während der an der Sprach-Kappe stehende Expander den Teppich am Schwellenpunkt nur
-~1 dB absenkt. Das ist eine Eigenschaft von Kompressor plus gekappter Expander-Schwelle, nicht des
-Normalizers; Abhilfe wäre nur ein Eingriff in den Kompressor im Zustand `low_snr` oder – wie
-§6.4 b vorsieht – Raum verbessern bzw. neu kalibrieren. Eine Pause auf Sprachlautheit entsteht in
-keinem Fall (schlechtester Fall 2,2 LU Abstand, ohne Hochziehen). Der Teppich-Schätzer folgt einem
-Raum, der um 10 dB lauter wird, innerhalb von ~20 s (gemessen −50 → −41,6 LUFS, Soll −41,9).
+Lesart: Der Normalizer hält in allen Fällen §6.4 b ein – Gain-Anstieg in der 20-s-Pause ≤ 0,2 dB
+(statt bis zu 12 dB im Fehlerbild PO-1), nächster Satz ≤ +0,5 dB lauter, `low_snr` gemeldet,
+Sprache auf dem Ziel, Pause nie auf Sprachlautheit (schlechtester Fall 2,2 LU Abstand). Der
+Abstand Sprache−Pause schrumpft nach der Nachführung um höchstens 5 LU (gemessen +0,2 / −0,3 /
+−4,4 / −4,5 LU), weil der Kompressor (Schwelle auf dem Sprach-RMS) die Sprache um 3–6 dB
+verdichtet, während der an der Sprach-Kappe stehende Expander den Teppich nur um 1–6 dB
+absenkt; vor der Nachführung (Expander noch auf dem alten Teppich) sind es bis zu 7 LU. Das ist
+eine Eigenschaft von Kompressor plus gekappter Expander-Schwelle, nicht des Normalizers. §6.4 a
+(Pause ≤ Sprache − 15 LU bei bis zu +8 dB) wird in diesem synthetischen Szenario mit
+Standard-Rosa nicht erreicht: Der Eingangsabstand beträgt dort nur 12,3 LU (Sprache −26 dBFS,
+Teppich −42 dBFS), und die Kette gewinnt netto 0,2 LU; mit dem früheren tieffrequenzlastigen
+Rosa lagen Eingang 15,5 und Ausgang 20,9 LU. Ob reale Lüftergeräusche näher am einen oder
+anderen Spektrum liegen, entscheidet der Hörtest am Arbeitsplatz. Der Teppich-Schätzer folgt
+einem Raum, der um 10 dB lauter wird, innerhalb von ~20 s (gemessen −50 → −41,6 LUFS, Soll −41,9).
+
+**Vorlaufrauschen und leiser werdender Sprecher (System):** Beginnt der Stream mit 3 s oder 10 s
+Rauschen vor dem ersten Wort (weiß, −55/−50/−45 dBFS, kalibrierte −50-Kette), steigt der Gain im
+Vorlauf um 0,00 dB, `low_snr` bleibt in den Räumen −55/−50 bei 0,0 % über 180 s, und die aktive
+Sprache liegt 30 s nach dem ersten Wort bei −16,7 LUFS (−45: −17,0 LUFS, `low_snr` 94–98 %, Gain
+regelt trotzdem auf 2,6 dB). Wird der Sprecher im +8-dB-Rosa-Raum nach der Nachführung um 6 dB
+leiser, liegt der Ausgang 30–40 s danach bei −19,3 LUFS (−16,8 davor): der Kompressor fängt den
+Großteil ab; die Sprache des leiseren Sprechers liegt dort nur ~13 LU über dem Teppich, sodass
+der Normalizer sie nicht mehr als sichere Sprache lernt und den Gain bei 3,4 dB hält – innerhalb
+der Toleranz, aber ohne Regelung; ein Raum mit Störabstand < 15 LU bleibt ein Fall für
+Neukalibrierung oder leiseren Raum.
 
 | Parameter | Startwert | Bereich | Begründung |
 |---|---|---|---|
@@ -466,12 +493,12 @@ bezeichnet, dass die Grenzen innerhalb des Stufenbereichs liegen und dass der ak
   vielen Pausen lesen 2–3 LU weniger (siehe 7). Die effektive Aufwärtsrate bei bewegter Sprache
   liegt bei etwa 0,4 dB/s; ein Start weit unter dem Ziel braucht entsprechend länger – die
   Kalibrierung (Input Trim) soll den Startpunkt in die Nähe des Ziels legen.
-- Raum wird nach der Kalibrierung lauter: Bis +8 dB mit lüfterähnlichem Rauschen hält die Kette
-  nach der Expander-Nachführung (erster Schritt ~20 s, Endwert ~1,5 min) den Abstand ≥ 15 LU.
-  Darüber (Störabstand am Eingang < ~16 dB) kann der Expander wegen der Sprach-Kappe nicht mehr
-  absenken; der Normalizer meldet `low_snr`, friert den Gain ein und verhindert damit das
-  Hochziehen der Pause – den Abstand verbessern kann dann nur Raum oder Neukalibrierung; bei
-  weißem Rauschen und +12 dB schrumpft der Abstand durch den Kompressor um ~4 LU (§7, Tabelle).
+- Raum wird nach der Kalibrierung lauter: Der Normalizer meldet `low_snr`, hält Pausen vom Gain
+  fern (Anstieg ≤ 0,2 dB, Einsatz ≤ +0,5 dB) und regelt die Sprache weiter aus sicheren
+  Sprachintervallen; der Abstand Sprache−Pause schrumpft durch Kompressor und gekappte
+  Expander-Schwelle um bis zu 7 LU vor und 5 LU nach der Nachführung (§6.4 b, §7 Tabelle). Die
+  15 LU von §6.4 a werden mit Standard-Rosa bei +8 dB im synthetischen Szenario nicht erreicht
+  (12,5 LU); den Abstand verbessern kann nur ein leiserer Raum oder eine Neukalibrierung.
 - True-Peak-Sicherheit beruht auf der Marge, nicht auf überabgetasteter Detektion (siehe 8).
 - Zusammenspiel mit der Kalibrierung: Die Kompressorschwelle auf dem Sprach-RMS senkt den
   Sprach-RMS um ~6 dB; von den 15 dB statischer Expander-Absenkung (10 dB Abstand zum

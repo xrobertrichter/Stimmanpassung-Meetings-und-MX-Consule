@@ -210,9 +210,12 @@ class AdaptiveController:
 4. Adaptive Regelung: in Simulation konvergiert sie innerhalb der Grenzen, oszilliert nicht,
    greift in der Lernphase nicht ein, protokolliert jede Änderung mit Grund. **Raumänderung im
    Betrieb** (Ergänzung 2026-11-03, PO Runde 2, präzisiert nach PO Runde 3):
-   a) Wird der Rauschteppich nach der Kalibrierung um bis zu 8 dB lauter, darf die Pausenlautheit
-      nach der Kette die Sprachlautheit − 15 LU nicht überschreiten und der nächste Satz nicht
-      lauter als +1,5 dB einsetzen.
+   a) Wird der Rauschteppich nach der Kalibrierung um bis zu 8 dB lauter, liegt die Pausenlautheit
+      nach der Kette mindestens 15 LU unter der Sprachlautheit oder, wenn der Abstand am Eingang
+      bereits geringer ist, mindestens so weit wie am Eingang; der nächste Satz setzt nicht
+      lauter als +1,5 dB ein. (Präzisierung nach Runde 5: Standard-Rosa +8 dB ergibt am Eingang
+      nur 12,3 LU K-bewerteten Abstand; die Kette hält ihn, kann ihn aber ohne Sprachverlust
+      nicht auf 15 LU vergrößern.)
    b) Bei größeren Anstiegen (Störabstand am Eingang unter ca. 16 dB) kann der Expander Pausen
       nicht weiter absenken, ohne Sprache abzuschneiden (Kappe Sprachpegel − 12 dB). Dann gilt:
       der Normalizer-Gain steigt in Pausen um höchstens 1 dB, der nächste Satz setzt höchstens

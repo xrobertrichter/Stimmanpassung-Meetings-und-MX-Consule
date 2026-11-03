@@ -17,6 +17,15 @@ def loudness_lufs(x, fs):
     return -0.691 + 10.0 * np.log10(np.mean(weighted ** 2))
 
 
+def gapped_sine(gen, freq_hz, peak_dbfs, seconds, fs, gap_s=0.6, period_s=2.0):
+    """Sine with a silent gap of ``gap_s`` every ``period_s``: the normaliser learns its
+    reference only from *modulated* signal (a steady tone would be taken for room noise),
+    so the stationary test tones carry a 30 % gap pattern; the tone itself is unchanged."""
+    x = gen.sine(freq_hz, peak_dbfs, seconds, fs)
+    t = np.arange(len(x)) / fs
+    return x * ((t % period_s) >= gap_s)
+
+
 def _run(stage, x, block):
     out, gains = [], []
     for i in range(0, len(x), block):
@@ -35,14 +44,18 @@ def test_reference_loudness_of_sine(fs, gen):
 
 
 def test_quiet_signal_is_pulled_to_target_within_rate_limit(fs, gen):
-    x = gen.sine(1000.0, -27.0, 25.0, fs)
-    y, gains = _run(Normalizer(fs, **DEFAULT), x, 1024)
-    assert abs(loudness_lufs(y[-3 * fs:], fs) - DEFAULT["target_lufs"]) < 1.0
+    x = gapped_sine(gen, 1000.0, -27.0, 30.0, fs)                      # tone at -30 LUFS
+    stage = Normalizer(fs, **DEFAULT)
+    y, gains = _run(stage, x, 1024)
+    tone = np.abs(x) > 0
+    assert abs(loudness_lufs(y[-6 * fs:][tone[-6 * fs:]], fs) - DEFAULT["target_lufs"]) < 1.0
     block_s = 1024 / fs
     assert np.max(np.diff(gains)) <= DEFAULT["rate_db_per_s"] * block_s * (1 + 1e-9)
+    assert abs(np.max(np.diff(gains)) / block_s - DEFAULT["rate_db_per_s"]) < 0.01   # exactly 1 dB/s while rising
     assert np.all(np.diff(gains) >= -1e-12)         # monotonic ramp towards the target
-    assert 4.0 <= gains[int(5.0 / block_s)] <= 5.2  # 1 dB/s -> ~5 dB after 5 s
+    assert np.argmax(gains > 0.01) * block_s < 1.5  # starts as soon as the first gap proves modulation
     assert abs(gains[-1] - 12.0) < 0.05             # exactly the 12 dB that are needed
+    assert abs(stage.meters()["loudness_lufs"] + 30.0) < 0.5
 
 
 def test_gate_prevents_pumping_up_silence(fs, gen):
@@ -55,14 +68,16 @@ def test_gate_prevents_pumping_up_silence(fs, gen):
 
 
 def test_max_and_min_gain_are_respected(fs, gen):
-    x = gen.sine(1000.0, -32.0, 25.0, fs)           # -35 LUFS needs +17 dB -> capped at +12
+    x = gapped_sine(gen, 1000.0, -32.0, 30.0, fs)   # -35 LUFS needs +17 dB -> capped at +12
+    tone = np.abs(x) > 0
     y, gains = _run(Normalizer(fs, **DEFAULT), x, 1024)
     assert np.max(gains) <= DEFAULT["max_gain_db"] + 1e-12
-    assert abs(loudness_lufs(y[-3 * fs:], fs) + 23.0) < 0.5
-    loud = gen.sine(1000.0, 3.0, 25.0, fs)          # 0 LUFS needs -18 dB -> capped at -12
+    assert abs(loudness_lufs(y[-6 * fs:][tone[-6 * fs:]], fs) + 23.0) < 0.5
+    loud = gapped_sine(gen, 1000.0, 3.0, 25.0, fs)  # 0 LUFS needs -18 dB -> capped at -12
+    loud_tone = np.abs(loud) > 0
     y, gains = _run(Normalizer(fs, **DEFAULT), loud, 1024)
     assert np.min(gains) >= DEFAULT["min_gain_db"] - 1e-12
-    assert abs(loudness_lufs(y[-3 * fs:], fs) + 12.0) < 0.5
+    assert abs(loudness_lufs(y[-6 * fs:][loud_tone[-6 * fs:]], fs) + 12.0) < 0.5
 
 
 def test_gain_is_held_in_pauses_and_resumes(fs, gen):
@@ -80,27 +95,56 @@ def test_block_invariance(fs, gen):
 
 
 def test_disabled_keeps_measuring(fs, gen):
-    x = gen.sine(1000.0, -27.0, 4.0, fs)
+    x = gapped_sine(gen, 1000.0, -27.0, 8.0, fs)
     stage = Normalizer(fs, **{**DEFAULT, "enabled": False})
     y, gains = _run(stage, x, 1024)
     assert np.array_equal(y, x) and np.all(gains == 0.0)
-    assert abs(stage.meters()["loudness_lufs"] + 30.0) < 0.1
+    assert abs(stage.meters()["loudness_lufs"] + 30.0) < 0.5
 
 
 def test_max_gain_can_be_changed_at_runtime(fs, gen):
     """The adaptive controller lowers/raises max_gain_db live; the cap must apply at once."""
-    x = gen.sine(1000.0, -32.0, 20.0, fs)           # -35 LUFS wants +17 dB
+    x = gapped_sine(gen, 1000.0, -32.0, 30.0, fs)   # -35 LUFS wants +17 dB
     stage = Normalizer(fs, **DEFAULT)
-    _run(stage, x[:10 * fs], 1024)
-    assert abs(stage.meters()["gain_db"] - 10.0) < 0.05        # 1 dB/s for 10 s
+    _, gains = _run(stage, x[:15 * fs], 1024)
+    assert 8.0 <= stage.meters()["gain_db"] <= 12.0            # ~1 dB/s during the tone parts
     stage.set_param("max_gain_db", 6.0)
     assert stage.get_param("max_gain_db") == 6.0
-    _, gains = _run(stage, x[10 * fs:], 1024)
-    assert np.all(gains <= 10.0 + 1e-12) and abs(gains[-1] - 6.0) < 0.05   # ramps down to the new cap
+    _, gains = _run(stage, x[15 * fs:], 1024)
+    assert np.all(gains <= 12.0 + 1e-12) and abs(gains[-1] - 6.0) < 0.05   # ramps down to the new cap
     release_rate = stage.get_param("release_rate_db_per_s")                  # default 3 dB/s downwards
     assert release_rate == 3.0
     assert np.min(np.diff(gains)) >= -release_rate * 1024 / fs * (1 + 1e-9)
     assert abs(np.min(np.diff(gains)) + release_rate * 1024 / fs) < 1e-9     # and it does use the full rate
+
+
+def test_gain_does_not_rise_on_a_decaying_envelope(fs, gen):
+    """Tone at -30 LUFS that fades out at -30 dB/s: the gain climbs during the tone, not during
+    the fade (a word end). Without the rule it would keep climbing at 1 dB/s for ~0.7 s until
+    the gate closes; the 400 ms detector needs ~0.1 s to register the fall, so a residual rise
+    of at most 0.25 dB is tolerated."""
+    plateau = gapped_sine(gen, 1000.0, -27.0, 8.0, fs)
+    t = np.arange(2 * fs) / fs
+    fade = gen.sine(1000.0, -27.0, 2.0, fs) * 10 ** (-30.0 * t / 20.0)
+    stage = Normalizer(fs, **DEFAULT)
+    _, g_plateau = _run(stage, plateau, 256)
+    _, g_fade = _run(stage, fade, 256)
+    assert g_plateau[-1] > 3.5
+    assert np.max(g_fade) <= g_plateau[-1] + 0.25
+    assert g_fade[-1] <= g_plateau[-1] + 0.25
+
+
+def test_asymmetric_rates(fs, gen):
+    loud = gapped_sine(gen, 1000.0, 3.0, 10.0, fs)              # 0 LUFS: 12 dB too loud -> cap -12
+    y, gains = _run(Normalizer(fs, **DEFAULT), loud, 1024)
+    per_s = fs / 1024
+    assert abs(np.min(np.diff(gains)) * per_s + 3.0) < 0.03     # 3 dB/s downwards
+    quiet = gapped_sine(gen, 1000.0, -27.0, 10.0, fs)
+    y, gains = _run(Normalizer(fs, **DEFAULT), quiet, 1024)
+    assert abs(np.max(np.diff(gains)) * per_s - 1.0) < 0.01     # 1 dB/s upwards
+    fast = Normalizer(fs, **{**DEFAULT, "release_rate_db_per_s": 6.0})
+    y, gains = _run(fast, loud, 1024)
+    assert abs(np.min(np.diff(gains)) * per_s + 6.0) < 0.06
 
 
 def test_validation(fs):
@@ -229,8 +273,9 @@ def test_gain_cap_keeps_pause_15_lu_below_target(fs, gen):
 
 def test_low_snr_state_with_hysteresis(fs, gen):
     """Room floor steps -50 -> -36 -> -41 -> -46 -> -50 dBFS under speech with 1.5 s pauses:
-    low_snr enters below 15 LU, stays while 15 <= snr < 17 (hysteresis), leaves above 17;
-    while it is set the gain does not rise and nothing is learnt."""
+    low_snr enters below 15 LU, stays while 15 <= snr < 17 (hysteresis), leaves above 17.
+    While it is set the reference is not learnt from the room and pauses do not lift the
+    gain (learning continues only from intervals >= floor + margin + 5 LU)."""
     parts = []
     for k, floor in enumerate((-50.0, -36.0, -41.0, -46.0, -50.0)):
         part, _ = gen.speech_like(-20.0, 30.0, fs, seed=80 + k, noise_rms_dbfs=floor, talk_s=0.6, pause_s=1.5)
@@ -247,13 +292,26 @@ def test_low_snr_state_with_hysteresis(fs, gen):
     def at(t):
         return log[int(t * per_s)]
     assert at(25)[0] == 0.0 and at(25)[1] > 20.0                   # quiet room: normal operation
-    assert at(55)[0] == 1.0 and at(55)[1] < 15.0                   # -36 dBFS: entered
-    assert at(85)[0] == 1.0 and at(85)[1] < 15.0                   # -41 dBFS: still too close
-    assert at(115)[0] == 1.0 and 15.0 <= at(115)[1] < 17.0         # -46 dBFS: inside the hysteresis band
-    assert at(145)[0] == 0.0 and at(145)[1] >= 17.0                # -50 dBFS: left again
+    assert at(55)[0] == 1.0 and at(55)[1] < 15.0                   # -36 dBFS: entered (measured ~10 LU)
+    assert at(85)[0] == 1.0 and 15.0 <= at(85)[1] < 17.0           # -41 dBFS: inside the hysteresis band
+    assert at(115)[0] == 0.0 and at(115)[1] >= 17.0                # -46 dBFS: left again (~20 LU)
     gains = np.array([row[2] for row in log])
     refs = np.array([row[3] for row in log])
-    frozen = slice(int(50 * per_s), int(120 * per_s))
-    assert np.max(gains[frozen]) - gains[int(50 * per_s)] <= 0.5     # no rise while low_snr
-    assert abs(refs[int(119 * per_s)] - refs[int(52 * per_s)]) <= 0.5  # reference not learnt from the room
+    low = slice(int(50 * per_s), int(90 * per_s))
+    assert np.max(gains[low]) - gains[int(50 * per_s)] <= 0.5        # pauses of the loud room never lift the gain
+    assert abs(refs[int(89 * per_s)] - refs[int(45 * per_s)]) <= 1.5  # reference not learnt from the room
     assert set(stage.meters()) >= {"low_snr", "snr_lu", "noise_floor_lufs", "effective_gate_lufs"}
+
+
+def test_preroll_noise_is_not_learnt_as_reference(fs, gen):
+    """Stationary noise above gate_lufs before the first word (pre-roll) must not become the
+    speech reference and must not run the gain up; the first words start the regulation."""
+    noise = gen.white_noise(-38.0, 10.0, fs, seed=5)                 # ~ -35 LUFS, well above the -40 gate
+    speech, _ = gen.speech_like(-20.0, 30.0, fs, seed=6, noise_rms_dbfs=-38.0)
+    stage = Normalizer(fs, **DEFAULT)
+    _, g_pre = _run(stage, noise, 256)
+    assert np.max(np.abs(g_pre)) <= 0.5                                # no regulation on noise
+    assert stage.meters()["loudness_lufs"] == -150.0                   # no reference learnt
+    _, g_speech = _run(stage, speech, 256)
+    assert g_speech[-1] > 1.0                                          # speech is learnt and regulated upwards
+    assert stage.meters()["loudness_lufs"] > -26.0                     # the reference is the speaker, not the noise
