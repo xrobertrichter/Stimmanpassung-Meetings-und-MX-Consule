@@ -338,8 +338,16 @@ def test_room_offset_enters_the_floor_rule_before_the_speech_cap():
     floor -50 + 10 + 6 = -34; the controller never settles above the cap."""
     cfg, chain, ctrl = make({"expander": {"threshold_db": -40.0}})
     ctrl.set_user_offsets({"expander.threshold_db": 6.0})
-    run(ctrl, lambda i: meters_dict(floor=-50.0, speech=-25.0), 40)
-    assert chain.get_param("expander", "threshold_db") <= -37.0 + adaptive.EXPANDER_DEADZONE_DB
+    changes = run(ctrl, lambda i: meters_dict(floor=-50.0, speech=-25.0), 40)
+    exp = [c for c in changes if c["stage"] == "expander"]
+    # (A) the target itself is capped, so the threshold ends at or below the cap ...
+    assert chain.get_param("expander", "threshold_db") <= -37.0
+    # (B) ... without the protection rule ever having to pull it back ...
+    assert [c for c in exp if c["reason"] == "speech_cap"] == []
+    # (C) ... the offset is untouched (nothing was taken back) ...
+    assert ctrl.user_offsets["expander.threshold_db"] == 6.0
+    # (D) ... and the threshold never rose above the cap on the way.
+    assert max(c["new"] for c in exp) <= -37.0
     assert ctrl.last_expander_cap == pytest.approx(-37.0)
     # Without the cap (speech -20 -> cap -32) the offset is fully effective: -34.
     cfg, chain, ctrl = make({"expander": {"threshold_db": -40.0}})
