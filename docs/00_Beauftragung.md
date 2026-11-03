@@ -194,8 +194,13 @@ class AdaptiveController:
 1. `pytest -q` grün im Container ohne Audiogeräte.
 2. `python -m voicechain selftest` gibt einen Bericht mit messbaren Prüfwerten aus, alle bestanden.
 3. `python -m voicechain calibrate --wav <sample>` erzeugt YAML + Bericht; die Kette verbessert das
-   Sample messbar (Rauschteppich ↓ ≥ 6 dB, Zischanteil ↓, Lautheit innerhalb Ziel ± 2 LU,
-   True Peak ≤ Ceiling).
+   Sample messbar: Störabstandsgewinn (Sprachpegel minus Rauschteppich, nachher minus vorher)
+   ≥ 6 dB **und** Pausenlautheit nach der Kette ≤ Ziel-Lautheit − 20 LU (gemessen in einer
+   Pause ≥ 5 s), Zischanteil ↓, Lautheit innerhalb Ziel ± 2 LU, True Peak ≤ Ceiling.
+   Das Sample muss mindestens eine Pause ≥ 5 s enthalten.
+   _Änderung 2026-11-03 (Blindprüfung BL-1, PO-8): ursprünglich "Rauschteppich ↓ ≥ 6 dB"
+   absolut; ein absoluter Wert ist bei Lautheitsnormalisierung nicht sinnvoll, daher relativ
+   plus absolute Pausenobergrenze._
 4. Adaptive Regelung: in Simulation konvergiert sie innerhalb der Grenzen, oszilliert nicht,
    greift in der Lernphase nicht ein, protokolliert jede Änderung mit Grund.
 5. Dokumentation ermöglicht einer technisch versierten Person ohne Audio-Vorwissen die
