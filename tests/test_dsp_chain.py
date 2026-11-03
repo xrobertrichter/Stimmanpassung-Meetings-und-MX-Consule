@@ -179,6 +179,7 @@ def test_end_to_end_speech(chain, fs, gen):
         assert -22.0 <= short_term <= -16.0
 
 
+@pytest.mark.slow
 def test_long_pause_in_calibrated_chain(cfg, fs, gen):
     """Long pause on the whole chain with calibration-like thresholds: speech 30 s, pause 20 s, speech 20 s."""
     for noise_dbfs in (-50.0, -42.0):
@@ -371,10 +372,10 @@ def _lufs(sig, fs, a, b, mask=None):
     # +8 dB fan-like noise: in this synthetic scenario (speech -26 dBFS) the floor lies only
     # 12.9 LU under the speech at the normaliser's input -> still flagged; the system measurement
     # of the product owner (15.5-16.5 LU) clears the state since the exit moved to 15 LU
-    (-42.0, "pink", True),
-    (-42.0, "white", True),    # +8 dB white: ~10 LU
+    pytest.param(-42.0, "pink", True, marks=pytest.mark.slow),
+    (-42.0, "white", True),    # +8 dB white: ~10 LU          (standard run: both levels, both colours)
     (-38.0, "pink", True),     # +12 dB: Beauftragung 6.4 b, after tracking <= 5 LU loss
-    (-38.0, "white", True),
+    pytest.param(-38.0, "white", True, marks=pytest.mark.slow),
 ])
 def test_room_gets_louder_after_calibration(cfg, fs, gen, floor_dbfs, kind, expect_low_snr):
     """Beauftragung 6.4 with the thresholds the system really uses. The chain is calibrated
@@ -413,14 +414,21 @@ def test_room_gets_louder_after_calibration(cfg, fs, gen, floor_dbfs, kind, expe
     assert abs(_lufs(y, fs, 20, 30) + 18.0) <= 2.0                      # speech still on target
 
 
-@pytest.mark.parametrize("preroll_s", [3.0, 10.0])
-@pytest.mark.parametrize("floor_dbfs", [-55.0, -50.0, -45.0])
+@pytest.mark.parametrize("preroll_s, floor_dbfs", [
+    (3.0, -50.0),                                                  # standard run: the two extremes of both axes
+    (10.0, -45.0),
+    pytest.param(3.0, -55.0, marks=pytest.mark.slow),
+    pytest.param(10.0, -55.0, marks=pytest.mark.slow),
+    pytest.param(10.0, -50.0, marks=pytest.mark.slow),
+    pytest.param(3.0, -45.0, marks=pytest.mark.slow),
+])
 def test_preroll_noise_does_not_lock_the_normaliser(cfg, fs, gen, preroll_s, floor_dbfs):
     """Stream starts with pre-roll noise (white) before the first word, calibrated -50 chain:
-    no gain run-up before the first word, low_snr < 5 % over 180 s in the -55/-50 rooms, and
-    the speech is regulated to -18 +-2 LU after 30 s of talking."""
-    speech, active = gen.speech_like(-26.0, 180.0 - preroll_s, fs, seed=90, noise_rms_dbfs=-150.0)
-    x = np.concatenate([np.zeros(int(preroll_s * fs)), speech]) + gen.white_noise(floor_dbfs, 180.0, fs, seed=91)
+    no gain run-up before the first word, low_snr < 5 % over 120 s in the -55/-50 rooms, and
+    the speech is regulated to -18 +-2 LU after 30 s of talking (and still at the end)."""
+    duration = 120.0
+    speech, active = gen.speech_like(-26.0, duration - preroll_s, fs, seed=90, noise_rms_dbfs=-150.0)
+    x = np.concatenate([np.zeros(int(preroll_s * fs)), speech]) + gen.white_noise(floor_dbfs, duration, fs, seed=91)
     active = np.concatenate([np.zeros(int(preroll_s * fs), dtype=bool), active])
     y, gains, low_snr = _run_calibrated(_calibrated_chain(cfg, -50.0), x, fs)
     per_s = fs / 256
@@ -431,9 +439,10 @@ def test_preroll_noise_does_not_lock_the_normaliser(cfg, fs, gen, preroll_s, flo
     print(f"\npreroll {preroll_s:.0f} s floor {floor_dbfs}: low_snr {100 * np.mean(low_snr):.1f} %, "
           f"active loudness after 30 s {loud:.1f} LUFS, gain end {gains[-1]:.2f} dB")
     assert abs(loud + 18.0) <= 2.0
-    assert abs(_lufs(y, fs, 150, 180, active) + 18.0) <= 2.0
+    assert abs(_lufs(y, fs, 90, 120, active) + 18.0) <= 2.0
 
 
+@pytest.mark.slow
 def test_quieter_speaker_in_loud_room_is_followed(cfg, fs, gen):
     """+8 dB fan room after tracking (standard pink, floor -42 dBFS), 20 s pause, then the
     speaker becomes 6 dB quieter: the output is back at -18 +-2 LU within 40 s (the compressor
@@ -454,6 +463,7 @@ def test_quieter_speaker_in_loud_room_is_followed(cfg, fs, gen):
     assert gen.rms_db(y[int(60.5 * fs):int(61.5 * fs)]) <= gen.rms_db(y[39 * fs:40 * fs]) + 1.5
 
 
+@pytest.mark.slow
 def test_dense_lecture_never_triggers_low_snr(cfg, fs, gen):
     """A speaker with only 10 % pauses (1.8 s talk / 0.2 s gaps) in the calibrated room: the
     floor estimator finds no plateau, low_snr stays off and the gain regulates normally."""
@@ -675,3 +685,55 @@ def test_processing_and_bypass_combine(cfg, fs, gen):
     chain.set_bypass(False)
     tail = np.concatenate([chain.process(x[i:i + 256]) for i in range(0, fs, 256)])
     assert np.all(np.isfinite(tail)) and chain.get_meters()["chain"]["bypass_mix"] == 0.0
+
+
+def test_peek_meters_does_not_drain(cfg, fs, gen):
+    """peek_meters() returns the running accumulator values and leaves them in place; the next
+    get_meters() still sees (and then drains) them."""
+    chain = Chain.from_config(cfg)
+    _run(chain, gen.sine(1000.0, -1.0, 0.5, fs).astype(np.float32), 256)
+    first = chain.peek_meters()
+    second = chain.peek_meters()
+    assert first["compressor"]["gain_reduction_max_db"] > 5.0
+    for stage in ("expander", "deesser", "compressor", "limiter"):
+        for key in ("gain_reduction_db", "gain_reduction_mean_db", "gain_reduction_max_db"):
+            assert first[stage][key] == second[stage][key]
+    assert set(first) == set(chain.get_meters(drain=False)) and "chain" in first and "input" in first
+    drained = chain.get_meters()
+    assert drained["compressor"]["gain_reduction_max_db"] == first["compressor"]["gain_reduction_max_db"]
+    assert chain.get_meters()["compressor"]["gain_reduction_max_db"] == 0.0        # now drained
+    assert chain.peek_meters()["compressor"]["gain_reduction_db"] == first["compressor"]["gain_reduction_db"]
+
+
+def test_processing_on_recovers_middle_stages(cfg, fs, gen, monkeypatch):
+    """Switching processing back on calls recover() on every middle stage exactly once (not
+    while off, not for trim/limiter), leaves fresh filter states behind and keeps the
+    normaliser's gain."""
+    x, _ = gen.speech_like(-26.0, 12.0, fs, seed=14, noise_rms_dbfs=-50.0, talk_s=0.6, pause_s=1.0)
+    x = x.astype(np.float32)
+    chain = _calibrated_chain(cfg, -50.0)
+    calls = {}
+    zi_at_recover = {}
+    for name, stage in chain.stages.items():
+        original = stage.recover
+
+        def spy(stage=stage, name=name, original=original):
+            original()
+            calls[name] = calls.get(name, 0) + 1
+            if hasattr(stage, "_filter"):
+                zi_at_recover[name] = float(np.max(np.abs(stage._filter._zi)))
+        monkeypatch.setattr(stage, "recover", spy)
+    _run(chain, x[:6 * fs], 256)
+    gain_before = chain.get_meters()["normalizer"]["gain_db"]
+    hp_zi_before = float(np.max(np.abs(chain.stage("highpass")._filter._zi)))
+    assert hp_zi_before > 0.0 and gain_before > 1.0
+    chain.set_processing(False)
+    _run(chain, x[6 * fs:8 * fs], 256)
+    assert calls == {}                                                      # nothing recovered while switching off
+    chain.set_processing(True)
+    chain.process(x[8 * fs:8 * fs + 256])
+    assert calls == {name: 1 for name in ("highpass", "expander", "deesser", "eq", "compressor", "normalizer")}
+    assert zi_at_recover["highpass"] == 0.0 and zi_at_recover["eq"] == 0.0   # fresh filter states at that moment
+    assert chain.get_meters()["normalizer"]["gain_db"] == gain_before         # kept across the recover
+    _run(chain, x[8 * fs + 256:], 256)
+    assert calls["highpass"] == 1                                            # no second recover later

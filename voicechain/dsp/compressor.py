@@ -83,8 +83,8 @@ class Compressor(StageBase):
         self._reduction.add(reduction)
         return x * (db_to_amp(-reduction) * self._makeup.process(x.size))
 
-    def meters(self) -> dict:
-        mean, peak = self._reduction.read()
+    def meters(self, drain: bool = True) -> dict:
+        mean, peak = self._reduction.read() if drain else self._reduction.peek()
         return {
             "enabled": float(self.enabled),
             "gain_reduction_db": self._reduction.last_mean,
@@ -92,6 +92,9 @@ class Compressor(StageBase):
             "gain_reduction_max_db": peak,
             "level_dbfs": self._last_level,
         }
+
+    def peek_meters(self) -> dict:
+        return self.meters(drain=False)
 
     def reset(self) -> None:
         self._smoother.reset()

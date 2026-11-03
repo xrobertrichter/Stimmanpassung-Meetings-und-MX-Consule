@@ -28,7 +28,7 @@ def test_default_config_loads(cfg):
     assert cfg["chain"]["normalizer"]["release_rate_db_per_s"] == 3.0
     assert cfg["chain"]["normalizer"]["gate_margin_lu"] == 8.0
     assert cfg["chain"]["eq"]["tilt_db"] == 0.0
-    assert cfg["control"] == {"socket_path": "logs/control.sock"}
+    assert "control" not in cfg                                       # optional; the runtime picks /tmp/voicechain-<user>.sock
     assert cfg["adaptive"]["bounds"]["deesser.threshold_db"] == [-45.0, -10.0]
     assert cfg["adaptive"]["bounds"]["normalizer.max_gain_db"] == [0.0, 12.0]
     assert "+8 dB" not in default_config_path().read_text(encoding="utf-8")
@@ -62,9 +62,9 @@ def test_default_yaml_documents_every_value(cfg):
     (lambda c: c["chain"]["normalizer"].update(release_rate_db_per_s=0.0), "chain.normalizer.release_rate_db_per_s: value 0.0 outside"),
     (lambda c: c["chain"]["eq"].update(tilt_db=4.0), "chain.eq.tilt_db: value 4.0 outside"),
     (lambda c: c["chain"]["eq"].update(tilt_db="bright"), "chain.eq.tilt_db: must be a number"),
-    (lambda c: c["control"].update(socket_path=""), "control.socket_path: must be a non-empty string"),
-    (lambda c: c["control"].pop("socket_path"), "control.socket_path: missing"),
-    (lambda c: c["control"].update(port=5), "control.port: unknown key"),
+    (lambda c: c.update(control={"socket_path": ""}), "control.socket_path: must be a non-empty string"),
+    (lambda c: c.update(control={}), "control.socket_path: missing"),
+    (lambda c: c.update(control={"socket_path": "/tmp/x.sock", "port": 5}), "control.port: unknown key"),
     (lambda c: c["chain"]["highpass"].update(enabled="yes"), "chain.highpass.enabled: must be true or false"),
     (lambda c: c["chain"]["highpass"].update(order=4.5), "chain.highpass.order: must be an integer"),
     (lambda c: c["chain"]["eq"]["bands"][0].update(type="notch"), "chain.eq.bands[0].type='notch'"),
@@ -106,7 +106,7 @@ def test_optional_internal_parameters_are_accepted(cfg):
     del extended["chain"]["normalizer"]["release_rate_db_per_s"]         # optional: default 3.0 applies
     del extended["chain"]["normalizer"]["gate_margin_lu"]                # optional: default 8.0 applies
     del extended["chain"]["eq"]["tilt_db"]                               # optional: default 0.0 applies
-    del extended["control"]                                              # optional section
+    extended["control"] = {"socket_path": "/tmp/voicechain-test.sock"}  # optional section, accepted when present
     validate_config(extended)
     chain = Chain.from_config(extended)
     assert chain.get_param("expander", "detector_ms") == 8.0
@@ -159,7 +159,7 @@ def test_saved_file_is_plain_yaml(cfg, tmp_path):
 
 def test_control_and_tilt_round_trip(cfg, tmp_path):
     custom = copy.deepcopy(cfg)
-    custom["control"]["socket_path"] = "/tmp/voicechain-test.sock"
+    custom["control"] = {"socket_path": "/tmp/voicechain-test.sock"}
     custom["chain"]["eq"]["tilt_db"] = 1.5
     path = tmp_path / "control.yaml"
     save_config(custom, path)

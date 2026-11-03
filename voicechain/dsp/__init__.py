@@ -134,7 +134,11 @@ class StageBase(abc.ABC):
 
     @abc.abstractmethod
     def meters(self) -> dict:
-        """Return the measurements of the most recently processed block."""
+        """Return the measurements of the most recently processed block (drains accumulators)."""
+
+    def peek_meters(self) -> dict:
+        """Like ``meters`` but without draining any accumulator (status displays, state queries)."""
+        return self.meters()
 
     @abc.abstractmethod
     def reset(self) -> None:

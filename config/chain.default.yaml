@@ -85,8 +85,9 @@ chain:
     lookahead_ms: 5.0       # Gesamt-Latenz der Kette; reicht für weiche Eingriffe
     release_ms: 50.0        # schnell genug, dass Sprache nach einer Spitze nicht "eingedrückt" bleibt
 
-control:
-  socket_path: "logs/control.sock"   # optional: Unix-Socket des Steuerkanals (MX Creative Console, `ctl`)
+# control:                              # optional: Unix-Socket des Steuerkanals (MX Creative Console, `ctl`).
+#   socket_path: /tmp/voicechain-ctl.sock  # Ohne Eintrag wählt die Runtime /tmp/voicechain-<user>.sock
+                                        # (macOS begrenzt Socket-Pfade auf 103 Byte, deshalb kein Repo-Pfad).
 
 adaptive:
   enabled: true             # false = Parameter bleiben wie in der Datei

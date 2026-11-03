@@ -219,14 +219,18 @@ class Chain:
     def get_param(self, stage: str, name: str) -> float:
         return self.stage(stage).get_param(name)
 
-    def get_meters(self) -> dict:
+    def get_meters(self, drain: bool = True) -> dict:
         """Meters of all stages plus input/output levels.
 
-        Reading drains the per-stage accumulators ``gain_reduction_mean_db`` /
-        ``gain_reduction_max_db`` (statistics since the previous read).
+        With ``drain=True`` (the controller's periodic read) the per-stage accumulators
+        ``gain_reduction_mean_db`` / ``gain_reduction_max_db`` (statistics since the
+        previous drain) are restarted; ``drain=False`` / :meth:`peek_meters` returns the
+        same structure with the running values and leaves the accumulation untouched
+        (status line, state queries).
         """
         with self._lock:
-            meters = {name: stage.meters() for name, stage in self._stages.items()}
+            meters = {name: (stage.meters() if drain else stage.peek_meters())
+                      for name, stage in self._stages.items()}
             if (self._bypass and self._bypass_mix == 1.0) or self._middle_asleep:
                 # bypass: the stages keep running for state and learning; kill switch: they are
                 # not called at all. Either way nothing of their gain reduction reaches the
@@ -243,6 +247,10 @@ class Chain:
                                "processing": float(self._processing), "processing_mix": self._processing_mix,
                                "latency_samples": float(self.latency_samples)}
             return meters
+
+    def peek_meters(self) -> dict:
+        """Non-draining read of :meth:`get_meters` (identical structure)."""
+        return self.get_meters(drain=False)
 
     def reset(self) -> None:
         with self._lock:

@@ -364,10 +364,13 @@ class ReductionAccumulator:
         self.last_mean = 0.0
         self._count += int(n)
 
+    def peek(self) -> tuple[float, float]:
+        """Return (mean, max) since the previous read without restarting the accumulation."""
+        return (self._sum / self._count if self._count else 0.0), self._max
+
     def read(self) -> tuple[float, float]:
         """Return (mean, max) since the previous read and restart the accumulation."""
-        mean = self._sum / self._count if self._count else 0.0
-        peak = self._max
+        mean, peak = self.peek()
         self._sum = 0.0
         self._count = 0
         self._max = 0.0

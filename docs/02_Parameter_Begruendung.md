@@ -32,7 +32,9 @@ einem M-Chip ist deutlich weniger zu erwarten; das Budget < 1 ms wird auch hier 
 **Meter und Robustheit (Prüfbefunde PO-5, SW-1):** Expander, De-Esser, Kompressor und Limiter
 liefern in `meters()` neben `gain_reduction_db` (Mittel des letzten Blocks) auch
 `gain_reduction_mean_db` und `gain_reduction_max_db` als Mittel bzw. Maximum **seit dem letzten
-Auslesen**; das Auslesen (`Chain.get_meters()`) leert den Akkumulator. Die adaptive Regelung sieht
+Auslesen**; das Auslesen (`Chain.get_meters()`) leert den Akkumulator. Für Statuszeile und
+Zustandsabfragen gibt es `Chain.peek_meters()` (= `get_meters(drain=False)`): dieselbe Struktur
+mit den laufenden Akkumulatorwerten, ohne sie zu leeren – nur die Regelung liest leerend. Die adaptive Regelung sieht
 damit alle 2 s das ganze Intervall und nicht einen 5-ms-Schnappschuss. `Chain.process` prüft jeden
 Block auf NaN/Inf: ein nicht-finiter Block wird durch Stille ersetzt, die Signalpfad-Zustände
 aller Stufen werden geleert (`recover()`) und `get_meters()["input"]["nonfinite_blocks"]` zählt das
@@ -54,7 +56,7 @@ Normalizers aktuell, und die Rückkehr hat keinen Einschwingknack – nach dem Z
 Ausgang identisch mit dem einer nie unterbrochenen Kette (Test: < 1e-3). Meter im Bypass: die
 mittleren Stufen melden `gain_reduction_*` = 0 und `bypassed` = 1 (das hört die Gegenseite),
 `get_meters()["chain"]` = {`bypass` (0/1, angefordert), `bypass_mix` (Blendposition 0…1),
-`latency_samples`}. Messwerte (Tests): Bypass-Ausgang bitgleich mit einer Referenz aus Trim +
+`processing` (0/1, Kill-Switch), `processing_mix` (Blendposition, 1 = aus), `latency_samples`}. Messwerte (Tests): Bypass-Ausgang bitgleich mit einer Referenz aus Trim +
 Limiter nach der Blende; Umschalten auf einem 1-kHz-Ton ohne Blockpegelsprung > 0,5 dB
 (gemessen 0,25 dB bei 1 dB Pfadunterschied) und ohne Transiente; die Blende dauert genau drei
 480er-Blöcke. Die 30 ms sind lang genug, dass ein Pegelunterschied von einigen dB zwischen den
@@ -514,8 +516,9 @@ Kalibrierung) sind Metadaten: nicht validiert, von `Chain.from_config` ignoriert
 erhalten. Optionale Stufenparameter (`expander.detector_ms`, `limiter.true_peak_margin_db`,
 `normalizer.release_rate_db_per_s`) dürfen fehlen; dann gilt der im Code begründete Default. Die
 Untergrenze von `deesser.ratio` und `compressor.ratio` ist 1,1, weil die Kalibrierung bei Ratio 1
-durch null teilen würde (SW-7). Optionale Abschnitte: `control: {socket_path}` (Unix-Socket des Steuerkanals, Default in der YAML
-`logs/control.sock`) und `eq.tilt_db`. `save_config` schreibt über `yaml.safe_dump`; **Kommentare der
+durch null teilen würde (SW-7). Optionale Abschnitte: `control: {socket_path}` (Unix-Socket des Steuerkanals; in der
+Default-YAML nur als auskommentiertes Beispiel, ohne Eintrag wählt die Runtime
+`/tmp/voicechain-<user>.sock`, weil macOS Socket-Pfade auf 103 Byte begrenzt) und `eq.tilt_db`. `save_config` schreibt über `yaml.safe_dump`; **Kommentare der
 Quelldatei gehen dabei verloren**
 (PyYAML erhält sie nicht). Das ist für erzeugte Konfigurationen (Kalibrierungsausgabe) akzeptiert;
 die kommentierte Referenz `config/chain.default.yaml` wird von `save_config` nie überschrieben.
