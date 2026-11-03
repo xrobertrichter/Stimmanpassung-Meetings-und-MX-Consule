@@ -9,7 +9,7 @@
 | Rauschteppich-Absenkung in Pausen | ≥ 6 dB | — | Beauftragung §6 |
 | Sprachpegel-Referenz nach Input Trim | −20 dBFS RMS (aktive Sprache) | ± 3 dB | Praxis |
 | High-Pass | 80 Hz, 24 dB/Okt | 60–120 Hz | E1, Sprache-Grundfrequenz > 85 Hz |
-| Expander | Schwelle Rauschteppich + 8 dB, Ratio 2.5, Range 20 dB | Schwelle −70…−30 dBFS | E1 |
+| Expander | Schwelle Rauschteppich + 10 dB (Entscheidung PL 2026-11-03, vorher 8 dB, siehe F3), Ratio 2.5, Range 20 dB | Schwelle −70…−30 dBFS | E1 |
 | De-Esser | 6,5 kHz, 1 Okt, max. 8 dB Reduktion | 5–9 kHz | E1 |
 | Kompressor | Schwelle −20 dBFS, Ratio 3:1, Knie 6 dB, 10/100 ms | Schwelle −35…−10 | E1 |
 | Limiter | Ceiling −1 dBTP, Lookahead 5 ms | — | E3 |
