@@ -17,6 +17,11 @@ Repo: `/home/user/Test`, Branch `claude/blackhole-rode-ntusb-config-jdoa16`
 | voicechain/runtime.py, cli.py, __main__.py | Live-Stream, CLI | Agent Integration/Doku |
 | tests/ | pytest, ohne Audiogeräte lauffähig | je Agent für eigene Module |
 | voicechain/synth.py | Synthetische Sprach-/Klick-Signale für Tests, Selftest, make-sample | Agent Kalibrierung |
+| docs/06_Beauftragung_MX_Console.md | Beauftragung 2: Live-Bedienung über MX Creative Console (Funktionen, Steuerkanal, Manifest) | Claude (PL) |
+| docs/05_MX_Creative_Console.md | Konzept und Begründung je Taste, zwei Ebenen | Agent Integration |
+| voicechain/livecontrol.py | Offsets, Makros, Kommandobehandlung | Agent Kalibrierung |
+| voicechain/control.py | Unix-Socket-Steuerkanal, Client | Agent Integration |
+| integrations/mx_console/ | Aktionen (sh, AppleScript), functions.json, README | Agent Integration |
 | docs/pruefungen/ | Vollständige Prüfberichte Runde 1 (01–03) und Runde 2 (04–06), Runde 3 PO (07) | Prüfrollen |
 | scripts/run_live.sh, calibrate.sh | venv anlegen, Python ≥ 3.11 prüfen, CLI starten | Agent Integration |
 | memory/ | Projekt-Memory (dieses Verzeichnis) | Claude (PL) |
