@@ -1,6 +1,6 @@
 # Parameter-Begründung: DSP-Kette voicechain
 
-Stand: 2026-11-03 (nach Prüfrunde 4) · Gilt für `config/chain.default.yaml` und die Umsetzung in `voicechain/dsp/`.
+Stand: 2026-11-03 (nach Prüfrunde 4, ergänzt um Live-Bedienung: Tilt und Bypass) · Gilt für `config/chain.default.yaml` und die Umsetzung in `voicechain/dsp/`.
 
 Alle Pegel in dBFS (0 dBFS = Vollaussteuerung). Für Sinussignale ist der Pegel als Spitzenwert
 gemeint (AES17: Vollaussteuerungs-Sinus = 0 dBFS), für Rauschen als RMS. Die Startwerte sind für
@@ -43,6 +43,22 @@ Lautstärke gekostet. Test: ein NaN-Sample im eingeschwungenen Zustand → Gain 
 Boden `voicechain.dsp.DB_FLOOR_DBFS = −150 dBFS` (6 dB unter dem Quantisierungsrauschen eines
 24-Bit-Wandlers), damit Stille endliche Zahlen liefert und Stufen-, Analyse- und Statuswerte
 vergleichbar sind.
+
+**Bypass (A/B-Vergleich, `Chain.set_bypass(on)` / `get_bypass()`):** Im Bypass liefert die Kette nur
+Input Trim → Limiter: der Trim, damit beide Pfade dieselbe Pegelreferenz haben, der Limiter, damit
+auch rohe Sprache spitzenpegelsicher bleibt. Der Übergang ist ein linearer Crossfade von 30 ms
+zwischen dem Ausgang der mittleren Stufen (HPF … Normalizer) und dem Trim-Signal, danach läuft der
+gemeinsame Limiter. Die mittleren Stufen rechnen auch im Bypass weiter (gleiche Rechenzeit wie im
+Normalbetrieb): So bleiben Filterzustände, Expander/Kompressor-Hüllkurven und das Gelernte des
+Normalizers aktuell, und die Rückkehr hat keinen Einschwingknack – nach dem Zurückschalten ist der
+Ausgang identisch mit dem einer nie unterbrochenen Kette (Test: < 1e-3). Meter im Bypass: die
+mittleren Stufen melden `gain_reduction_*` = 0 und `bypassed` = 1 (das hört die Gegenseite),
+`get_meters()["chain"]` = {`bypass` (0/1, angefordert), `bypass_mix` (Blendposition 0…1),
+`latency_samples`}. Messwerte (Tests): Bypass-Ausgang bitgleich mit einer Referenz aus Trim +
+Limiter nach der Blende; Umschalten auf einem 1-kHz-Ton ohne Blockpegelsprung > 0,5 dB
+(gemessen 0,25 dB bei 1 dB Pfadunterschied) und ohne Transiente; die Blende dauert genau drei
+480er-Blöcke. Die 30 ms sind lang genug, dass ein Pegelunterschied von einigen dB zwischen den
+Pfaden ohne Knacken vergeht, und kurz genug, um als sofort zu gelten.
 
 **Parameteränderungen im Betrieb:** `set_param` validiert den Wert und entwirft die neuen
 Koeffizienten *außerhalb* des Ketten-Locks; nur der Tausch läuft unter dem Lock (Mikrosekunden).
@@ -186,6 +202,26 @@ stark → dumpf.
 
 Messwerte (Tests): Zeitbereichsmessung je Band stimmt mit Soll ±0,5 dB überein (analytisch ±0,1 dB),
 Nullgain-Bänder (auch der 0-dB-Shelf der Startkonfiguration) sind exakt transparent.
+
+**Klang-Tilt (`eq.tilt_db`, Live-Bedienung „wärmer / heller“):** Im Meeting korrigiert man die
+Klangfarbe mit einem Griff, nicht mit drei Bändern. Der Tilt sind zwei feste zusätzliche Shelves
+hinter den konfigurierten Bändern: Low-Shelf 250 Hz mit −tilt/2 dB und High-Shelf 4 kHz mit
++tilt/2 dB (Q 0,707). Warum diese Eckfrequenzen: Unter 250 Hz liegen Grundton und „Brust“ einer
+Stimme, über 4 kHz Konsonanten und „Luft“; dazwischen, um 1 kHz, sitzt die Sprachverständlichkeit,
+und genau dort bleibt der Tilt bei 0 dB (Drehpunkt). Positiv = heller, negativ = wärmer.
+
+| Parameter | Startwert | Bereich | Begründung |
+|---|---|---|---|
+| `tilt_db` | 0.0 (optional) | −3…+3 | ±3 dB gesamt (±1,5 dB je Shelf) ist das Meiste, was eine Meeting-Stimme verträgt, ohne „falsch“ zu klingen; alles darüber gehört in die kalibrierten Bänder. Schrittweite der Konsole 1 dB. |
+
+Hörbild: +1…+2 → präsenter, „näher am Mikrofon“, bei zu viel spitz und zischig (der De-Esser
+sitzt davor und sieht die Anhebung nicht); −1…−2 → runder, „Radio-Stimme“, bei zu viel dumpf
+und verhangen. Messwerte (Tests): Tilt +2 → −0,98 dB bei 100 Hz, −0,5 dB bei 250 Hz, 0,0 dB bei
+1 kHz, +0,5 dB bei 4 kHz, +0,96 dB bei 8 kHz; Tilt 0 ist bitgenau transparent (beide Sektionen
+sind dann exakte Identität und bleiben in der Kaskade, damit ein Wechsel die Sektionszahl nicht
+ändert); Umschalten 0 → +3 → −3 auf einem 1-kHz-Ton ohne Blockpegelsprung > 0,5 dB und ohne
+Transiente (Crossfade 10 ms wie bei allen Filterwechseln). Zugriff: `set_param("eq", "tilt_db", v)`,
+Meter `eq.tilt_db`.
 
 ## 6. Kompressor (`chain.compressor`)
 
@@ -458,7 +494,8 @@ Kalibrierung) sind Metadaten: nicht validiert, von `Chain.from_config` ignoriert
 erhalten. Optionale Stufenparameter (`expander.detector_ms`, `limiter.true_peak_margin_db`,
 `normalizer.release_rate_db_per_s`) dürfen fehlen; dann gilt der im Code begründete Default. Die
 Untergrenze von `deesser.ratio` und `compressor.ratio` ist 1,1, weil die Kalibrierung bei Ratio 1
-durch null teilen würde (SW-7). `save_config` schreibt über `yaml.safe_dump`; **Kommentare der
+durch null teilen würde (SW-7). Optionale Abschnitte: `control: {socket_path}` (Unix-Socket des Steuerkanals, Default in der YAML
+`logs/control.sock`) und `eq.tilt_db`. `save_config` schreibt über `yaml.safe_dump`; **Kommentare der
 Quelldatei gehen dabei verloren**
 (PyYAML erhält sie nicht). Das ist für erzeugte Konfigurationen (Kalibrierungsausgabe) akzeptiert;
 die kommentierte Referenz `config/chain.default.yaml` wird von `save_config` nie überschrieben.

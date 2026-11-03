@@ -36,6 +36,8 @@ class ConfigError(ValueError):
 # every CoreAudio rate; block sizes below 16 are pointless, above 8192 (170 ms) the
 # latency is unusable for a conversation.
 _TOP_LEVEL_KEYS = ("sample_rate", "block_size", "input", "output", "chain", "adaptive")
+# Optional top-level sections: ``control`` holds the Unix-socket path of the live control channel.
+_OPTIONAL_TOP_LEVEL_KEYS = ("control",)
 _ADAPTIVE_RANGES = {
     "learn_s": (0.0, 600.0),       # 0 = no learning phase, 10 min is the longest sensible wait
     "interval_s": (0.1, 60.0),
@@ -137,9 +139,11 @@ def _validate_stage(col: _Collector, name: str, params, sample_rate) -> None:
         return
     cls = STAGE_CLASSES[name]
     if cls is Equalizer:
-        col.keys(params, path, required=("enabled", "bands"))
+        col.keys(params, path, required=("enabled", "bands"), optional=("tilt_db",))
         if "enabled" in params:
             col.boolean(params["enabled"], f"{path}.enabled")
+        if "tilt_db" in params:
+            col.number(params["tilt_db"], f"{path}.tilt_db", *Equalizer.PARAM_RANGES["tilt_db"])
         bands = params.get("bands")
         if bands is not None:
             if not isinstance(bands, list):
@@ -213,7 +217,11 @@ def validate_config(cfg: dict) -> None:
     if not col.mapping(cfg, "<root>"):
         raise ConfigError(col.errors[0])
     metadata = tuple(key for key in cfg if isinstance(key, str) and key.startswith("_"))
-    col.keys(cfg, "", required=_TOP_LEVEL_KEYS, optional=metadata)
+    col.keys(cfg, "", required=_TOP_LEVEL_KEYS, optional=_OPTIONAL_TOP_LEVEL_KEYS + metadata)
+    if "control" in cfg and col.mapping(cfg["control"], "control"):
+        col.keys(cfg["control"], "control", required=("socket_path",))
+        if "socket_path" in cfg["control"]:
+            col.string(cfg["control"]["socket_path"], "control.socket_path")
     sample_rate = cfg.get("sample_rate")
     if "sample_rate" in cfg:
         col.integer(sample_rate, "sample_rate", 8000, 192000)

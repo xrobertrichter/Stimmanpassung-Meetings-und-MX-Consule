@@ -19,6 +19,14 @@ from voicechain.dsp.normalizer import Normalizer
 
 # Fixed processing order from the "On Air" reference chain.
 STAGE_ORDER = ("input_trim", "highpass", "expander", "deesser", "eq", "compressor", "normalizer", "limiter")
+# Bypass (A/B listening) keeps the first and the last stage: the trim so that both paths have
+# the same level reference, the limiter so that raw speech stays peak-safe. The stages in
+# between are cross-faded out over BYPASS_FADE_MS; they keep running so that their states,
+# the normaliser's learnt gain and the meters stay current and the return is click-free.
+BYPASS_STAGES = ("highpass", "expander", "deesser", "eq", "compressor", "normalizer")
+# 30 ms: long enough for a level step of a few dB to pass without a click (< 0.5 dB per
+# 5 ms block for differences up to ~3 dB), short enough to feel instantaneous.
+BYPASS_FADE_MS = 30.0
 STAGE_CLASSES = {
     "input_trim": InputTrim,
     "highpass": HighPass,
@@ -40,6 +48,10 @@ class Chain:
     *outside* the lock and holds it only for the swap (microseconds), so a control
     thread can never delay the audio callback by a filter design.
 
+    Bypass (A/B listening): ``set_bypass(True)`` cross-fades over ``BYPASS_FADE_MS``
+    to the path Input Trim -> Limiter; ``get_meters()["chain"]["bypass"]`` shows
+    the requested state, ``bypass_mix`` the fade position.
+
     Robustness: a block containing NaN or Inf would poison every filter state
     for good. ``process`` therefore checks ``np.isfinite`` first, replaces such a
     block by silence, clears the signal-path states of all stages (``recover``,
@@ -55,6 +67,9 @@ class Chain:
         self._stages = {name: stages[name] for name in STAGE_ORDER}
         self._lock = threading.RLock()
         self._nonfinite_blocks = 0
+        self._bypass = False                 # requested state
+        self._bypass_mix = 0.0               # 0 = full chain, 1 = bypass path (ramps towards the request)
+        self._bypass_step = 1.0 / max(1, int(round(BYPASS_FADE_MS * 1e-3 * self.sample_rate)))
         self._input_peak = DB_FLOOR_DBFS
         self._input_rms = DB_FLOOR_DBFS
         self._output_peak = DB_FLOOR_DBFS
@@ -104,6 +119,26 @@ class Chain:
     def nonfinite_blocks(self) -> int:
         return self._nonfinite_blocks
 
+    # -- bypass -----------------------------------------------------------------------
+    def set_bypass(self, on: bool) -> None:
+        """Cross-fade to (True) or from (False) the bypass path Input Trim -> Limiter."""
+        with self._lock:
+            self._bypass = bool(on)
+
+    def get_bypass(self) -> bool:
+        return self._bypass
+
+    def _bypass_weights(self, n: int) -> np.ndarray | float:
+        """Per-sample weight of the bypass path for the next block (scalar when settled)."""
+        target = 1.0 if self._bypass else 0.0
+        if self._bypass_mix == target:
+            return target
+        direction = 1.0 if target > self._bypass_mix else -1.0
+        weights = self._bypass_mix + direction * self._bypass_step * np.arange(1, n + 1, dtype=np.float64)
+        np.clip(weights, 0.0, 1.0, out=weights)
+        self._bypass_mix = float(weights[-1])
+        return weights
+
     # -- contract ---------------------------------------------------------------------
     def process(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x)
@@ -124,8 +159,16 @@ class Chain:
                 return np.zeros(y.shape, dtype=np.float32)
             self._input_peak = peak_dbfs(y)
             self._input_rms = rms_dbfs(y)
-            for stage in self._stages.values():
-                y = stage.process(y)
+            y = self._stages["input_trim"].process(y)
+            processed = y
+            for name in BYPASS_STAGES:
+                processed = self._stages[name].process(processed)
+            weight = self._bypass_weights(y.size)
+            if isinstance(weight, float):
+                mixed = y if weight == 1.0 else processed
+            else:
+                mixed = processed + weight * (y - processed)
+            y = self._stages["limiter"].process(mixed)
             self._output_peak = peak_dbfs(y)
             self._output_rms = rms_dbfs(y)
             return y.astype(np.float32)
@@ -145,14 +188,25 @@ class Chain:
         """
         with self._lock:
             meters = {name: stage.meters() for name, stage in self._stages.items()}
+            if self._bypass and self._bypass_mix == 1.0:
+                # the stages keep running for state and learning, but nothing of their gain
+                # reduction reaches the output: report what the listener gets
+                for name in BYPASS_STAGES:
+                    for key in ("gain_reduction_db", "gain_reduction_mean_db", "gain_reduction_max_db"):
+                        if key in meters[name]:
+                            meters[name][key] = 0.0
+                    meters[name]["bypassed"] = 1.0
             meters["input"] = {"peak_dbfs": self._input_peak, "rms_dbfs": self._input_rms,
                                "nonfinite_blocks": float(self._nonfinite_blocks)}
             meters["output"] = {"peak_dbfs": self._output_peak, "rms_dbfs": self._output_rms}
+            meters["chain"] = {"bypass": float(self._bypass), "bypass_mix": self._bypass_mix,
+                               "latency_samples": float(self.latency_samples)}
             return meters
 
     def reset(self) -> None:
         with self._lock:
             for stage in self._stages.values():
                 stage.reset()
+            self._bypass_mix = 1.0 if self._bypass else 0.0
             self._input_peak = self._input_rms = DB_FLOOR_DBFS
             self._output_peak = self._output_rms = DB_FLOOR_DBFS

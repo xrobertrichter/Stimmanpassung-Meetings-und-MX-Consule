@@ -501,3 +501,59 @@ def test_nonfinite_block_keeps_normaliser_gain(cfg, fs, gen):
     assert abs(active_lufs(20.1, 23) - active_lufs(17, 19.9)) <= 2.0        # same loudness right after the event
     m = chain.get_meters()["normalizer"]
     assert m["loudness_lufs"] > -40.0 and m["noise_floor_lufs"] > -150.0 and m["low_snr"] == 0.0
+
+
+def test_bypass_equals_trim_plus_limiter(cfg, fs, gen):
+    """In bypass the chain is Input Trim -> Limiter: identical to a reference of the two stages."""
+    x = gen.sine(1000.0, -20.0, 2.0, fs).astype(np.float32)
+    x[fs:fs + 48] = 1.5                                                     # a +3.5 dBFS burst keeps the limiter honest
+    chain = Chain.from_config(cfg)
+    assert chain.get_bypass() is False
+    chain.set_bypass(True)
+    assert chain.get_bypass() is True
+    y = _run(chain, x, 256).astype(np.float64)
+    trim = InputTrim(fs, **cfg["chain"]["input_trim"])
+    limiter = Limiter(fs, **cfg["chain"]["limiter"])
+    reference = np.concatenate([limiter.process(trim.process(x[i:i + 256].astype(np.float64))) for i in range(0, len(x), 256)])
+    # after the 30 ms fade plus the limiter's look-ahead memory (delay line, hold and ramp
+    # window: 2 x 5 ms) the two are identical
+    settled = int(0.03 * fs) + 2 * chain.latency_samples
+    assert np.max(np.abs(y[settled:] - reference[settled:])) < 1e-6
+    assert np.max(np.abs(y)) <= 10 ** (-1.0 / 20.0)                        # still peak-safe
+    m = chain.get_meters()
+    assert m["chain"]["bypass"] == 1.0 and m["chain"]["bypass_mix"] == 1.0
+    for name in ("expander", "deesser", "compressor"):
+        assert m[name]["gain_reduction_db"] == 0.0 and m[name]["gain_reduction_max_db"] == 0.0
+        assert m[name]["bypassed"] == 1.0
+    assert m["chain"]["latency_samples"] == chain.latency_samples
+
+
+def test_bypass_toggle_is_click_free_and_keeps_state(cfg, fs, gen):
+    """Constant 1 kHz tone, bypass on at 1 s and off at 2 s: no block level step > 0.5 dB, no
+    transient (second-difference roughness), and after the return the chain is in the state it
+    would have reached without the excursion (stages keep running during bypass)."""
+    x = gen.sine(1000.0, -20.0, 4.0, fs).astype(np.float32)
+    block = 480                                                             # 10 periods: block RMS is constant
+    chain = Chain.from_config(cfg)
+    undisturbed = Chain.from_config(cfg)
+    levels, roughness, mixes = [], [], []
+    y_all, ref_all = [], []
+    for k, i in enumerate(range(0, len(x), block)):
+        if k == 100:
+            chain.set_bypass(True)
+        if k == 200:
+            chain.set_bypass(False)
+        y = chain.process(x[i:i + block]).astype(np.float64)
+        ref_all.append(undisturbed.process(x[i:i + block]).astype(np.float64))
+        y_all.append(y)
+        levels.append(gen.rms_db(y))
+        roughness.append(np.max(np.abs(np.diff(y, n=2))) / np.sqrt(np.mean(y ** 2)))
+        mixes.append(chain.get_meters()["chain"]["bypass_mix"])
+    assert np.max(np.abs(np.diff(levels[20:]))) < 0.5
+    assert np.max(roughness[90:]) < 1.5 * np.max(roughness[20:90])
+    assert mixes[99] == 0.0 and mixes[103] == 1.0 and 0.0 < mixes[100] < 1.0   # 30 ms = 1440 samples = 3 blocks
+    assert mixes[203] == 0.0
+    y_all, ref_all = np.concatenate(y_all), np.concatenate(ref_all)
+    # back on the full path the output matches the undisturbed chain (states kept running)
+    assert np.max(np.abs(y_all[int(2.2 * fs):] - ref_all[int(2.2 * fs):])) < 1e-3
+    assert chain.get_meters()["chain"]["bypass"] == 0.0

@@ -48,6 +48,8 @@ chain:
 
   eq:
     enabled: true           # false = Bypass aller Bänder
+    tilt_db: 0.0            # optional, Klang-Tilt für die Live-Bedienung (-3…+3): Low-Shelf 250 Hz -tilt/2,
+                            # High-Shelf 4 kHz +tilt/2; positiv = heller, negativ = wärmer; 0 = transparent
     bands:
       - {type: peak,       freq_hz: 220.0,   gain_db: -2.0, q: 1.0}    # Nahbesprechungs-Mulm der Niere (15–25 cm)
       - {type: peak,       freq_hz: 3200.0,  gain_db: 2.0,  q: 1.2}    # Präsenz: Konsonanten und Sprachverständlichkeit
@@ -82,6 +84,9 @@ chain:
     ceiling_dbfs: -1.0      # -1 dBTP: Sicherheitsabstand für Codec und D/A der Gegenseite
     lookahead_ms: 5.0       # Gesamt-Latenz der Kette; reicht für weiche Eingriffe
     release_ms: 50.0        # schnell genug, dass Sprache nach einer Spitze nicht "eingedrückt" bleibt
+
+control:
+  socket_path: "logs/control.sock"   # optional: Unix-Socket des Steuerkanals (MX Creative Console, `ctl`)
 
 adaptive:
   enabled: true             # false = Parameter bleiben wie in der Datei
