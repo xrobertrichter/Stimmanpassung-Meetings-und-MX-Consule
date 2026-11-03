@@ -237,8 +237,10 @@ durch. Ist die Prüfung negativ, schreibt der Controller je Intervall ein Ereign
 `implausible_speech` mit den Gründen und ändert De-Esser und Kompressor nicht; der Expander
 folgt weiter dem Rauschteppich. Die Kappe „12 dB unter Sprache" bleibt dabei aktiv, solange
 das Gehörte Sprache ist (also auch bei einem Sprecher mit abweichendem Pegel: leiser Sprecher
-−28 dBFS in einem −46-dBFS-Raum → Expander höchstens −40, nicht −36); nur bei Tippen
-(Sprachanteil) oder gleichförmigem Geräusch (Dynamik) entfällt sie. Nach **mehr als
+−28 dBFS in einem −46-dBFS-Raum, Dynamik dann nur ~14 dB → Expander höchstens −40, nachgemessen
+−38 mit Totzone, nicht −36); für die Kappe genügen Sprachaktivität, ein sprachähnlicher Anteil
+aktiver Rahmen und eine Dynamik ≥ 10 dB, nur bei Tippen (Sprachanteil) oder gleichförmigem
+Geräusch (Dynamik < 10 dB) entfällt sie. Nach **mehr als
 60 s ohne plausible Sprache** wandern De-Esser- und Kompressor-Schwelle in `max_step_db`-Schritten
 zu ihren kalibrierten Startwerten zurück (Grund `rest`), so dass der Sprecher nach einer
 Zuhörphase die kalibrierte Kette vorfindet.
@@ -256,7 +258,13 @@ Je Intervall höchstens ein Schritt von `max_step_db` (Standard 0,5 dB) in Richt
 wenn der Fehler außerhalb der Totzone liegt, nur innerhalb der `bounds`, und nur, wenn der
 letzte Eingriff an diesem Parameter mindestens zwei Intervalle zurückliegt. Weil die Ziele
 aus dem Eingangssignal berechnet werden (nicht aus dem Ausgang), gibt es keine Rückkopplung
-und kein Pendeln: die Richtung ändert sich nur, wenn sich das Signal ändert.
+und kein Pendeln: die Richtung ändert sich nur, wenn sich das Signal oder seine Statistik
+ändert. Der Rauschteppich der Regelung wird aus den Pausenrahmen geschätzt (5. Perzentil der
+inaktiven Rahmen, sobald mindestens 5 % der 20-s-Historie inaktiv sind; sonst 5. Perzentil
+aller Rahmen), damit ein dichter Vortrag mit wenig Pausen (10 %) nicht als lauterer Raum gelesen
+wird (Simulation 300 s dichter Vortrag im unveränderten Raum: 0 Expander-Schritte). Die
+De-Esser-Regel hält ihren Zustand „engagiert/ruhend" mit 1 dB Hysterese um die Referenz, damit
+eine Stimme nahe −15 dB nicht zwischen beiden Zielwerten pendelt.
 
 **Raumänderung im Betrieb (Beauftragung §6.4).** Wird der Rauschteppich nach der Kalibrierung
 8–12 dB lauter, greifen zwei Mechanismen auf verschiedenen Zeitskalen: Der Normalizer schätzt
@@ -318,6 +326,7 @@ Ereignisse (Schlüssel `event`):
 | `learn_done` | Lernphase beendet, Regelung aktiv |
 | `no_analysis` | Kein Analyzer-Schnappschuss oder noch nicht `ready` (< 2 s Historie) |
 | `implausible_speech` | Gemessenes ist nicht der Sprecher (`reasons`: Pegel, Sprachanteil, Dynamik, keine Sprache); `since_s` Sekunden seit der letzten plausiblen Sprache. De-Esser/Kompressor werden gehalten, ab 60 s zurückgeholt (`rest`) |
+| `low_snr` | Störabstand zu gering (Beauftragung §6.4 b): der Normalizer meldet `low_snr` oder der eigene Teppich nach Trim liegt weniger als 16 dB unter dem Sprachpegel; `snr_lu`, `input_snr_db`, `source` und `hint` („Störabstand zu gering: Raum verbessern oder neu kalibrieren"). Höchstens alle 30 s, kein Parametereingriff |
 | `limiter_protect` | Schutz ein/aus (`active`), mit gemessener mittlerer Limiter-Reduction |
 | `frozen` | Vorgeschlagene Änderung (`proposed`) wurde wegen Freeze nicht angewandt |
 | `freeze` | Freeze ein-/ausgeschaltet (`on`) |
@@ -390,8 +399,22 @@ nicht mehr mit der Kalibrierung überein (neu kalibrieren).
 - **Lautheit.** Die Lautheitsmessung ist ITU-R BS.1770 (K-Bewertung, Gating), das Ziel
   −18 LUFS ist ein Praxiswert für Konferenzsysteme (E3), keine Norm; es gilt für die
   Mono-Messung (ein Stereo-Meter auf dem BlackHole-Signal zeigt +3 LU).
-- **Synthetisches Sample.** `make-sample` ersetzt keine echte Aufnahme; es dient zum Proben
-  des Ablaufs und für die Tests.
+- **Raum wird nach der Kalibrierung lauter** (Beauftragung §6.4, zwei Stufen):
+  a) bis etwa +8 dB Rauschteppich: der Normalizer hält seinen Gain in Pausen (Gate auf den
+  Teppich, Gainbegrenzung aus der Kalibrierung), die Pausen liegen weiter ≥ 15 LU unter der
+  Sprache, der nächste Satz setzt höchstens +1,5 dB lauter ein; der volle Pausenabstand kehrt
+  erst zurück, wenn die Regelung die Expander-Schwelle nachgezogen hat (etwa 1–1,5 min, §8).
+  b) größere Anstiege (Störabstand am Eingang unter ~16 dB): der Expander darf wegen der Kappe
+  „Sprache − 12 dB" nicht weiter schließen, die Pausen bleiben nur so weit unter der Sprache wie
+  am Eingang; die Regelung schreibt `low_snr` mit dem Hinweis, den Raum zu verbessern oder neu zu
+  kalibrieren, die Statuszeile zeigt den Zustand. Praktische Abhilfe: Freeze, Lüfter/Fenster,
+  näher ans Mikrofon, dann neu kalibrieren.
+- **Synthetische Nachweise.** Alle Zahlen in diesem Dokument und alle Tests stammen aus
+  synthetischen Sprachsignalen (`synth.py`): sie haben die Pegelstatistik von Sprache, aber
+  keine leisen Konsonanten 15–20 dB unter dem RMS, keine echten Zischlaute und keine
+  Mikrofonfärbung. Vor einer Freigabe sind eine Kalibrierung mit einer echten Aufnahme, das Lesen
+  des Berichts und ein Hördurchlauf (§6) nötig; `make-sample` ersetzt keine echte Aufnahme, es
+  dient zum Proben des Ablaufs und für die Tests.
 - **Metadaten in der YAML.** Der Block `_calibration` (Messwerte, Begründungen) steht in der
   kalibrierten YAML; `voicechain.config` behandelt Schlüssel mit führendem Unterstrich als
   Metadaten.

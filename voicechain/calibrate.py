@@ -152,6 +152,10 @@ LOUDNESS_TOLERANCE_LU = 2.0
 #: Sibilance must not get worse by more than this when the de-esser is not
 #: needed (assumption: 1 dB is below audibility for a band-energy ratio).
 SIBILANCE_MAX_INCREASE_DB = 1.0
+#: A voice up to this far above the sibilance reference is a borderline voice:
+#: unproblematic to listen to, the de-esser only keeps it where it is.
+#: Assumption: 3 dB (the spread of the reference estimate itself).
+SIBILANCE_BORDERLINE_DB = 3.0
 #: Difference tolerated between the limiter's internal peak estimate and the
 #: 4x-oversampled true-peak meter (assumption: 0.1 dB).
 TRUE_PEAK_TOLERANCE_DB = 0.1
@@ -747,8 +751,21 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
     sib_delta = after["sibilance_ratio_db"] - before["sibilance_ratio_db"]
     deesser_needed = before["sibilance_ratio_db"] > SIBILANCE_REFERENCE_DB
     if deesser_needed:
-        sib_pass = sib_delta < 0.0
-        note = "De-Esser aktiv, Zischanteil muss sinken."
+        # Hysteresis: a clear reduction passes. Compressor and normalizer lift the
+        # 5-10 kHz band of soft fricatives relative to loud vowels by a few dB and
+        # the de-esser takes that back, so a voice may end up where it started.
+        # A borderline voice (at most SIBILANCE_BORDERLINE_DB above the reference)
+        # therefore passes when it is not worse than +1 dB; a clearly sibilant
+        # voice passes with +1 dB only if it ends up below the reference.
+        borderline = before["sibilance_ratio_db"] <= SIBILANCE_REFERENCE_DB + SIBILANCE_BORDERLINE_DB
+        sib_pass = (sib_delta <= -SIBILANCE_MAX_INCREASE_DB
+                    or (sib_delta <= SIBILANCE_MAX_INCREASE_DB
+                        and (borderline or after["sibilance_ratio_db"] <= SIBILANCE_REFERENCE_DB)))
+        note = (f"De-Esser aktiv: Zischanteil muss um ≥ {SIBILANCE_MAX_INCREASE_DB:.0f} dB sinken"
+                + (f" oder (Grenzstimme, höchstens {SIBILANCE_BORDERLINE_DB:.0f} dB über der Referenz) nicht mehr als "
+                   f"+{SIBILANCE_MAX_INCREASE_DB:.0f} dB steigen" if borderline else
+                   f" oder bei höchstens +{SIBILANCE_MAX_INCREASE_DB:.0f} dB unter der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB liegen")
+                + "; Kompressor und Normalizer heben das 5–10-kHz-Band leiser Frikative relativ an, der De-Esser nimmt das zurück.")
     else:
         # A clean voice stays clean: the chain may shift the band ratio a little
         # (compression acts more on the loud voiced peaks than on soft fricatives),
@@ -761,7 +778,8 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
                 f"oder nicht schlechter als +{SIBILANCE_MAX_INCREASE_DB:.0f} dB.")
     criteria["sibilance_reduced"] = {
         "passed": bool(sib_pass),
-        "target": ("Zischanteil ↓" if deesser_needed
+        "target": (f"Zischanteil ↓ ≥ {SIBILANCE_MAX_INCREASE_DB:.0f} dB oder ≤ {SIBILANCE_REFERENCE_DB:.0f} dB "
+                   f"bei ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB" if deesser_needed
                    else f"Zischanteil ≤ {SIBILANCE_REFERENCE_DB:.0f} dB oder ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB"),
         "actual": f"{sib_delta:+.1f} dB ({before['sibilance_ratio_db']:.1f} → {after['sibilance_ratio_db']:.1f} dB)",
         "note": note + (f" Zischspitzen im De-Esser-Band {before['sibilant_band_peak_dbfs']:.1f} → "

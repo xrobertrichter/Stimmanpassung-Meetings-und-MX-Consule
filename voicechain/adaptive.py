@@ -55,7 +55,7 @@ in intervals whose frames were (almost) all speech
 Log format (JSON lines): every applied change is
 ``{"t", "stage", "name", "old", "new", "reason"}``; informational entries are
 ``{"t", "event", ...}`` (events: learning, learn_done, no_analysis,
-implausible_speech, frozen, limiter_protect, freeze).
+implausible_speech, low_snr, frozen, limiter_protect, freeze).
 """
 from __future__ import annotations
 
@@ -71,6 +71,7 @@ from scipy import signal
 from voicechain import meters as _m
 from voicechain.calibrate import (
     REFERENCE_SPEECH_LEVEL_DBFS,
+    SIBILANCE_REFERENCE_DB,
     clamp,
     compressor_threshold_target,
     deesser_threshold_target,
@@ -93,6 +94,23 @@ HISTORY_S = 20.0
 MIN_HISTORY_S = 2.0
 #: Window of ``recent_speech_ratio`` = one controller interval (2 s default).
 RECENT_S = 2.0
+#: Live noise-floor estimate: low percentile of the *inactive* frames (below the
+#: activity threshold) when at least FLOOR_MIN_INACTIVE_RATIO of the history is
+#: inactive. The inactive set holds the pauses and the syllable valleys; in a
+#: dense talk (10 % pauses) the pauses are only the lowest tenth of it, so the
+#: 5th percentile is needed to land inside them. Single-frame outliers are no
+#: concern: the RMS of a 50 ms frame of stationary noise scatters by only
+#: ~0.1 dB. Without enough inactive frames the 5th percentile of all frames is
+#: used. Assumptions.
+FLOOR_INACTIVE_PERCENTILE = 5.0
+FLOOR_MIN_INACTIVE_RATIO = 0.05
+FLOOR_FALLBACK_PERCENTILE = 5.0
+#: De-esser engagement follows the sibilance ratio with hysteresis around the
+#: reference: engage above reference + 1 dB, release below reference - 1 dB, keep
+#: the state in between. Without it a voice near the reference would flip
+#: between the tracking target (peak - overshoot) and the resting target
+#: (peak + 2 dB) with every 20 s window. Assumption: 1 dB.
+SIBILANCE_HYSTERESIS_DB = 1.0
 #: Default de-esser band of the analyzer = shipped configuration (6.5 kHz, 1 oct).
 DEFAULT_DEESSER_FREQ_HZ = 6500.0
 DEFAULT_DEESSER_BANDWIDTH_OCT = 1.0
@@ -113,6 +131,19 @@ MIN_CHANGE_SPACING_INTERVALS = 2
 PLAUSIBLE_LEVEL_TOLERANCE_DB = 6.0
 PLAUSIBLE_MIN_SPEECH_RATIO = 0.3
 PLAUSIBLE_MIN_DYNAMIC_RANGE_DB = 15.0
+#: The expander's "12 dB below speech" cap protects any speech, also a speaker
+#: at the wrong level: it needs speech activity, a speech-like share of frames
+#: and only a modest dynamic range (a quiet speaker in a slightly louder room
+#: measures 12-15 dB). Below 10 dB the signal is steady noise, not speech.
+CAP_MIN_DYNAMIC_RANGE_DB = 10.0
+#: Low signal-to-noise state (docs/00 section 6.4 b): below this input SNR
+#: (speech RMS minus noise floor, after trim) the expander cannot lower pauses
+#: further without cutting speech (floor + 10 dB would exceed speech - 12 dB
+#: already at 22 dB; at 16 dB the pauses reach speech - 15 LU after the chain).
+LOW_SNR_DB = 16.0
+#: The low-SNR event is repeated at most this often (it carries advice, not a change).
+LOW_SNR_LOG_INTERVAL_S = 30.0
+LOW_SNR_HINT = "Störabstand zu gering: Raum verbessern oder neu kalibrieren"
 #: After this long without plausible speech the de-esser and compressor
 #: thresholds walk back to their calibrated values (reason ``rest``).
 IMPLAUSIBLE_REST_S = 60.0
@@ -272,10 +303,18 @@ class LiveAnalyzer:
         if count == 0:
             return out
         thr, detected = _m.activity_threshold_db(levels)
-        out["noise_floor_dbfs"] = float(np.percentile(levels, _m.NOISE_FLOOR_PERCENTILE))
         out["dynamic_range_db"] = _m.dynamic_range_db(levels)
         out["speech_detected"] = bool(detected)
         mask = levels > thr if detected else np.zeros(count, dtype=bool)
+        # Noise floor from the pause frames: a global 10th percentile reads syllable
+        # valleys instead of the floor when less than ~10 % of the history is pause
+        # (dense talk). With enough inactive frames the floor is a low percentile of
+        # those; otherwise the 5th percentile of everything is the best estimate.
+        inactive = levels[~mask]
+        if inactive.size >= FLOOR_MIN_INACTIVE_RATIO * count:
+            out["noise_floor_dbfs"] = float(np.percentile(inactive, FLOOR_INACTIVE_PERCENTILE))
+        else:
+            out["noise_floor_dbfs"] = float(np.percentile(levels, FLOOR_FALLBACK_PERCENTILE))
         if np.any(mask):
             out["speech_level_dbfs"] = float(_m._power_to_db(np.mean(10.0 ** (levels[mask] / 10.0))))
             sel = mask
@@ -338,6 +377,12 @@ class AdaptiveController:
         self._last_change_t: dict[tuple[str, str], float] = {}
         self._limiter_protect = False
         self._speech_cut_streak = 0
+        self._last_low_snr_log_t: float | None = None
+        self._current_meters: dict = {}
+        #: De-esser engagement state (None until the first decision: it is then
+        #: read off the calibrated threshold, which lies below the band peak when
+        #: the calibration engaged the de-esser and above it when it rests).
+        self._deesser_engaged: bool | None = None
         self._acc_limiter: list[float] = []
         self._acc_expander_speech: list[float] = []
         self._acc_normalizer: list[float] = []
@@ -391,6 +436,7 @@ class AdaptiveController:
             return []
         self._last_decision_t = now
         stats = self._drain()
+        self._current_meters = meters
         analysis = meters.get("analysis")
         if not isinstance(analysis, dict) or not analysis.get("ready", False):
             self._log({"t": now, "event": "no_analysis",
@@ -488,11 +534,45 @@ class AdaptiveController:
         return reasons
 
     @staticmethod
-    def _speech_present(reasons: list[str]) -> bool:
+    def _speech_present(analysis: dict, reasons: list[str]) -> bool:
         """True when what is heard is speech of some kind (possibly at the wrong
         level): the expander's "12 dB below speech" cap then still protects it.
-        Typing (low speech ratio) or steady noise (low dynamics) is not speech."""
-        return not any(r.startswith(("no_speech", "speech_ratio", "dynamic_range")) for r in reasons)
+        Typing (low speech ratio) or steady noise (dynamics below
+        CAP_MIN_DYNAMIC_RANGE_DB) is not speech; a quiet speaker whose dynamics
+        fall below the 15 dB plausibility limit still is."""
+        if any(r.startswith(("no_speech", "speech_ratio")) for r in reasons):
+            return False
+        return float(analysis.get("dynamic_range_db", 0.0)) >= CAP_MIN_DYNAMIC_RANGE_DB
+
+    def _deesser_engagement(self, sibilance_ratio_db: float, band_peak_dbfs: float) -> bool:
+        """Engagement state with hysteresis around SIBILANCE_REFERENCE_DB."""
+        if self._deesser_engaged is None:
+            current = float(self.chain.get_param("deesser", "threshold_db"))
+            self._deesser_engaged = current < band_peak_dbfs
+        if sibilance_ratio_db > SIBILANCE_REFERENCE_DB + SIBILANCE_HYSTERESIS_DB:
+            self._deesser_engaged = True
+        elif sibilance_ratio_db < SIBILANCE_REFERENCE_DB - SIBILANCE_HYSTERESIS_DB:
+            self._deesser_engaged = False
+        return self._deesser_engaged
+
+    def _check_low_snr(self, now: float, meters: dict, floor: float, speech: float,
+                       speech_present: bool) -> None:
+        """Log ``low_snr`` (advice only, no parameter change) when the normalizer
+        reports it or the own input SNR after trim is below LOW_SNR_DB."""
+        meter_flag = self._meter(meters, "normalizer", "low_snr")
+        meter_snr = self._meter(meters, "normalizer", "snr_lu")
+        own_snr = speech - floor
+        low = bool(meter_flag) or (speech_present and own_snr < LOW_SNR_DB)
+        if not low:
+            return
+        if self._last_low_snr_log_t is not None and now - self._last_low_snr_log_t < LOW_SNR_LOG_INTERVAL_S - EPS:
+            return
+        self._last_low_snr_log_t = now
+        self._log({"t": now, "event": "low_snr",
+                   "snr_lu": round(meter_snr if meter_snr is not None else own_snr, 1),
+                   "input_snr_db": round(own_snr, 1),
+                   "source": "normalizer" if meter_flag else "analysis",
+                   "hint": LOW_SNR_HINT})
 
     def _propose(self, now: float, analysis: dict, stats: dict) -> list[dict]:
         trim = 0.0 if self.analysis_is_post_trim else float(self.chain.get_param("input_trim", "gain_db"))
@@ -507,6 +587,8 @@ class AdaptiveController:
         else:
             self._log({"t": now, "event": "implausible_speech", "reasons": implausible,
                        "since_s": round(now - self._last_plausible_t, 1)})
+        speech_present = self._speech_present(analysis, implausible)
+        self._check_low_snr(now, self._current_meters, floor, speech, speech_present)
         proposals: list[dict] = []
 
         # Limiter protection state (hysteresis), evaluated first because it
@@ -537,7 +619,6 @@ class AdaptiveController:
             proposals.append({"stage": "expander", "name": "threshold_db", "step": -self.max_step_db,
                               "reason": "speech_cut", "immediate": True, "target": None})
         else:
-            speech_present = self._speech_present(implausible)
             p = self._track("expander", "threshold_db",
                             expander_threshold_target(floor, speech if speech_present else None),
                             EXPANDER_DEADZONE_DB, "noise_floor_track")
@@ -545,7 +626,10 @@ class AdaptiveController:
                 proposals.append(p)
 
         if plausible:
-            de_target, engaged = deesser_threshold_target(band_peak, sib, self.deesser_ratio)
+            engaged = self._deesser_engagement(sib, band_peak)
+            # Same control law as the calibration, evaluated with the hysteresis state.
+            de_target, _ = deesser_threshold_target(
+                band_peak, SIBILANCE_REFERENCE_DB + (1.0 if engaged else -1.0), self.deesser_ratio)
             p = self._track("deesser", "threshold_db", de_target, DEESSER_DEADZONE_DB,
                             "sibilance_track" if engaged else "sibilance_rest")
             if p:

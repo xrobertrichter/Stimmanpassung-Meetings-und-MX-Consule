@@ -283,18 +283,62 @@ def test_implausible_speech_holds_deesser_and_compressor(tmp_path, kw, expected_
 
 
 def test_expander_speech_cap_stays_for_a_quiet_speaker_but_not_for_typing():
-    # Quiet speaker (-28 dBFS after trim, level implausible) in a -46 dBFS room:
-    # floor + 10 = -36 would sit only 8 dB under the speech; the cap keeps -40.
+    # Quiet speaker (-28 dBFS after trim, level implausible, dynamics 14.3 dB < 15)
+    # in a -46 dBFS room: floor + 10 = -36 would sit only 8 dB under the speech;
+    # the cap keeps the target at -40, the expander ends at -38 (dead zone 2 dB).
     cfg, chain, ctrl = make()
-    changes = run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.6), 40)
+    changes = run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.6, dynamic=14.3), 40)
     thr = chain.get_param("expander", "threshold_db")
     assert abs(thr - (-40.0)) <= adaptive.EXPANDER_DEADZONE_DB
-    assert thr <= -28.0 - cal.EXPANDER_SPEECH_MARGIN_DB
+    assert thr <= -37.7
+    assert thr <= -28.0 - cal.EXPANDER_SPEECH_MARGIN_DB + adaptive.EXPANDER_DEADZONE_DB
     assert [c for c in changes if c["stage"] in ("deesser", "compressor")] == []
     # Typing (speech ratio 0.15) is not speech: the cap does not apply, the floor rule does.
     cfg, chain, ctrl = make()
-    run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.15), 40)
+    run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.15, dynamic=17.0), 40)
     assert abs(chain.get_param("expander", "threshold_db") - (-36.0)) <= adaptive.EXPANDER_DEADZONE_DB
+    # Steady noise (dynamics 8 dB, below the 10 dB cap limit) is not speech either.
+    cfg, chain, ctrl = make()
+    run(ctrl, lambda i: meters_dict(floor=-46.0, speech=-28.0, ratio=0.6, dynamic=8.0), 40)
+    assert abs(chain.get_param("expander", "threshold_db") - (-36.0)) <= adaptive.EXPANDER_DEADZONE_DB
+
+
+def test_low_snr_event_is_logged_with_hint_and_throttled(tmp_path):
+    log = tmp_path / "snr.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    # Own analysis: floor -40, speech -26 -> input SNR 14 dB < 16 dB.
+    changes = run(ctrl, lambda i: meters_dict(floor=-40.0, speech=-26.0, dynamic=14.0), 31)   # 30..90 s
+    assert all("snr" not in c["reason"] for c in changes)          # advice only, no own parameter change
+    ctrl.close()
+    low = [e for e in events(log) if e.get("event") == "low_snr"]
+    assert [e["t"] for e in low] == [30.0, 60.0, 90.0]              # at most every 30 s
+    assert low[0]["input_snr_db"] == pytest.approx(14.0) and low[0]["snr_lu"] == pytest.approx(14.0)
+    assert low[0]["source"] == "analysis" and "Störabstand zu gering" in low[0]["hint"]
+    # Normalizer meter flag (with its own SNR figure) triggers it as well; a healthy room does not.
+    log2 = tmp_path / "snr2.jsonl"
+    cfg, chain, ctrl = make(log_path=log2)
+    m = meters_dict(floor=-60.0, speech=-20.0)
+    m["normalizer"] = {"gain_db": 0.0, "low_snr": True, "snr_lu": 12.5}
+    ctrl.update(m, now=LEARN_S)
+    ctrl.update(meters_dict(floor=-60.0, speech=-20.0), now=LEARN_S + 40.0)
+    ctrl.close()
+    low2 = [e for e in events(log2) if e.get("event") == "low_snr"]
+    assert len(low2) == 1 and low2[0]["source"] == "normalizer" and low2[0]["snr_lu"] == pytest.approx(12.5)
+
+
+def test_live_floor_estimate_holds_for_dense_talk():
+    """Dense talk (10 % pauses): the floor comes from the pause frames, not from
+    syllable valleys (the global 10th percentile read 2.5 dB too high)."""
+    dense = synth.make_speech_like(60.0, SR, noise_floor_dbfs=-50.0, pause_ratio=0.1, seed=12)
+    normal = synth.make_speech_like(60.0, SR, noise_floor_dbfs=-50.0, pause_ratio=0.3, seed=12)
+    for x in (dense, normal):
+        la = adaptive.LiveAnalyzer(SR)
+        la.push(x)
+        assert la.snapshot()["noise_floor_dbfs"] == pytest.approx(-50.0, abs=1.5)
+    # Pure noise (no speech): the estimate is the noise level as well.
+    la = adaptive.LiveAnalyzer(SR)
+    la.push(np.random.default_rng(2).standard_normal(20 * SR) * 10 ** (-50 / 20))
+    assert la.snapshot()["noise_floor_dbfs"] == pytest.approx(-50.0, abs=1.5)
 
 
 def test_rest_after_60_s_without_plausible_speech(tmp_path):
@@ -651,6 +695,19 @@ def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_c
     assert all(set(e) == {"t", "stage", "name", "old", "new", "reason"} for e in logged)
     # Ticks at 2, 4, ..., 28 s fall into the 30 s learning phase: 14 entries.
     assert [e["event"] for e in entries if "event" in e].count("learning") == 14
+
+
+def test_dense_talk_in_an_unchanged_room_does_not_move_the_expander(tmp_path, base_cfg):
+    """300 s of dense talk (10 % pauses) in the room the chain was calibrated for:
+    the floor estimate stays put, so the expander threshold does not wander."""
+    sample = synth.make_speech_like(60.0, SR, noise_floor_dbfs=-50.0, seed=31, lead_silence_s=10.0, long_pause_s=6.0)
+    cfg = cal.recommend(cal.analyze(sample, SR), base_cfg)
+    dense = synth.make_speech_like(300.0, SR, noise_floor_dbfs=-50.0, pause_ratio=0.1, seed=32)
+    log = tmp_path / "dense.jsonl"
+    chain, changes = _run_closed_loop(dense, cfg, log)
+    exp = [c for c in changes if c["stage"] == "expander"]
+    assert exp == [], exp
+    assert chain.get_param("expander", "threshold_db") == cfg["chain"]["expander"]["threshold_db"]
 
 
 def test_pause_ending_just_after_an_interval_start_is_no_speech_cut(tmp_path, base_cfg):

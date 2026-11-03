@@ -596,6 +596,70 @@ def test_first_pass_without_normalizer_keeps_gain_headroom_in_a_noisy_room(tmp_p
     assert norm["enabled"] is True
 
 
+def test_borderline_voice_passes_the_sibilance_criterion_with_the_real_chain(tmp_path, base_cfg):
+    """A voice just above the reference (de-esser engaged) must not fail only because
+    compressor/normalizer lift the band by the amount the de-esser takes back."""
+    x = synth.make_speech_like(60.0, SR, sibilance_db=-6.0, **SAMPLE_KW)
+    wav = _write_wav(tmp_path / "border.wav", x)
+    result = cal.run_calibration(str(wav), None, str(tmp_path / "b.yaml"), str(tmp_path / "b.md"))
+    before = result["measurements"]["sibilance_ratio_db"]
+    assert cal.SIBILANCE_REFERENCE_DB < before <= cal.SIBILANCE_REFERENCE_DB + cal.SIBILANCE_BORDERLINE_DB
+    crit = result["evaluation"]["criteria"]["sibilance_reduced"]
+    assert crit["passed"] is True, crit
+    assert result["evaluation"]["after"]["sibilance_ratio_db"] <= before + cal.SIBILANCE_MAX_INCREASE_DB
+    assert "Grenzstimme" in crit["note"]
+
+
+def test_sibilance_criterion_hysteresis_rules():
+    """Rule table of the engaged branch, checked on synthetic before/after pairs."""
+    cfg_stub = {"chain": {"deesser": {"freq_hz": 6500.0, "bandwidth_oct": 1.0},
+                          "normalizer": {"target_lufs": -18.0}, "limiter": {"ceiling_dbfs": -1.0}}}
+    base = synth.make_speech_like(40.0, SR, sibilance_db=0.0, seed=4, long_pause_s=6.0)
+    from scipy import signal
+    sos = signal.butter(4, [5000.0, 10000.0], btype="bandpass", fs=SR, output="sos")
+    band = signal.sosfiltfilt(sos, base.astype(np.float64))
+
+    def shifted(db):   # scale the 5-10 kHz band by db
+        return (base + band * (10 ** (db / 20) - 1.0)).astype(np.float32)
+
+    ratio_before = cal.analyze(base, SR)["sibilance_ratio_db"]
+    assert ratio_before > cal.SIBILANCE_REFERENCE_DB + cal.SIBILANCE_BORDERLINE_DB   # clearly sibilant (~-7 dB)
+    # clearly sibilant: -2 dB passes, +0.5 dB (still above reference) fails
+    assert cal.evaluate(base, shifted(-2.0), SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is True
+    assert cal.evaluate(base, shifted(+0.5), SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is False
+    # borderline (reference + 2 dB): +0.5 dB passes, +1.5 dB fails
+    border = shifted(cal.SIBILANCE_REFERENCE_DB + 2.0 - ratio_before)
+    border_ratio = cal.analyze(border, SR)["sibilance_ratio_db"]   # band scaling is not exactly 1:1 in the ratio
+    assert cal.SIBILANCE_REFERENCE_DB + 1.0 <= border_ratio <= cal.SIBILANCE_REFERENCE_DB + cal.SIBILANCE_BORDERLINE_DB
+    bb = signal.sosfiltfilt(sos, border.astype(np.float64))
+    up_half = (border + bb * (10 ** (0.5 / 20) - 1.0)).astype(np.float32)
+    up_two = (border + bb * (10 ** (1.5 / 20) - 1.0)).astype(np.float32)
+    assert cal.evaluate(border, up_half, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is True
+    assert cal.evaluate(border, up_two, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is False
+
+
+def test_bright_microphone_gets_a_moderate_high_shelf_cut(base_cfg):
+    """A voice with +4 dB above 7 kHz (bright capsule) is cut by about half of
+    that, within the -3 dB limit; the plain voice (reference-like above 7 kHz) is left alone."""
+    x = synth.make_speech_like(40.0, SR, sibilance_db=-12.0, seed=5, long_pause_s=6.0).astype(np.float64)
+    spec = np.fft.rfft(x)
+    f = np.fft.rfftfreq(x.size, 1 / SR)
+    gain = np.ones_like(f)
+    ramp = (f >= 5000.0) & (f < 7000.0)
+    gain[ramp] = 10 ** (4.0 / 20 * (f[ramp] - 5000.0) / 2000.0)
+    gain[f >= 7000.0] = 10 ** (4.0 / 20)
+    bright = np.fft.irfft(spec * gain, x.size)
+    plain_m = cal.analyze(x, SR)
+    bright_m = cal.analyze(bright, SR)
+    anchor = lambda m: m["eq_bands"]["high_shelf@10000"]["density_db"] - m["eq_anchor"]["density_db"]
+    assert anchor(bright_m) - anchor(plain_m) == pytest.approx(4.0, abs=0.7)
+    shelf = lambda cfg: next(b for b in cfg["chain"]["eq"]["bands"] if b["type"] == "high_shelf")["gain_db"]
+    plain_gain = shelf(cal.recommend(plain_m, base_cfg))
+    bright_gain = shelf(cal.recommend(bright_m, base_cfg))
+    assert plain_gain == 0.0
+    assert -cal.EQ_HIGH_SHELF_MAX_CUT_DB <= bright_gain <= -1.0
+
+
 def test_clean_voice_passes_the_sibilance_criterion_with_the_real_chain(tmp_path, base_cfg):
     x = synth.make_speech_like(60.0, SR, sibilance_db=-12.0, **SAMPLE_KW)
     wav = _write_wav(tmp_path / "clean.wav", x)

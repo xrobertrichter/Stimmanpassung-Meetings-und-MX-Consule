@@ -42,8 +42,12 @@ PAUSE_JITTER = (0.7, 1.3)           # random spread of pause lengths around the 
 # --- Voice model ------------------------------------------------------------ #
 PITCH_RANGE_HZ = (100.0, 140.0)     # male-to-neutral fundamental; above the 80 Hz high-pass
 PITCH_GLIDE = 0.10                  # +-10 % pitch movement within a syllable
-HARMONIC_MAX_HZ = 5000.0            # voiced energy above this is negligible
+HARMONIC_MAX_HZ = 8000.0            # voiced harmonics reach into the top octave of the speech band
 SPECTRAL_KNEE_HZ = 500.0            # envelope flat below, -6 dB/oct above (long-term speech spectrum, assumption)
+# Above this knee the voiced envelope falls at -12 dB/oct in total: real voices
+# keep weak harmonics and aspiration noise up to ~8 kHz, which is what a
+# microphone's top-octave response (high shelf) acts on. Assumption.
+SPECTRAL_KNEE_HIGH_HZ = 4000.0
 FORMANTS_HZ = (500.0, 1500.0, 2500.0)   # neutral vowel formant positions
 FORMANT_BANDWIDTH_HZ = 150.0
 FORMANT_BOOST = 2.0                 # +6 dB amplitude peak at each formant
@@ -78,6 +82,7 @@ def _voiced_syllable(n: int, sr: int, rng: np.random.Generator,
     k = np.arange(1, n_harm + 1)
     fk = k * f0
     amp = 1.0 / np.sqrt(1.0 + (fk / SPECTRAL_KNEE_HZ) ** 2)
+    amp /= np.sqrt(1.0 + (fk / SPECTRAL_KNEE_HIGH_HZ) ** 2)   # extra -6 dB/oct above 4 kHz
     for fc in FORMANTS_HZ:
         amp *= 1.0 + FORMANT_BOOST * np.exp(-((fk - fc) / FORMANT_BANDWIDTH_HZ) ** 2)
     phases = rng.uniform(0.0, 2.0 * math.pi, size=n_harm)
