@@ -333,6 +333,58 @@ def test_level_plausibility_has_one_db_hysteresis(tmp_path):
     assert comp and all(c["new"] - c["old"] == pytest.approx(-STEP_DB) for c in comp)   # one direction only
 
 
+def test_room_offset_enters_the_floor_rule_before_the_speech_cap():
+    """Target = min(floor + 10 + offset, speech - 12): with speech -25 the cap -37 wins over
+    floor -50 + 10 + 6 = -34; the controller never settles above the cap."""
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -40.0}})
+    ctrl.set_user_offsets({"expander.threshold_db": 6.0})
+    run(ctrl, lambda i: meters_dict(floor=-50.0, speech=-25.0), 40)
+    assert chain.get_param("expander", "threshold_db") <= -37.0 + adaptive.EXPANDER_DEADZONE_DB
+    assert ctrl.last_expander_cap == pytest.approx(-37.0)
+    # Without the cap (speech -20 -> cap -32) the offset is fully effective: -34.
+    cfg, chain, ctrl = make({"expander": {"threshold_db": -40.0}})
+    ctrl.set_user_offsets({"expander.threshold_db": 6.0})
+    run(ctrl, lambda i: meters_dict(floor=-50.0, speech=-20.0), 40)
+    assert abs(chain.get_param("expander", "threshold_db") - (-34.0)) <= adaptive.EXPANDER_DEADZONE_DB
+    # Typing (no speech present): no cap, last_expander_cap None.
+    cfg, chain, ctrl = make()
+    run(ctrl, lambda i: meters_dict(floor=-60.0, speech=-40.0, ratio=0.15), 3)
+    assert ctrl.last_expander_cap is None
+
+
+def test_pause_and_resume_stop_the_controller_clock(tmp_path):
+    log = tmp_path / "pause.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    run(ctrl, lambda i: meters_dict(floor=-70.0), 10, t0=0.0)          # 0..18 s learned
+    ctrl.pause(now=20.0)
+    assert ctrl.paused
+    assert ctrl.update(meters_dict(floor=-70.0), now=50.0) == []       # nothing while paused
+    ctrl.clock = lambda: 300.0
+    assert ctrl.learning is True
+    ctrl.resume(now=300.0)                                            # 280 s off: all timers shifted
+    assert not ctrl.paused
+    assert ctrl.update(meters_dict(floor=-70.0), now=305.0) == []     # 25 s of 30 s learned
+    assert len(ctrl.update(meters_dict(floor=-70.0), now=311.0)) >= 1
+    ctrl.resume()                                                     # idempotent
+    ctrl.close()
+    evs = [e.get("event") for e in events(log)]
+    assert "paused" in evs and "resumed" in evs
+
+
+def test_reset_protection_restores_the_normalizer_limit_and_clears_the_state():
+    cfg, chain, ctrl = make()
+    ctrl.update(meters_dict(limiter_gr=5.0, norm_gain=4.0, speech=-15.0), now=LEARN_S)
+    assert ctrl.limiter_protect_active and chain.get_param("normalizer", "max_gain_db") == pytest.approx(4.0)
+    changes = ctrl.reset_protection()
+    assert not ctrl.limiter_protect_active
+    assert chain.get_param("normalizer", "max_gain_db") == pytest.approx(12.0)
+    assert [(c["stage"], c["name"], c["old"], c["new"], c["reason"]) for c in changes] == \
+        [("normalizer", "max_gain_db", 4.0, 12.0, "reset")]
+    # The next interval with a quiet limiter raises the compressor again (protection gone).
+    changes = ctrl.update(meters_dict(limiter_gr=0.0, speech=-15.0), now=LEARN_S + 2 * INTERVAL_S)
+    assert [c["new"] - c["old"] for c in changes if c["stage"] == "compressor"] == [pytest.approx(STEP_DB)]
+
+
 def test_user_offsets_api_validation_rest_and_log_event(tmp_path):
     log = tmp_path / "offs.jsonl"
     cfg, chain, ctrl = make(log_path=log)
@@ -714,6 +766,7 @@ def _run_closed_loop(x, cfg, log, learn_s=LEARN_S, block=2048):
     return chain, changes
 
 
+@pytest.mark.slow
 def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_cfg):
     """Chain + LiveAnalyzer + AdaptiveController over 300 s of normal speech: floor
     -55 dBFS for 100 s, then -45 dBFS. Learning phase untouched, expander follows
@@ -756,6 +809,7 @@ def test_closed_loop_with_real_chain_follows_a_noise_floor_step(tmp_path, base_c
     assert [e["event"] for e in entries if "event" in e].count("learning") == 14
 
 
+@pytest.mark.slow
 def test_dense_talk_in_an_unchanged_room_does_not_move_the_expander(tmp_path, base_cfg):
     """300 s of dense talk (10 % pauses) in the room the chain was calibrated for:
     the floor estimate stays put, so the expander threshold does not wander."""

@@ -649,6 +649,7 @@ def _voice_with_sibilance_ratio(target_db: float, seed: int = 4) -> np.ndarray:
     return x.astype(np.float32)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("target", [-18.0, -17.0, -16.0, -15.0, -14.0, -13.0, -12.0, -11.0, -10.0])
 def test_sibilance_criterion_passes_across_the_reference_with_the_real_chain(tmp_path, target):
     """Calibrated chain on voices from -18 to -10 dB: none fails the sibilance criterion
@@ -694,19 +695,37 @@ def test_sibilance_criterion_on_signals_follows_the_closed_rule():
     assert cal.evaluate(mild, up_two, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is False
 
 
-@pytest.mark.parametrize("sibilance_db", [-12.0, -18.0])
-def test_calibration_with_lead_silence_lets_the_normalizer_regulate(tmp_path, base_cfg, sibilance_db):
+def _calibrate_standard_sample(tmp_dir, sibilance_db: float) -> dict:
+    """Full calibration (real chain) of the standard sample: 10 s lead silence, 6 s pause."""
+    x = synth.make_speech_like(60.0, SR, sibilance_db=sibilance_db, **SAMPLE_KW)
+    wav = _write_wav(tmp_dir / f"lead{int(-sibilance_db)}.wav", x)
+    result = cal.run_calibration(str(wav), None, str(tmp_dir / "l.yaml"), str(tmp_dir / "l.md"))
+    result["report_text"] = (tmp_dir / "l.md").read_text(encoding="utf-8")
+    return result
+
+
+@pytest.fixture(scope="module")
+def clean_calibration(tmp_path_factory):
+    """One real-chain calibration of a clean voice (sibilance -12), shared by the tests below."""
+    return _calibrate_standard_sample(tmp_path_factory.mktemp("clean"), -12.0)
+
+
+@pytest.fixture(scope="module")
+def soft_calibration(tmp_path_factory):
+    return _calibrate_standard_sample(tmp_path_factory.mktemp("soft"), -18.0)
+
+
+@pytest.mark.parametrize("which", ["clean", "soft"])
+def test_calibration_with_lead_silence_lets_the_normalizer_regulate(request, which):
     """Standard sample (10 s lead silence, 6 s pause): the evaluation pass must not leave
     the normalizer frozen on the lead noise; loudness lands on target with gain > 0.5 dB."""
-    x = synth.make_speech_like(60.0, SR, sibilance_db=sibilance_db, **SAMPLE_KW)
-    wav = _write_wav(tmp_path / f"lead{int(-sibilance_db)}.wav", x)
-    result = cal.run_calibration(str(wav), None, str(tmp_path / "l.yaml"), str(tmp_path / "l.md"))
+    result = request.getfixturevalue(f"{which}_calibration")
     ev = result["evaluation"]
     assert ev["criteria"]["loudness_in_target"]["passed"] is True, ev["criteria"]["loudness_in_target"]
     assert abs(ev["after"]["integrated_lufs"] - (-18.0)) <= 2.0
     assert ev["info"]["normalizer_gain_end_db"] is not None
     assert ev["info"]["normalizer_gain_end_db"] > 0.5
-    assert "Normalizer-Gain am Ende" in (tmp_path / "l.md").read_text(encoding="utf-8")
+    assert "Normalizer-Gain am Ende" in result["report_text"]
     assert result["passed"] is True, ev["criteria"]
 
 
@@ -732,10 +751,8 @@ def test_bright_microphone_gets_a_moderate_high_shelf_cut(base_cfg):
     assert -cal.EQ_HIGH_SHELF_MAX_CUT_DB <= bright_gain <= -1.0
 
 
-def test_clean_voice_passes_the_sibilance_criterion_with_the_real_chain(tmp_path, base_cfg):
-    x = synth.make_speech_like(60.0, SR, sibilance_db=-12.0, **SAMPLE_KW)
-    wav = _write_wav(tmp_path / "clean.wav", x)
-    result = cal.run_calibration(str(wav), None, str(tmp_path / "c.yaml"), str(tmp_path / "c.md"))
+def test_clean_voice_passes_the_sibilance_criterion_with_the_real_chain(clean_calibration):
+    result = clean_calibration
     assert result["measurements"]["sibilance_ratio_db"] <= cal.SIBILANCE_REFERENCE_DB
     crit = result["evaluation"]["criteria"]["sibilance_reduced"]
     assert crit["passed"] is True, crit

@@ -323,7 +323,10 @@ Datei aus `adaptive.log_path` (Standard `logs/adaptive.jsonl`), eine JSON-Zeile 
 ```
 
 Gründe: `noise_floor_track`, `sibilance_track`, `sibilance_rest`, `speech_level_track`,
-`speech_cut`, `limiter_overload`, `limiter_recovered`, `rest`.
+`speech_cap` (Schwelle lag über Sprache − 12 dB – leiserer Sprecher oder Raum-Offset – und wird
+je Intervall um höchstens `max_step_db` auf die Kappe gezogen, ohne Totzone), `speech_cut`,
+`limiter_overload`, `limiter_recovered`, `rest`, `reset` (Normalizer-Deckel nach Reset),
+`relearn` (Rückkehr auf Kalibrierwerte bei „Neu lernen").
 
 Ereignisse (Schlüssel `event`):
 
@@ -378,50 +381,68 @@ Werte der geladenen Konfiguration:
 
 | Offset | Bereich / Schritt | Wirkung |
 |---|---|---|
-| `loudness_lu` | −6…+6 LU, 0,5 je Rastung | `normalizer.target_lufs` = Kalibrierwert + Offset, geklemmt auf −24…−12 LUFS |
+| `loudness_lu` | −6…+6 LU, 0,5 je Rastung | `normalizer.target_lufs` = Kalibrierwert + Offset, geklemmt auf −24…−14 LUFS (lauter regelt die AGC der Konferenzsysteme ohnehin zurück) |
 | `room_db` | −6…+6 dB, 2 je Druck | Expander-Schwelle = Sollwert + Offset (positiv = weniger Raum = Schwelle höher); die Sprach-Kappe „Sprache − 12" und die `bounds` gelten weiter |
 | `deess_db` | −6…+6 dB, 2 je Druck | De-Esser-Schwelle = Sollwert + Offset (negativ = weniger Zischen) |
-| `intensity` | −3…+3 Stufen, 1 je Druck | Kompressor-Schwelle −2 dB je Stufe, De-Esser-Schwelle −1 dB je Stufe (kumulativ mit `deess_db`) |
+| `intensity` | −3…+3 Stufen, 1 je Druck | Kompressor-Schwelle −2 dB je Stufe (der De-Esser ist nicht gekoppelt: Zischen ist Eigenschaft von Mikro und Stimme, nicht der Dichte) |
 | `tone_db` | −3…+3 dB, 1 je Druck | `eq.tilt_db` (positiv = heller; zwei Shelves 250 Hz / 4 kHz, docs/02) |
 
 Ein Tastendruck bewegt einen Offset um höchstens eine Schrittweite und nie über den Bereich
-hinaus; `set_offset` setzt ihn direkt (geklemmt). Jede Antwort enthält `state` (Offsets,
+hinaus; `set_offset` setzt ihn direkt (geklemmt). **Gespeicherte Offsets sind immer der wirksame
+Wert:** Stoppt der Bereich, eine `bounds`-Grenze oder die Sprach-Kappe den Schritt ganz, antwortet
+die Kette `ok: false` mit „… am Anschlag (wirksam: Expander −30 dBFS, Raum +4 dB)"; wirkt er nur
+teilweise, nennt die Antwort die Begrenzung („durch Sprach-Kappe auf −37 dBFS begrenzt") und der
+Offset wird aus der tatsächlich gesetzten Schwelle zurückgerechnet. Es gibt keine Phantomstufen:
+`status` zeigt nie einen Offset, der nichts bewirkt. Jede Antwort enthält `state` (Offsets,
 Ziel-Lautheit, Freeze/Mute/Bypass, Lautheit, Störabstand, `low_snr`, Lernphase, aktuelle
 Schwellen) und eine kurze deutsche `message` für die macOS-Mitteilung; Fehler kommen als
 `ok: false` mit Text zurück, nie als Ausnahme.
 
 **Zusammenspiel mit der Regelung.** Mit laufender Regelung gehen die Schwellen-Offsets in die
-Sollwerte des Controllers (`AdaptiveController.set_user_offsets`): das Ziel bleibt
-min(Rauschteppich + 10, Sprache − 12) bzw. Zischspitze ± Overshoot bzw. Sprachpegel, der
-Offset wird addiert, die `bounds` gelten danach. Weil der Offset Teil des Sollwerts ist, regelt
+Sollwerte des Controllers (`AdaptiveController.set_user_offsets`): Expander-Ziel =
+min(Rauschteppich + 10 + Raum-Offset, Sprache − 12) – die Sprach-Kappe liegt **über** dem
+Offset und gilt auch für den Sofortschritt der Taste (Kappe aus dem letzten Analyzer-Schnappschuss;
+vor der ersten Auswertung begrenzen nur die `bounds`); De-Esser-Ziel = Zischspitze ± Overshoot +
+Offset, Kompressor-Ziel = Sprachpegel + Offset, die `bounds` gelten danach. Weil der Offset Teil des Sollwerts ist, regelt
 die Regelung ihn nicht zurück (Simulation 300 s mit Raum +4: Expander bleibt Ziel + 4 ± Totzone,
 kein Schritt nach unten). Damit ein Tastendruck sofort hörbar ist, wird die Änderung des Offsets
 zusätzlich direkt auf den Parameter angewandt; die Regelung hält den neuen Sollwert ab dem
 nächsten Intervall. Auch die Ruhewerte (`rest`) erhalten den Offset. Ohne Regelung
 (`--no-adaptive`) wirken die Offsets unmittelbar auf die Kalibrierwerte.
 
-**Reset** setzt alle Offsets auf 0, die Ziel-Lautheit und den Tilt auf den Kalibrierwert, die drei
-Schwellen sofort (nicht in Schritten) auf die kalibrierten Ruhewerte, Mute und Bypass aus; die
-Lernphase läuft nicht neu. **Neu lernen** startet nur die Lernphase und leert die Analyzer-Historie,
-die Offsets bleiben (Platzwechsel im selben Meeting). **Freeze** friert die Regelung ein (wie
-SIGUSR1). **Marker** schreibt `{"event": "marker", "text": …}` ins JSONL-Log.
+**Reset = Bedienzustand zurück.** Alle Offsets 0, Ziel-Lautheit und Tilt auf den Kalibrierwert,
+Verarbeitung an (Kill-Switch), Mute und Bypass aus, Freeze **aus**, `normalizer.max_gain_db` und
+der Limiter-Schutzzustand der Regelung zurück auf die Konfiguration. Die von der Regelung
+**nachgeführten Schwellen bleiben** (nur der Offset wird von ihnen abgezogen): Hat der Lüfter den
+Raum verändert, bleibt die Kette an den Raum angepasst; die Lernphase läuft nicht neu. Ohne
+Regelung setzt Reset die Kalibrierwerte. **Neu lernen** (Ebene 2) setzt die Regelung sofort auf
+die kalibrierten Ruhewerte (+ Offsets), startet die Lernphase neu und leert die Analyzer-Historie;
+die Offsets bleiben (Platz- oder Raumwechsel im selben Meeting); im Kill-Switch-Aus-Zustand wird
+es abgelehnt. **Freeze** friert die Regelung ein (wie SIGUSR1). **Marker** schreibt
+`{"event": "marker", "text": …}` ins JSONL-Log.
 
 **Kill-Switch (Verarbeitung an/aus).** Das Kommando `processing` (Ebene 2, K4; CLI `power`)
 schaltet die Kette über den Hook `processing` der Runtime wirklich ab: nur Input Trim und Limiter
 werden gerechnet (`Chain.set_processing`), Analyzer und Regelung pausieren, die Prozessorlast
 sinkt; die Statuszeile zeigt OFF. Im Aus-Zustand werden Offset-Kommandos angenommen und
 gespeichert (die Antwort sagt „wirkt beim Einschalten"); mit Regelung wird deren Freeze-Zustand
-gemerkt, die Regelung eingefroren und beim Einschalten der vorherige Zustand wiederhergestellt –
-ohne neue Lernphase, die Kalibrierwerte bleiben. Reset schaltet die Verarbeitung wieder ein und
-setzt danach wie beschrieben zurück.
+gemerkt, die Regelung eingefroren und **ihre Uhr angehalten** (Lernphase und Wartezeiten laufen erst
+beim Einschalten weiter, eine halb gehörte Lernphase wird also zu Ende gehört); beim Einschalten
+wird der vorherige Freeze-Zustand wiederhergestellt, ohne neue Lernphase. Reset schaltet die
+Verarbeitung wieder ein und setzt danach wie beschrieben zurück. Antworten enthalten nie
+NaN/Infinity (unbekannte Messwerte erscheinen als `null` bzw. „unbekannt"), nicht-finite Eingaben
+werden abgelehnt, und Meter für Status/Antworten werden nicht-leerend gelesen
+(`Chain.peek_meters`), damit ein Tastendruck die Akkumulatoren der Regelung nicht löscht.
 
 **Warum Offsets nicht persistiert werden.** Ein Offset ist eine Sitzungskorrektur („heute
 zischt es, heute ist der Lüfter an"); die Kalibrierung bleibt die Referenz, zu der Reset
-zurückführt. Wer eine Korrektur behalten will, nutzt **Snapshot**: er schreibt die geladene
-Konfiguration mit eingerechneten Offsets (Basiswerte + Offsets, geklemmt) über
+zurückführt. Wer behalten will, „was jetzt gut klingt", nutzt **Snapshot**: er schreibt die
+geladene Konfiguration mit den **wirksamen Werten** – die aktuellen Schwellen der Kette
+einschließlich Nachführung und Offsets, die Ziel-Lautheit, den Tilt – über
 `voicechain.config.save_config` nach `config/chain.live.yaml` (oder `path`), zusätzlich den
-Metadaten-Block `_live: {created, offsets}`; die Datei lässt sich mit `run --config` laden und ist
-dann die neue Basis (Offsets wieder 0).
+Metadaten-Block `_live: {created, offsets, tracked, base}` (Offsets, nachgeführte Werte,
+Kalibrierbasis); die Datei lässt sich mit `run --config` laden und ist dann die neue Basis
+(Offsets wieder 0, Offset-Bereich −6…+6 um die neue Basis, `bounds` schützen).
 
 ## 12. Grenzen des Verfahrens
 

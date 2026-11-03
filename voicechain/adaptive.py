@@ -70,6 +70,7 @@ from scipy import signal
 
 from voicechain import meters as _m
 from voicechain.calibrate import (
+    EXPANDER_SPEECH_MARGIN_DB,
     REFERENCE_SPEECH_LEVEL_DBFS,
     SIBILANCE_REFERENCE_DB,
     clamp,
@@ -387,6 +388,13 @@ class AdaptiveController:
         self._deesser_engaged: bool | None = None
         self._level_plausible = False
         self._user_offsets: dict[tuple[str, str], float] = {}
+        #: Speech cap of the expander from the last decision (speech - 12 dB after
+        #: trim) or None when no speech was present; used by the live control for
+        #: its immediate room step.
+        self.last_expander_cap: float | None = None
+        #: Kill switch: while paused the controller clock stands still (the
+        #: learning phase and all spacing timers resume where they stopped).
+        self._paused_at: float | None = None
         self._acc_limiter: list[float] = []
         self._acc_expander_speech: list[float] = []
         self._acc_normalizer: list[float] = []
@@ -412,8 +420,10 @@ class AdaptiveController:
 
     @property
     def learning(self) -> bool:
-        """True while the learning phase (measured from start or the last relearn) runs."""
-        return float(self.clock()) - self._t_start < self.learn_s - EPS
+        """True while the learning phase (measured from start or the last relearn) runs;
+        while paused the phase does not advance."""
+        now = self._paused_at if self._paused_at is not None else float(self.clock())
+        return now - self._t_start < self.learn_s - EPS
 
     @property
     def user_offsets(self) -> dict[str, float]:
@@ -470,6 +480,54 @@ class AdaptiveController:
         self._drain()
         self._log({"t": now, "event": "relearn", "learn_s": self.learn_s})
 
+    @property
+    def paused(self) -> bool:
+        return self._paused_at is not None
+
+    def pause(self, now: float | None = None) -> None:
+        """Stop the controller clock (processing switched off); updates do nothing."""
+        if self._paused_at is None:
+            self._paused_at = self._now(now)
+            self._log({"t": self._paused_at, "event": "paused"})
+
+    def resume(self, now: float | None = None) -> None:
+        """Continue after pause(): every timer is shifted by the paused duration, so
+        the learning phase lasts learn_s of *heard* audio."""
+        if self._paused_at is None:
+            return
+        now = self._now(now)
+        gap = max(0.0, now - self._paused_at)
+        self._t_start += gap
+        self._last_decision_t += gap
+        self._last_plausible_t += gap
+        if self._last_learning_log_t is not None:
+            self._last_learning_log_t += gap
+        if self._last_low_snr_log_t is not None:
+            self._last_low_snr_log_t += gap
+        self._last_change_t = {key: t + gap for key, t in self._last_change_t.items()}
+        self._paused_at = None
+        self._drain()
+        self._log({"t": now, "event": "resumed", "paused_s": round(gap, 3)})
+
+    def reset_protection(self) -> list[dict]:
+        """Clear the limiter protection state: normalizer.max_gain_db back to the
+        configured value, protection flag and accumulators cleared."""
+        now = self._now(None)
+        self._limiter_protect = False
+        self._speech_cut_streak = 0
+        self._drain()
+        changes = []
+        old = float(self.chain.get_param("normalizer", "max_gain_db"))
+        if abs(old - self.normalizer_max_gain_db) > EPS:
+            self.chain.set_param("normalizer", "max_gain_db", self.normalizer_max_gain_db)
+            entry = {"t": now, "stage": "normalizer", "name": "max_gain_db", "old": old,
+                     "new": self.normalizer_max_gain_db, "reason": "reset"}
+            self._log(entry)
+            changes.append(entry)
+        self._log({"t": now, "event": "limiter_protect", "active": False, "limiter_gr_mean_db": None,
+                   "hold_normalizer_gain": False, "block_compressor_raise": False, "by": "reset"})
+        return changes
+
     def log_event(self, entry: dict) -> None:
         """Write an informational JSONL entry (``event`` key) with the current time."""
         if "event" not in entry:
@@ -487,6 +545,8 @@ class AdaptiveController:
         Returns the list of applied changes ``{"t", "stage", "name", "old", "new", "reason"}``.
         """
         now = self._now(now)
+        if self._paused_at is not None:
+            return []
         elapsed = now - self._t_start
         if elapsed < self.learn_s - EPS:
             # Listening only: meters of the learning phase are not collected, so
@@ -571,11 +631,14 @@ class AdaptiveController:
         return tracked_bounds(self.bounds, stage, name)
 
     def _track(self, stage: str, name: str, target: float, deadzone: float,
-               reason: str, block_increase: bool = False) -> dict | None:
+               reason: str, block_increase: bool = False, include_offset: bool = True) -> dict | None:
         lo, hi = self._bounds(stage, name)
         # Live offsets (console) shift the setpoint; the controller never regulates
-        # them away because they are part of the target itself.
-        target = clamp(target + self._user_offsets.get((stage, name), 0.0), lo, hi)
+        # them away because they are part of the target itself. The expander adds
+        # its offset before the speech cap (include_offset=False, see _propose).
+        if include_offset:
+            target = target + self._user_offsets.get((stage, name), 0.0)
+        target = clamp(target, lo, hi)
         current = float(self.chain.get_param(stage, name))
         error = target - current
         if abs(error) <= deadzone:
@@ -699,11 +762,25 @@ class AdaptiveController:
             proposals.append({"stage": "expander", "name": "threshold_db", "step": -self.max_step_db,
                               "reason": "speech_cut", "immediate": True, "target": None})
         else:
-            p = self._track("expander", "threshold_db",
-                            expander_threshold_target(floor, speech if speech_present else None),
-                            EXPANDER_DEADZONE_DB, "noise_floor_track")
-            if p:
-                proposals.append(p)
+            # The room offset shifts the floor rule only; the speech cap stays on
+            # top of it (min after the offset), so an offset can never push the
+            # threshold into the quiet syllables.
+            room_offset = self._user_offsets.get(("expander", "threshold_db"), 0.0)
+            self.last_expander_cap = (speech - EXPANDER_SPEECH_MARGIN_DB) if speech_present else None
+            current = float(self.chain.get_param("expander", "threshold_db"))
+            if self.last_expander_cap is not None and current > self.last_expander_cap + EPS:
+                # The cap is a protection, not a setpoint: a threshold above it (quieter
+                # speaker, live offset) is pulled down every interval, dead zone and
+                # spacing do not apply, until it sits on the cap.
+                proposals.append({"stage": "expander", "name": "threshold_db",
+                                  "step": -min(self.max_step_db, current - self.last_expander_cap),
+                                  "reason": "speech_cap", "immediate": True, "target": self.last_expander_cap})
+            else:
+                p = self._track("expander", "threshold_db",
+                                expander_threshold_target(floor + room_offset, speech if speech_present else None),
+                                EXPANDER_DEADZONE_DB, "noise_floor_track", include_offset=False)
+                if p:
+                    proposals.append(p)
 
         if plausible:
             engaged = self._deesser_engagement(sib, band_peak)
