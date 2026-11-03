@@ -557,3 +557,121 @@ def test_bypass_toggle_is_click_free_and_keeps_state(cfg, fs, gen):
     # back on the full path the output matches the undisturbed chain (states kept running)
     assert np.max(np.abs(y_all[int(2.2 * fs):] - ref_all[int(2.2 * fs):])) < 1e-3
     assert chain.get_meters()["chain"]["bypass"] == 0.0
+
+
+def test_processing_off_equals_reference_and_saves_cpu(cfg, fs, gen):
+    """Kill switch: output == Input Trim -> Limiter, middle stages are not called, block time
+    < 25 % of normal operation (median over 1000 blocks)."""
+    x, _ = gen.speech_like(-20.0, 12.0, fs, seed=5)
+    x = x.astype(np.float32)
+    x[fs + 100:fs + 148] = 1.5                                              # keeps the limiter honest
+    blocks = [x[i:i + 256] for i in range(0, len(x), 256)]
+
+    def timed(chain, items):
+        durations, outputs = [], []
+        for b in items:
+            t0 = time.perf_counter()
+            outputs.append(chain.process(b))
+            durations.append(time.perf_counter() - t0)
+        return np.array(durations) * 1e3, outputs
+
+    on = Chain.from_config(cfg)
+    on.process(blocks[0])
+    d_on, _ = timed(on, blocks[1:1001])
+    off = Chain.from_config(cfg)
+    off.set_processing(False)
+    assert off.get_processing() is False
+    d_off, out = timed(off, blocks)                                         # fade-out in the first 30 ms
+    t_on, t_off = float(np.median(d_on)), float(np.median(d_off[20:1020]))
+    print(f"\nkill switch: median block time on {t_on:.3f} ms, off {t_off:.3f} ms ({100 * t_off / t_on:.0f} %)")
+    assert t_off < 0.25 * t_on
+    y = np.concatenate(out).astype(np.float64)
+    trim = InputTrim(fs, **cfg["chain"]["input_trim"])
+    limiter = Limiter(fs, **cfg["chain"]["limiter"])
+    reference = np.concatenate([limiter.process(trim.process(b.astype(np.float64))) for b in blocks])
+    settled = int(0.03 * fs) + 2 * off.latency_samples
+    assert np.max(np.abs(y[settled:] - reference[settled:])) < 1e-6
+    m = off.get_meters()
+    assert m["chain"]["processing"] == 0.0 and m["chain"]["processing_mix"] == 1.0
+    assert m["compressor"]["gain_reduction_db"] == 0.0 and m["compressor"]["bypassed"] == 1.0
+    assert np.max(np.abs(y)) <= 10 ** (-1.0 / 20.0)
+
+
+def test_processing_toggle_is_click_free_and_restarts_cleanly(cfg, fs, gen):
+    """Constant tone, off at 1 s, on at 2.5 s: no block level step > 0.5 dB outside the two
+    30 ms ramps, and no transient after the fade-in (peak of the first 100 ms after the ramp
+    <= settled peak + 0.5 dB); the normaliser keeps its gain across the restart."""
+    x = gen.sine(1000.0, -20.0, 5.0, fs).astype(np.float32)
+    block = 480
+    chain = Chain.from_config(cfg)
+    levels, y_all = [], []
+    off_at, on_at = 100, 250
+    for k, i in enumerate(range(0, len(x), block)):
+        if k == off_at:
+            gain_before = chain.get_meters()["normalizer"]["gain_db"]
+            chain.set_processing(False)
+        if k == on_at:
+            chain.set_processing(True)
+        y = chain.process(x[i:i + block]).astype(np.float64)
+        y_all.append(y)
+        levels.append(gen.rms_db(y))
+    y_all = np.concatenate(y_all)
+    steps = np.abs(np.diff(levels))
+    ramps = set(range(off_at - 1, off_at + 4)) | set(range(on_at - 1, on_at + 4))
+    assert max(step for k, step in enumerate(steps) if k + 1 not in ramps and k > 20) < 0.5
+    assert max(steps[off_at - 1:off_at + 4]) < 0.5 and max(steps[on_at - 1:on_at + 4]) < 0.5   # even inside the ramps
+    after = int((on_at + 3) * block)
+    peak_after = np.max(np.abs(y_all[after:after + int(0.1 * fs)]))
+    settled_peak = np.max(np.abs(y_all[-fs:]))
+    assert 20 * np.log10(peak_after / settled_peak) <= 0.5
+    m = chain.get_meters()
+    assert m["chain"]["processing"] == 1.0 and m["chain"]["processing_mix"] == 0.0
+    assert m["normalizer"]["gain_db"] == gain_before                             # a steady tone is not learnt: unchanged
+
+
+def test_processing_restart_keeps_learnt_loudness(cfg, fs, gen):
+    """Speech, kill switch off for 3 s, on again: the normaliser's gain, reference and floor
+    survive the restart (recover, not reset), so the loudness is right from the first block."""
+    x, active = gen.speech_like(-26.0, 30.0, fs, seed=12, noise_rms_dbfs=-50.0, talk_s=0.6, pause_s=1.0)
+    x = x.astype(np.float32)
+    chain = _calibrated_chain(cfg, -50.0)
+    _run(chain, x[:20 * fs], 256)
+    before = chain.get_meters()["normalizer"]
+    chain.set_processing(False)
+    _run(chain, x[20 * fs:23 * fs], 256)
+    chain.set_processing(True)
+    y = _run(chain, x[23 * fs:], 256).astype(np.float64)
+    after = chain.get_meters()["normalizer"]
+    assert abs(after["gain_db"] - before["gain_db"]) <= 1.0
+    assert abs(after["loudness_lufs"] - before["loudness_lufs"]) <= 1.5
+    assert after["noise_floor_lufs"] > -150.0 and abs(after["noise_floor_lufs"] - before["noise_floor_lufs"]) <= 3.0
+    tail_active = active[23 * fs:]
+    assert abs(_lufs(y, fs, 1, 7, tail_active) + 18.0) <= 2.0                   # on target right after the restart
+
+
+def test_processing_and_bypass_combine(cfg, fs, gen):
+    """Processing off takes precedence: with bypass toggled in any order the output stays the
+    Trim -> Limiter reference and no error occurs; switching processing on while bypassed keeps
+    the bypass path."""
+    x = gen.sine(1000.0, -20.0, 3.0, fs).astype(np.float32)
+    chain = Chain.from_config(cfg)
+    trim = InputTrim(fs, **cfg["chain"]["input_trim"])
+    limiter = Limiter(fs, **cfg["chain"]["limiter"])
+    reference = np.concatenate([limiter.process(trim.process(x[i:i + 256].astype(np.float64))) for i in range(0, len(x), 256)])
+    chain.set_processing(False)
+    chain.set_bypass(True)
+    out = []
+    for k, i in enumerate(range(0, len(x), 256)):
+        if k == 200:
+            chain.set_bypass(False)                                  # still off: nothing changes
+        if k == 300:
+            chain.set_bypass(True)
+            chain.set_processing(True)                               # on, but bypassed: still the dry path
+        out.append(chain.process(x[i:i + 256]))
+    y = np.concatenate(out).astype(np.float64)
+    assert np.max(np.abs(y[int(0.1 * fs):] - reference[int(0.1 * fs):])) < 1e-6
+    m = chain.get_meters()
+    assert m["chain"]["processing"] == 1.0 and m["chain"]["bypass"] == 1.0 and m["chain"]["bypass_mix"] == 1.0
+    chain.set_bypass(False)
+    tail = np.concatenate([chain.process(x[i:i + 256]) for i in range(0, fs, 256)])
+    assert np.all(np.isfinite(tail)) and chain.get_meters()["chain"]["bypass_mix"] == 0.0

@@ -25,7 +25,9 @@ STAGE_ORDER = ("input_trim", "highpass", "expander", "deesser", "eq", "compresso
 # the normaliser's learnt gain and the meters stay current and the return is click-free.
 BYPASS_STAGES = ("highpass", "expander", "deesser", "eq", "compressor", "normalizer")
 # 30 ms: long enough for a level step of a few dB to pass without a click (< 0.5 dB per
-# 5 ms block for differences up to ~3 dB), short enough to feel instantaneous.
+# 5 ms block for differences up to ~3 dB), short enough to feel instantaneous. The same
+# fade serves the kill switch (``set_processing``), which - unlike the bypass - really
+# stops computing the middle stages and recovers them when switched on again.
 BYPASS_FADE_MS = 30.0
 STAGE_CLASSES = {
     "input_trim": InputTrim,
@@ -49,8 +51,15 @@ class Chain:
     thread can never delay the audio callback by a filter design.
 
     Bypass (A/B listening): ``set_bypass(True)`` cross-fades over ``BYPASS_FADE_MS``
-    to the path Input Trim -> Limiter; ``get_meters()["chain"]["bypass"]`` shows
-    the requested state, ``bypass_mix`` the fade position.
+    to the path Input Trim -> Limiter while the middle stages keep running;
+    ``get_meters()["chain"]["bypass"]`` shows the requested state, ``bypass_mix``
+    the fade position.
+
+    Kill switch: ``set_processing(False)`` fades to the same path and then stops
+    calling the middle stages altogether (CPU saving); ``set_processing(True)``
+    recovers them (fresh filter states, the normaliser keeps gain, reference and
+    floor) and fades back. Processing off takes precedence over the bypass.
+    ``get_meters()["chain"]["processing"]`` / ``processing_mix``.
 
     Robustness: a block containing NaN or Inf would poison every filter state
     for good. ``process`` therefore checks ``np.isfinite`` first, replaces such a
@@ -70,6 +79,9 @@ class Chain:
         self._bypass = False                 # requested state
         self._bypass_mix = 0.0               # 0 = full chain, 1 = bypass path (ramps towards the request)
         self._bypass_step = 1.0 / max(1, int(round(BYPASS_FADE_MS * 1e-3 * self.sample_rate)))
+        self._processing = True              # kill switch: requested state
+        self._processing_mix = 0.0           # 0 = middle stages in the output, 1 = switched off
+        self._middle_asleep = False          # middle stages are not being called (fully off)
         self._input_peak = DB_FLOOR_DBFS
         self._input_rms = DB_FLOOR_DBFS
         self._output_peak = DB_FLOOR_DBFS
@@ -128,15 +140,38 @@ class Chain:
     def get_bypass(self) -> bool:
         return self._bypass
 
+    def set_processing(self, on: bool) -> None:
+        """Kill switch: False fades to Input Trim -> Limiter and stops computing the middle stages."""
+        with self._lock:
+            self._processing = bool(on)
+
+    def get_processing(self) -> bool:
+        return self._processing
+
+    def _ramp(self, current: float, target: float, n: int) -> tuple[np.ndarray | float, float]:
+        """Linear 30 ms ramp from ``current`` towards ``target``; returns (weights, new position)."""
+        if current == target:
+            return target, current
+        direction = 1.0 if target > current else -1.0
+        weights = current + direction * self._bypass_step * np.arange(1, n + 1, dtype=np.float64)
+        np.clip(weights, 0.0, 1.0, out=weights)
+        return weights, float(weights[-1])
+
     def _bypass_weights(self, n: int) -> np.ndarray | float:
         """Per-sample weight of the bypass path for the next block (scalar when settled)."""
-        target = 1.0 if self._bypass else 0.0
-        if self._bypass_mix == target:
-            return target
-        direction = 1.0 if target > self._bypass_mix else -1.0
-        weights = self._bypass_mix + direction * self._bypass_step * np.arange(1, n + 1, dtype=np.float64)
-        np.clip(weights, 0.0, 1.0, out=weights)
-        self._bypass_mix = float(weights[-1])
+        weights, self._bypass_mix = self._ramp(self._bypass_mix, 1.0 if self._bypass else 0.0, n)
+        return weights
+
+    def _processing_weights(self, n: int) -> np.ndarray | float:
+        """Per-sample weight of the kill-switch path; wakes the middle stages up when switched on."""
+        if self._processing and self._middle_asleep:
+            # fresh filter/detector states, the normaliser keeps gain, reference and floor
+            for name in BYPASS_STAGES:
+                self._stages[name].recover()
+            self._middle_asleep = False
+        weights, self._processing_mix = self._ramp(self._processing_mix, 0.0 if self._processing else 1.0, n)
+        if not self._processing and self._processing_mix == 1.0:
+            self._middle_asleep = True
         return weights
 
     # -- contract ---------------------------------------------------------------------
@@ -160,14 +195,18 @@ class Chain:
             self._input_peak = peak_dbfs(y)
             self._input_rms = rms_dbfs(y)
             y = self._stages["input_trim"].process(y)
-            processed = y
-            for name in BYPASS_STAGES:
-                processed = self._stages[name].process(processed)
-            weight = self._bypass_weights(y.size)
-            if isinstance(weight, float):
-                mixed = y if weight == 1.0 else processed
+            off_weight = self._processing_weights(y.size)
+            if isinstance(off_weight, float) and off_weight == 1.0:
+                mixed = y                                   # switched off: middle stages are not called
             else:
-                mixed = processed + weight * (y - processed)
+                processed = y
+                for name in BYPASS_STAGES:
+                    processed = self._stages[name].process(processed)
+                weight = np.maximum(off_weight, self._bypass_weights(y.size))
+                if isinstance(weight, float):
+                    mixed = y if weight == 1.0 else processed
+                else:
+                    mixed = processed + weight * (y - processed)
             y = self._stages["limiter"].process(mixed)
             self._output_peak = peak_dbfs(y)
             self._output_rms = rms_dbfs(y)
@@ -188,9 +227,10 @@ class Chain:
         """
         with self._lock:
             meters = {name: stage.meters() for name, stage in self._stages.items()}
-            if self._bypass and self._bypass_mix == 1.0:
-                # the stages keep running for state and learning, but nothing of their gain
-                # reduction reaches the output: report what the listener gets
+            if (self._bypass and self._bypass_mix == 1.0) or self._middle_asleep:
+                # bypass: the stages keep running for state and learning; kill switch: they are
+                # not called at all. Either way nothing of their gain reduction reaches the
+                # output: report what the listener gets
                 for name in BYPASS_STAGES:
                     for key in ("gain_reduction_db", "gain_reduction_mean_db", "gain_reduction_max_db"):
                         if key in meters[name]:
@@ -200,6 +240,7 @@ class Chain:
                                "nonfinite_blocks": float(self._nonfinite_blocks)}
             meters["output"] = {"peak_dbfs": self._output_peak, "rms_dbfs": self._output_rms}
             meters["chain"] = {"bypass": float(self._bypass), "bypass_mix": self._bypass_mix,
+                               "processing": float(self._processing), "processing_mix": self._processing_mix,
                                "latency_samples": float(self.latency_samples)}
             return meters
 
@@ -208,5 +249,7 @@ class Chain:
             for stage in self._stages.values():
                 stage.reset()
             self._bypass_mix = 1.0 if self._bypass else 0.0
+            self._processing_mix = 0.0 if self._processing else 1.0
+            self._middle_asleep = not self._processing
             self._input_peak = self._input_rms = DB_FLOOR_DBFS
             self._output_peak = self._output_rms = DB_FLOOR_DBFS

@@ -60,6 +60,26 @@ Limiter nach der Blende; Umschalten auf einem 1-kHz-Ton ohne Blockpegelsprung > 
 480er-Blöcke. Die 30 ms sind lang genug, dass ein Pegelunterschied von einigen dB zwischen den
 Pfaden ohne Knacken vergeht, und kurz genug, um als sofort zu gelten.
 
+**Kill-Switch vs. Bypass (`Chain.set_processing(on)` / `get_processing()`):** Der Bypass ist zum
+Hören gedacht (A/B-Vergleich): Die mittleren Stufen rechnen weiter, die Rückkehr ist bitgleich mit
+einer nie unterbrochenen Kette. Der Kill-Switch ist zum Abschalten gedacht: Nach derselben
+30-ms-Blende auf das Trim-Signal werden die mittleren Stufen (HPF … Normalizer) **nicht mehr
+aufgerufen**; nur Input Trim und Limiter laufen (Sprache bleibt pegelsicher), Analyzer und Regelung
+pausieren. Gemessen: Rechenzeit je 256er-Block im Aus-Zustand 0,07 ms statt 0,44 ms, also ~16 % des
+Normalbetriebs (Median über 1000 Blöcke; Soll < 25 %). Beim Wiedereinschalten werden die mittleren Stufen wie bei der
+NaN-Erholung zurückgesetzt (`recover()`: Filter- und Detektorzustände frisch, der Normalizer behält
+Gain, Sprachreferenz und Teppich) und dann 30 ms eingeblendet. Hörbild beim Wiedereinschalten: Die
+Einschwingvorgänge der frischen Filter (Hochpass, EQ) und der von null startenden Kompressor-
+Reduktion fallen in die Blende; danach liegt die Lautstärke sofort wieder auf dem gelernten Wert,
+weil der Normalizer-Gain erhalten bleibt – kein Hochregeln über Sekunden, kein Knack (Test: Spitze
+der ersten 100 ms nach der Blende ≤ eingeschwungene Spitze + 0,5 dB, kein Blockpegelsprung
+> 0,5 dB). Verarbeitung aus hat Vorrang vor dem Bypass: Beide Zustände sind kombinierbar, im
+Aus-Zustand ist der Ausgang in jedem Fall Trim → Limiter. Meter:
+`get_meters()["chain"]["processing"]` (0/1), `processing_mix` (Blendposition, 1 = aus); im
+Aus-Zustand melden die mittleren Stufen `gain_reduction_*` = 0 und `bypassed` = 1. Wann welches:
+Bypass, um zu prüfen, was die Kette tut; Kill-Switch, wenn die Kette für längere Zeit nicht
+arbeiten soll (Prozessorlast, Batterie, fremde Quelle am Mikrofon).
+
 **Parameteränderungen im Betrieb:** `set_param` validiert den Wert und entwirft die neuen
 Koeffizienten *außerhalb* des Ketten-Locks; nur der Tausch läuft unter dem Lock (Mikrosekunden).
 Schlägt Validierung oder Entwurf fehl, bleibt der alte Wert vollständig erhalten (Test:
