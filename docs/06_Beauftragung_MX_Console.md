@@ -32,20 +32,20 @@ und bleiben auf Ebene 1. Ergänzt werden Zischen (zweithäufigstes Problem bei K
 Mute (Stille ohne Zoom-Menü, mit sanfter Blende) und Status (man muss sehen, was aktiv ist).
 Klangfarbe (wärmer/heller) ist seltener nötig und wandert auf Ebene 2.
 
-### Ebene 1 „Meeting“
+### Ebene 1 „Meeting“ (Belegung nach PO-Prüfung 2026-11-03 geändert)
 
 | Element | Funktion | Wirkung (Offset) | Schritt / Grenze |
 |---|---|---|---|
-| Dial drehen | Lautheit | Ziel-Lautheit des Normalizers | ±0,5 LU je Rastung, −24…−12 LUFS |
-| Dial drücken | Mute an/aus | Ausgang blendet in 30 ms auf Stille / zurück | Toggle, Statuszeile „MUTE“ |
-| K1 | Weniger Raum | Expander-Schwelle höher | +2 dB je Druck, Offset −6…+6 dB; Sprach-Kappe (Sprache − 12 dB) bleibt |
+| Dial drehen | Lautheit | Ziel-Lautheit des Normalizers | ±0,5 LU je Rastung, −24…−14 LUFS; ohne Mitteilung |
+| Dial drücken | Lautheit 0 | Lautheits-Offset zurück auf Kalibrierwert | |
+| K1 | Wenig Raum | Expander-Schwelle höher | +2 dB je Druck, Offset −6…+6 dB; Sprach-Kappe (Sprache − 12 dB) gilt **nach** dem Offset |
 | K2 | Mehr Raum | Expander-Schwelle tiefer | −2 dB je Druck |
-| K3 | Weniger Zischen | De-Esser-Schwelle tiefer | −2 dB je Druck, Offset −6…+6 dB |
-| K4 | Natürlicher | Intensität −1: Kompressor-Schwelle +2 dB, De-Esser-Schwelle +1 dB | Stufe −3…+3 |
-| K5 | Dichter | Intensität +1: Kompressor-Schwelle −2 dB, De-Esser-Schwelle −1 dB | Stufe −3…+3 |
-| K6 | Freeze / Weiter | Adaptive Regelung einfrieren bzw. freigeben | Toggle, Statuszeile FROZEN |
-| K7 | Reset | Alle Offsets 0, Lautheit auf Kalibrierwert, Regelung auf Kalibrierwerte (rest), Mute aus, Bypass aus | sofort, mit Blende |
-| K8 | Status | macOS-Mitteilung: Lautheit, Störabstand, aktive Offsets, Freeze/Mute | nur lesend |
+| K3 | Zischen − | De-Esser-Schwelle tiefer | −2 dB je Druck, Offset −6…+6 dB |
+| K4 | Zischen + | De-Esser-Schwelle höher | +2 dB je Druck |
+| K5 | Natürlich | Intensität −1: Kompressor-Schwelle +2 dB | Stufe −3…+3 (De-Esser nicht gekoppelt) |
+| K6 | Dichter | Intensität +1: Kompressor-Schwelle −2 dB | Stufe −3…+3 |
+| K7 | Freeze | Adaptive Regelung einfrieren bzw. freigeben | Toggle, Statuszeile FROZEN |
+| K8 | Reset | Bedienzustand zurück: alle Offsets 0, Lautheit Kalibrierwert, Mute/Bypass/Kill-Switch aus, Freeze aus, Normalizer-Deckel und Schutzzustände auf Konfiguration; nachgeführte Schwellen der Regelung bleiben (Regelung läuft weiter) | sofort, mit Blende |
 
 ### Ebene 2 „Feinabstimmung“
 
@@ -53,14 +53,22 @@ Klangfarbe (wärmer/heller) ist seltener nötig und wandert auf Ebene 2.
 |---|---|---|---|
 | K1 | Wärmer | Klang-Tilt −1 dB (Low-Shelf 250 Hz +½, High-Shelf 4 kHz −½) | Tilt −3…+3 dB |
 | K2 | Heller | Klang-Tilt +1 dB | |
-| K3 | Mehr Zischen | De-Esser-Schwelle höher (De-Esser zurücknehmen) | +2 dB je Druck |
-| K4 | Verarbeitung an/aus (Kill-Switch) | Kette wirklich abschalten: nur Input Trim + Limiter werden gerechnet, Analyzer und Regelung pausieren; spart Prozessorlast. Wiedereinschalten setzt die Stufen zurück und blendet 30 ms ein | Toggle, Statuszeile OFF; `Lautheit zurück` bleibt als CLI-Kommando `loudness-reset` |
-| K5 | Neu lernen | Regelung: Lernphase neu starten (nach Platz- oder Raumwechsel), Offsets bleiben | |
-| K6 | Snapshot speichern | aktuelle Basiswerte + Offsets als `config/chain.live.yaml` schreiben (mit Zeitstempel im Kommentar) | |
-| K7 | Bypass A/B | Kette umgehen (nur Input Trim + Limiter) zum Vergleich; Blende 30 ms | Toggle, Statuszeile BYPASS |
-| K8 | Marker | Zeitmarke mit Text ins Regelungslog (für spätere Analyse) | |
+| K3 | Status | macOS-Mitteilung: Lautheit, Störabstand, Offsets, Freeze/Mute/Bypass/OFF | nur lesend |
+| K4 | DSP an/aus (Kill-Switch) | Kette wirklich abschalten: nur Input Trim + Limiter; Analyzer, Regelung und Lernphasen-Uhr pausieren; Wiedereinschalten setzt Stufen zurück, 30 ms Blende | Toggle, Statuszeile OFF |
+| K5 | Neu lernen | Regelung auf Kalibrierwerte, Lernphase neu, Analyzer leer; Offsets bleiben | |
+| K6 | Snapshot | hörbaren Ist-Zustand (nachgeführte Werte + Offsets) als `config/chain.live.yaml` schreiben, `_live.created` als Zeitstempel | |
+| K7 | Bypass A/B | Kette umgehen (nur Input Trim + Limiter), Stufen rechnen weiter; Blende 30 ms | Toggle, Statuszeile BYPASS |
+| K8 | Mute | Ausgang blendet in 30 ms auf Stille / zurück; sichtbar beschriftet | Toggle, Statuszeile MUTE |
 
-Dial auf Ebene 2: identisch zu Ebene 1 (Lautheit / Mute), damit der häufigste Griff immer gleich ist.
+Nicht belegt, aber per CLI/Skript verfügbar: `marker` (Zeitmarke ins Regelungslog).
+Dial auf Ebene 2: identisch zu Ebene 1.
+
+_Begründung der Änderung (PO-Prüfung): beide Zisch-Richtungen auf einer Ebene, damit eine
+Überkorrektur im Meeting ohne Ebenenwechsel rücknehmbar ist; Dial-Druck als unsichtbarer zweiter
+Mute neben Zoom/Teams ist fehlbedienungsanfällig, deshalb Mute sichtbar auf Ebene 2; Dial ohne
+Mitteilung, weil jede Rastung sonst ein Banner erzeugt; Intensität ohne De-Esser-Kopplung, damit
+„Natürlich“ nicht „Zischen −“ zurücknimmt; Reset behält die nachgeführten Schwellen, sonst werden
+Pausen im Lüfterraum für ~1 min lauter; Lautheits-Obergrenze −14 LUFS reicht für Konferenz-AGC._
 
 ## 3. Lieferumfang
 
@@ -112,7 +120,7 @@ Kommandos (JSON-Objekt je Zeile, Antwort JSON-Objekt je Zeile):
 | `status` | — | Zustand |
 | `processing` | `on`: true/false/"toggle" | Kill-Switch (Ergänzung 2026-11-03 auf Nutzerwunsch) |
 
-Offset-Namen und Bereiche: `loudness_lu` (−6…+6, Schritt 0,5), `room_db` (−6…+6, Schritt 2;
+Offset-Namen und Bereiche: `loudness_lu` (−6…+6, Schritt 0,5; Ziel geklemmt auf −24…−14 LUFS), `room_db` (−6…+6, Schritt 2;
 positiv = weniger Raum = Expander-Schwelle höher), `deess_db` (−6…+6, Schritt 2; negativ =
 weniger Zischen = Schwelle tiefer), `tone_db` (−3…+3, Schritt 1; positiv = heller),
 `intensity` (−3…+3, Schritt 1; positiv = dichter).
@@ -134,7 +142,7 @@ Antwortzeit `ctl` < 300 ms auf dem Mac (Python-Start eingerechnet; messen und do
 ## 6. Abnahmekriterien
 
 1. `pytest -q` grün ohne Audiogeräte; Selftest unverändert 12/12.
-2. Jede der 17 Funktionen ist über `ctl` erreichbar, hat Skript, AppleScript, Manifest-Eintrag,
+2. Jede der 20 Funktionen (18 Tasten/Dial-Belegungen plus `loudness-reset`-Logik auf dem Dial-Druck und `marker` unbelegt) ist über `ctl` erreichbar, hat Skript, AppleScript, Manifest-Eintrag,
    Doku-Zeile und einen Test (Manifest-Konsistenztest).
 3. Offsets wirken hörbar und messbar (Simulation): Raum −/+ ändert die Pausenabsenkung, Zischen
    −/+ ändert die De-Esser-Reduktion, Lautheit ±1 LU ändert die Ausgangslautheit um ±1 LU,
@@ -148,3 +156,14 @@ Antwortzeit `ctl` < 300 ms auf dem Mac (Python-Start eingerechnet; messen und do
 6. Mute und Bypass sind knackfrei (kein Sprung > 0,5 dB je Block außerhalb der 30-ms-Rampe) und
    werden in der Statuszeile angezeigt.
 7. PO-, Software- und Blindprüfung nach `memory/01_rolle_routinen.md`.
+
+## 7. Ergänzungen nach Prüfrunde 1 (2026-11-03)
+
+- Am Bereichs- oder Bounds-Anschlag antwortet die Kette `ok: false` mit „am Anschlag“ und dem
+  wirksamen Wert; gespeicherte Offsets spiegeln immer den wirksamen Wert.
+- Antworten dürfen kein NaN/Infinity enthalten; nicht-finite Eingaben werden abgelehnt.
+- Lesen von Metern für Status/Antworten darf die Akkumulatoren der Regelung nicht leeren.
+- Socket-Pfade: auf macOS maximal 103 Byte; Tests und Default-Pfad müssen das einhalten; `run`
+  prüft die Länge vor dem Binden und nennt die Abhilfe.
+- Testsuite: Marker `slow` für Simulationen > 30 s; Standardlauf ohne `slow` unter 5 min,
+  Abnahmelauf mit `slow`.

@@ -227,3 +227,38 @@ mit Dynamik < 15 dB hält De-Esser/Kompressor auf den kalibrierten Werten; kein 
 Empfehlung für den nächsten Schritt: 60-s-Sample mit `python -m voicechain record` am gewohnten
 Platz aufnehmen, kalibrieren, Bericht lesen, `process`-Ausgabe anhören, dann Live-Test im
 Zoom-Testmeeting mit Kopfhörern. Erst danach produktiv einsetzen.
+
+
+# Beauftragung 2: MX Creative Console (docs/06)
+
+## Prüfrunde 1 (2026-11-03, Stand e680b56)
+
+Berichte: `docs/pruefungen/10_b2_product_owner.md`, `11_b2_software.md`, `12_b2_blind.md`.
+
+| Prüfung | Urteil | hoch | mittel | niedrig |
+|---|---|---|---|---|
+| Product Owner | abnehmbar mit Auflagen | 1 | 5 | 7 |
+| Software | abnehmbar mit Auflagen | 0 | 2 | 8 (+Hinweise); Mutationen 18/20 gefangen |
+| Blind | abnehmbar mit Auflagen | 0 | 1 | 5 (+Infos); alle 20 Kommandos Ende-zu-Ende geprüft |
+
+### Entscheidungen Projektleitung
+
+| Nr | Schwere | Befund | Entscheidung | Zuordnung |
+|---|---|---|---|---|
+| PO2-1 / BL2-1 | hoch | Raum-Offset wird nach der Sprach-Kappe addiert; Schwelle bis 7 dB über Sprache − 12 | Kappe nach dem Offset, auch beim Sofortschritt; Antwort nennt Begrenzung | KAL |
+| BL2-2 / SW2-1 | mittel | `state()` leert die Meter-Akkumulatoren der Regelung | nicht-leerende Lesart (`peek_meters`) | DSP (API), KAL (Nutzung) |
+| SW2-2 | mittel | Socket-Tests mit tmp_path > 103 Byte scheitern auf macOS | kurze Socket-Pfade in Tests; `run` prüft Pfadlänge | INT |
+| PO2-2 | mittel | Reset lässt Freeze stehen und verwirft Nachführung | Reset = Bedienzustand zurück (Freeze aus, nachgeführte Schwellen bleiben); Regelung zurück nur über „Neu lernen“ | KAL, Beauftragung geändert |
+| PO2-3 | mittel | Reset stellt normalizer.max_gain_db nach Limiter-Schutz nicht her | Deckel und Schutzzustand zurücksetzen; Test | KAL |
+| PO2-4 / PO2-5 / PO2-6 | mittel | Zisch + auf Ebene 2; Dial-Druck Mute unsichtbar; Mitteilung je Rastung | Belegung geändert (siehe docs/06 §2); Dial ohne `--notify` | INT |
+| PO2-7 | niedrig | Intensität koppelt De-Esser | Intensität nur Kompressor | KAL |
+| PO2-8 / BL2-3 / BL2-6 | niedrig | Phantomstufe am Anschlag | ok=false „am Anschlag“, Offsets = wirksamer Wert | KAL |
+| PO2-9 / BL2-5 | niedrig | Snapshot schreibt Basis statt Ist | Snapshot = nachgeführte Werte + Offsets; Doku | KAL |
+| PO2-10 / PO2-11 / BL2-8 / SW2-9 / BL2-9 | niedrig | Labels, README (Symptom → Taste, venv/PATH unter Options+), Zählungen | Beheben | INT |
+| PO2-12 | niedrig | Lernphasen-Uhr läuft im Aus-Zustand weiter | Controller pausiert die Uhr | KAL |
+| PO2-13 | niedrig | Lautheits-Obergrenze −12 LUFS | −14 LUFS | KAL |
+| SW2-3…SW2-7, SW2-13, SW2-14 | niedrig | Socket-Liveness, NaN im Protokoll, SIGTERM, Stop-Reihenfolge, toter Pfadlängen-Zweig, Start-Race, Tests schreiben ins Repo | Beheben | INT (Socket/Runtime/Tests), KAL (NaN in LiveControl) |
+| SW2-15 / M14 | niedrig | Offset-Haltetest zu tolerant; recover beim Wiedereinschalten ungetestet | Tests schärfen | KAL, DSP |
+| Laufzeit | — | Suite 574 s | Marker `slow`, Kürzungen nach SW-Vorschlag, Standardlauf < 5 min | alle |
+| BL2-4 | niedrig | `--value` wird auf Schrittweite geklemmt | Dokumentieren (bewusst: ein Druck = ein Schritt) | INT |
+| BL2-10 | info | docs/02 Meterliste ohne processing | Ergänzen | DSP |
