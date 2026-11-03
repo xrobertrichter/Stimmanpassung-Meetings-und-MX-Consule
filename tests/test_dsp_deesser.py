@@ -84,7 +84,7 @@ def test_disabled_and_validation(fs, gen):
     with pytest.raises(ValueError):
         DeEsser(fs, **{**DEFAULT, "bandwidth_oct": 0.0})
     with pytest.raises(ValueError):
-        DeEsser(fs, **{**DEFAULT, "ratio": 1.0})           # schema lower bound 1.1 (review SW-7)
+        DeEsser(fs, **{**DEFAULT, "ratio": 1.0})           # schema lower bound 1.1 (ratio 1 = off would break the calibration formulas)
     stage = DeEsser(fs, **DEFAULT)
     stage.set_param("freq_hz", 7000.0)
     assert stage.get_param("freq_hz") == 7000.0

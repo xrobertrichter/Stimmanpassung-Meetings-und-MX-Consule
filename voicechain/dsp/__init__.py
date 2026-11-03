@@ -140,6 +140,15 @@ class StageBase(abc.ABC):
     def reset(self) -> None:
         """Clear all filter and detector states (parameters are kept)."""
 
+    def recover(self) -> None:
+        """Recover from a corrupted (non-finite) signal: clear the signal-path states.
+
+        Defaults to ``reset``; stages that hold slowly learnt control values which
+        a single bad block cannot corrupt (the normaliser's gain, reference and
+        noise floor) override this to keep them.
+        """
+        self.reset()
+
 
 def _as_bool(name: str, value) -> bool:
     if isinstance(value, (bool, np.bool_)):

@@ -132,7 +132,7 @@ def test_sosfilter_set_sos_keeps_state(fs, gen):
 
 
 def test_biquad_is_a_leaf_module_with_public_k_weighting():
-    """SW-10: meters/calibration import the K-weighting from here, so biquad must not import voicechain."""
+    """meters/calibration import the K-weighting from here, so biquad must stay a leaf module."""
     import voicechain.dsp.biquad as biquad
     source = pathlib.Path(biquad.__file__).read_text(encoding="utf-8")
     for node in ast.walk(ast.parse(source)):

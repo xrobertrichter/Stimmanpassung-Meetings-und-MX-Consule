@@ -78,14 +78,14 @@ def test_disabled_meters_and_validation(fs, gen):
     with pytest.raises(ValueError):
         stage.set_param("ratio", 50.0)
     with pytest.raises(ValueError):
-        stage.set_param("ratio", 1.0)                      # schema lower bound 1.1 (review SW-7)
+        stage.set_param("ratio", 1.0)                      # schema lower bound 1.1 (ratio 1 = off would break the calibration formulas)
     assert stage.get_param("ratio") == 3.0
     stage.set_param("threshold_db", -25.0)
     assert stage.get_param("threshold_db") == -25.0
 
 
 def test_reduction_accumulator_mean_max_and_drain(fs, gen):
-    """PO-5: 2 s without reduction, then 10 ms with 10 dB -> small mean, max 10; drained by reading."""
+    """Interval statistics: 2 s without reduction, then 10 ms with 10 dB -> small mean, max 10; drained by reading."""
     stage = Compressor(fs, **{**DEFAULT, "attack_ms": 0.1})
     x = np.concatenate([gen.sine(1000.0, -30.0, 2.0, fs), gen.sine(1000.0, -5.0, 0.010, fs)])  # -5 dBFS: 15 dB over -> 10 dB
     gen.process_blocks(stage, x, 240)                       # 240 = 5 ms blocks, the burst spans two blocks

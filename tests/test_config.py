@@ -20,12 +20,15 @@ def test_default_config_loads(cfg):
     assert set(cfg["chain"]) == set(STAGE_ORDER)
     assert len(cfg["chain"]["eq"]["bands"]) == 3
     assert isinstance(Chain.from_config(cfg), Chain)
-    # start values decided in review round 1 (PO): hold/release 100/250 ms, no high-shelf boost,
+    # start values of the shipped file: hold/release 100/250 ms, no high-shelf boost,
     # expander distance 10 dB to a -55 dBFS floor, asymmetric normaliser rates
     assert cfg["chain"]["expander"]["hold_ms"] == 100.0 and cfg["chain"]["expander"]["release_ms"] == 250.0
     assert cfg["chain"]["expander"]["threshold_db"] == -45.0
     assert cfg["chain"]["eq"]["bands"][2] == {"type": "high_shelf", "freq_hz": 10000.0, "gain_db": 0.0, "q": 0.707}
     assert cfg["chain"]["normalizer"]["release_rate_db_per_s"] == 3.0
+    assert cfg["chain"]["normalizer"]["gate_margin_lu"] == 8.0
+    assert cfg["adaptive"]["bounds"]["deesser.threshold_db"] == [-45.0, -10.0]
+    assert cfg["adaptive"]["bounds"]["normalizer.max_gain_db"] == [0.0, 12.0]
     assert "+8 dB" not in default_config_path().read_text(encoding="utf-8")
 
 
@@ -94,11 +97,13 @@ def test_optional_internal_parameters_are_accepted(cfg):
     extended["chain"]["expander"]["detector_ms"] = 8.0
     extended["chain"]["limiter"]["true_peak_margin_db"] = 1.0
     del extended["chain"]["normalizer"]["release_rate_db_per_s"]         # optional: default 3.0 applies
+    del extended["chain"]["normalizer"]["gate_margin_lu"]                # optional: default 8.0 applies
     validate_config(extended)
     chain = Chain.from_config(extended)
     assert chain.get_param("expander", "detector_ms") == 8.0
     assert chain.get_param("limiter", "true_peak_margin_db") == 1.0
     assert chain.get_param("normalizer", "release_rate_db_per_s") == 3.0
+    assert chain.get_param("normalizer", "gate_margin_lu") == 8.0
     assert cfg["chain"]["expander"]["ratio"] == 2.5 and Chain.from_config({**cfg, "chain": {**cfg["chain"], "expander": {**cfg["chain"]["expander"], "ratio": 1.0}}})
 
 

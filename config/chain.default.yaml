@@ -73,7 +73,9 @@ chain:
     rate_db_per_s: 1.0      # Aufwärtsrate, langsam wie eine Hand am Fader: keine hörbare Regelbewegung
     release_rate_db_per_s: 3.0  # Abwärtsrate (optional, Default 3): ein zu lauter Satzanfang ist in 2 s gezähmt
     gate_lufs: -40.0        # absolutes Gate auf die Momentary-Lautheit (400 ms): darunter Pause → Gain einfrieren;
-                            # zusätzlich relatives Gate 10 LU unter der Sprachlautheit; Kalibrierung setzt Teppich + 8
+                            # Kalibrierung setzt Teppich nach Kette + 8; wirksam ist max(gate_lufs, Teppich-Schätzer + gate_margin_lu)
+    gate_margin_lu: 8.0     # optional (Default 8): Abstand des wirksamen Gates über dem intern geschätzten Teppich;
+                            # schützt, wenn der Raum nach der Kalibrierung lauter wird (Lüfter, Fenster)
 
   limiter:
     enabled: true           # false = Bypass; Achtung: entfernt auch die Lookahead-Latenz
@@ -89,5 +91,6 @@ adaptive:
   log_path: "logs/adaptive.jsonl"   # JSONL-Protokoll jeder Änderung mit Grund
   bounds:                   # harte Grenzen je nachgeführtem Parameter [min, max]
     expander.threshold_db: [-70.0, -30.0]     # folgt dem Rauschteppich (+10 dB), nie über -30 dBFS
-    deesser.threshold_db: [-45.0, -15.0]      # folgt dem Zischanteil
+    deesser.threshold_db: [-45.0, -10.0]      # folgt dem Zischanteil; bis -10, weil Bandspitzen nach Trim nahe Vollaussteuerung liegen können
     compressor.threshold_db: [-35.0, -10.0]   # folgt dem Sprachpegel
+    normalizer.max_gain_db: [0.0, 12.0]       # Limiter-Schutzregel senkt den Gain-Deckel; nie über den kalibrierten Wert

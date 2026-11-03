@@ -126,7 +126,7 @@ def test_runtime_parameter_changes(fs, gen):
 
 
 def test_reduction_accumulates_between_meter_reads(fs, gen):
-    """PO-5: mean/max since the last meters() call, drained by reading; last block stays separate."""
+    """Interval statistics: mean/max since the last meters() call, drained by reading; last block stays separate."""
     stage = Expander(fs, **DEFAULT)
     stage.process(gen.sine(1000.0, -17.0, 0.5, fs))          # open the gate
     stage.meters()                                            # drain

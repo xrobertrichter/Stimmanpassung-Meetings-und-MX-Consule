@@ -42,7 +42,8 @@ class Chain:
 
     Robustness: a block containing NaN or Inf would poison every filter state
     for good. ``process`` therefore checks ``np.isfinite`` first, replaces such a
-    block by silence, resets all stages and counts the event
+    block by silence, clears the signal-path states of all stages (``recover``,
+    the normaliser keeps its gain) and counts the event
     (``get_meters()["input"]["nonfinite_blocks"]``).
     """
 
@@ -111,12 +112,13 @@ class Chain:
         with self._lock:
             y = x.astype(np.float64, copy=False)
             if not np.isfinite(y).all():
-                # Replace the block by silence and restart every stage from its initial
-                # state; the silent block is not run through the stages, so the chain
-                # continues exactly like a freshly built one.
+                # Replace the block by silence and clear the signal-path states of every
+                # stage (the normaliser keeps its learnt gain, reference and noise floor:
+                # a finite scalar cannot be poisoned, and losing it would cost seconds of
+                # wrong loudness). The silent block is not run through the stages.
                 self._nonfinite_blocks += 1
                 for stage in self._stages.values():
-                    stage.reset()
+                    stage.recover()
                 self._input_peak = self._input_rms = DB_FLOOR_DBFS
                 self._output_peak = self._output_rms = DB_FLOOR_DBFS
                 return np.zeros(y.shape, dtype=np.float32)

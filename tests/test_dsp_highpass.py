@@ -80,7 +80,7 @@ def test_parameter_validation(fs):
 
 
 def test_invalid_set_param_leaves_stage_untouched(fs, gen):
-    """SW-6: validation and design happen before anything is stored."""
+    """Validation and design happen before anything is stored (atomic set_param)."""
     stage = HighPass(fs, **DEFAULT)
     reference = HighPass(fs, **DEFAULT)
     x = gen.pink_noise(-20.0, 0.5, fs, seed=4)
