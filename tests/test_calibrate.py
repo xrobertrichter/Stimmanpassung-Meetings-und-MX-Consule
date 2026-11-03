@@ -596,22 +596,39 @@ def test_first_pass_without_normalizer_keeps_gain_headroom_in_a_noisy_room(tmp_p
     assert norm["enabled"] is True
 
 
-def test_borderline_voice_passes_the_sibilance_criterion_with_the_real_chain(tmp_path, base_cfg):
-    """A voice just above the reference (de-esser engaged) must not fail only because
-    compressor/normalizer lift the band by the amount the de-esser takes back."""
+def test_mildly_sibilant_voice_passes_the_sibilance_criterion_with_the_real_chain(tmp_path, base_cfg):
+    """A voice just above the reference (de-esser engaged, no clear problem) must not
+    fail only because compressor/normalizer lift the band by the amount the de-esser takes back."""
     x = synth.make_speech_like(60.0, SR, sibilance_db=-6.0, **SAMPLE_KW)
     wav = _write_wav(tmp_path / "border.wav", x)
     result = cal.run_calibration(str(wav), None, str(tmp_path / "b.yaml"), str(tmp_path / "b.md"))
     before = result["measurements"]["sibilance_ratio_db"]
-    assert cal.SIBILANCE_REFERENCE_DB < before <= cal.SIBILANCE_REFERENCE_DB + cal.SIBILANCE_BORDERLINE_DB
+    assert cal.SIBILANCE_REFERENCE_DB < before <= cal.SIBILANCE_CLEAR_PROBLEM_DB
     crit = result["evaluation"]["criteria"]["sibilance_reduced"]
     assert crit["passed"] is True, crit
     assert result["evaluation"]["after"]["sibilance_ratio_db"] <= before + cal.SIBILANCE_MAX_INCREASE_DB
-    assert "Grenzstimme" in crit["note"]
+    assert "geringem Zischproblem" in crit["note"]
 
 
-def test_sibilance_criterion_hysteresis_rules():
-    """Rule table of the engaged branch, checked on synthetic before/after pairs."""
+@pytest.mark.parametrize("before", [-18.0, -15.5, -13.6, -12.0, -11.0, -8.0])
+@pytest.mark.parametrize("delta", [-2.0, 0.5, 1.5])
+def test_sibilance_criterion_closed_rule_table(before, delta):
+    """Closed rule: pass if after <= -15, or delta <= -1, or (before <= -10 and delta <= +1)."""
+    after = before + delta
+    expected = (after <= -15.0) or (delta <= -1.0) or (before <= -10.0 and delta <= 1.0)
+    assert cal.sibilance_criterion_passed(before, after) is expected
+    # Spelled out: every voice passes with -2 dB; +0.5 dB passes unless the voice clearly
+    # sibilant (-8 dB); +1.5 dB passes only when the result still sits below -15 dB (-18 dB voice).
+    if delta == -2.0:
+        assert expected is True
+    if delta == 0.5:
+        assert expected is (before <= -10.0)
+    if delta == 1.5:
+        assert expected is (before == -18.0)
+
+
+def test_sibilance_criterion_on_signals_follows_the_closed_rule():
+    """The evaluate() criterion applies the closed rule to measured before/after ratios."""
     cfg_stub = {"chain": {"deesser": {"freq_hz": 6500.0, "bandwidth_oct": 1.0},
                           "normalizer": {"target_lufs": -18.0}, "limiter": {"ceiling_dbfs": -1.0}}}
     base = synth.make_speech_like(40.0, SR, sibilance_db=0.0, seed=4, long_pause_s=6.0)
@@ -623,19 +640,35 @@ def test_sibilance_criterion_hysteresis_rules():
         return (base + band * (10 ** (db / 20) - 1.0)).astype(np.float32)
 
     ratio_before = cal.analyze(base, SR)["sibilance_ratio_db"]
-    assert ratio_before > cal.SIBILANCE_REFERENCE_DB + cal.SIBILANCE_BORDERLINE_DB   # clearly sibilant (~-7 dB)
-    # clearly sibilant: -2 dB passes, +0.5 dB (still above reference) fails
+    assert ratio_before > cal.SIBILANCE_CLEAR_PROBLEM_DB   # clearly sibilant (~-7 dB)
+    # clearly sibilant: -2 dB passes, +0.5 dB (still above the reference) fails
     assert cal.evaluate(base, shifted(-2.0), SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is True
     assert cal.evaluate(base, shifted(+0.5), SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is False
-    # borderline (reference + 2 dB): +0.5 dB passes, +1.5 dB fails
-    border = shifted(cal.SIBILANCE_REFERENCE_DB + 2.0 - ratio_before)
-    border_ratio = cal.analyze(border, SR)["sibilance_ratio_db"]   # band scaling is not exactly 1:1 in the ratio
-    assert cal.SIBILANCE_REFERENCE_DB + 1.0 <= border_ratio <= cal.SIBILANCE_REFERENCE_DB + cal.SIBILANCE_BORDERLINE_DB
-    bb = signal.sosfiltfilt(sos, border.astype(np.float64))
-    up_half = (border + bb * (10 ** (0.5 / 20) - 1.0)).astype(np.float32)
-    up_two = (border + bb * (10 ** (1.5 / 20) - 1.0)).astype(np.float32)
-    assert cal.evaluate(border, up_half, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is True
-    assert cal.evaluate(border, up_two, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is False
+    # mild voice (about -12 dB): +0.5 dB passes, +1.5 dB fails
+    mild = shifted(-12.0 - ratio_before)
+    mild_ratio = cal.analyze(mild, SR)["sibilance_ratio_db"]   # band scaling is not exactly 1:1 in the ratio
+    assert cal.SIBILANCE_REFERENCE_DB < mild_ratio <= cal.SIBILANCE_CLEAR_PROBLEM_DB
+    mb = signal.sosfiltfilt(sos, mild.astype(np.float64))
+    up_half = (mild + mb * (10 ** (0.5 / 20) - 1.0)).astype(np.float32)
+    up_two = (mild + mb * (10 ** (1.5 / 20) - 1.0)).astype(np.float32)
+    assert cal.evaluate(mild, up_half, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is True
+    assert cal.evaluate(mild, up_two, SR, cfg_stub)["criteria"]["sibilance_reduced"]["passed"] is False
+
+
+@pytest.mark.parametrize("sibilance_db", [-12.0, -18.0])
+def test_calibration_with_lead_silence_lets_the_normalizer_regulate(tmp_path, base_cfg, sibilance_db):
+    """Standard sample (10 s lead silence, 6 s pause): the evaluation pass must not leave
+    the normalizer frozen on the lead noise; loudness lands on target with gain > 0.5 dB."""
+    x = synth.make_speech_like(60.0, SR, sibilance_db=sibilance_db, **SAMPLE_KW)
+    wav = _write_wav(tmp_path / f"lead{int(-sibilance_db)}.wav", x)
+    result = cal.run_calibration(str(wav), None, str(tmp_path / "l.yaml"), str(tmp_path / "l.md"))
+    ev = result["evaluation"]
+    assert ev["criteria"]["loudness_in_target"]["passed"] is True, ev["criteria"]["loudness_in_target"]
+    assert abs(ev["after"]["integrated_lufs"] - (-18.0)) <= 2.0
+    assert ev["info"]["normalizer_gain_end_db"] is not None
+    assert ev["info"]["normalizer_gain_end_db"] > 0.5
+    assert "Normalizer-Gain am Ende" in (tmp_path / "l.md").read_text(encoding="utf-8")
+    assert result["passed"] is True, ev["criteria"]
 
 
 def test_bright_microphone_gets_a_moderate_high_shelf_cut(base_cfg):

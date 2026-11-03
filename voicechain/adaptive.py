@@ -129,6 +129,8 @@ MIN_CHANGE_SPACING_INTERVALS = 2
 #: clicks (3 per second, -30 dBFS) read as -40 dBFS "speech" with 15 % activity,
 #: a colleague in the room or playback at -42 dBFS fails the level test.
 PLAUSIBLE_LEVEL_TOLERANCE_DB = 6.0
+#: Hysteresis of the level test: enter at +-6 dB, leave at +-7 dB. Assumption: 1 dB.
+PLAUSIBLE_LEVEL_HYSTERESIS_DB = 1.0
 PLAUSIBLE_MIN_SPEECH_RATIO = 0.3
 PLAUSIBLE_MIN_DYNAMIC_RANGE_DB = 15.0
 #: The expander's "12 dB below speech" cap protects any speech, also a speaker
@@ -383,6 +385,7 @@ class AdaptiveController:
         #: read off the calibrated threshold, which lies below the band peak when
         #: the calibration engaged the de-esser and above it when it rests).
         self._deesser_engaged: bool | None = None
+        self._level_plausible = False
         self._acc_limiter: list[float] = []
         self._acc_expander_speech: list[float] = []
         self._acc_normalizer: list[float] = []
@@ -523,7 +526,15 @@ class AdaptiveController:
         reasons = []
         if not analysis.get("speech_detected", False):
             reasons.append("no_speech")
-        if abs(speech_after_trim - REFERENCE_SPEECH_LEVEL_DBFS) > PLAUSIBLE_LEVEL_TOLERANCE_DB:
+        # Level plausibility with hysteresis: enter the plausible state inside
+        # +-PLAUSIBLE_LEVEL_TOLERANCE_DB, leave it only outside the tolerance plus
+        # PLAUSIBLE_LEVEL_HYSTERESIS_DB, so a speaker sitting right at the edge
+        # does not flip between tracking and resting every interval.
+        deviation = abs(speech_after_trim - REFERENCE_SPEECH_LEVEL_DBFS)
+        limit = (PLAUSIBLE_LEVEL_TOLERANCE_DB + PLAUSIBLE_LEVEL_HYSTERESIS_DB
+                 if self._level_plausible else PLAUSIBLE_LEVEL_TOLERANCE_DB)
+        self._level_plausible = deviation <= limit
+        if not self._level_plausible:
             reasons.append(f"level {speech_after_trim:.1f} dBFS outside "
                            f"{REFERENCE_SPEECH_LEVEL_DBFS:.0f}±{PLAUSIBLE_LEVEL_TOLERANCE_DB:.0f}")
         if float(analysis.get("speech_ratio", 0.0)) < PLAUSIBLE_MIN_SPEECH_RATIO:

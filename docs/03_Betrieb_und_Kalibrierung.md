@@ -266,13 +266,20 @@ wird (Simulation 300 s dichter Vortrag im unveränderten Raum: 0 Expander-Schrit
 De-Esser-Regel hält ihren Zustand „engagiert/ruhend" mit 1 dB Hysterese um die Referenz, damit
 eine Stimme nahe −15 dB nicht zwischen beiden Zielwerten pendelt.
 
-**Raumänderung im Betrieb (Beauftragung §6.4).** Wird der Rauschteppich nach der Kalibrierung
-8–12 dB lauter, greifen zwei Mechanismen auf verschiedenen Zeitskalen: Der Normalizer schätzt
-seinen Teppich selbst (Meter `normalizer.noise_floor_lufs`, wirksames Gate
-`normalizer.effective_gate_lufs`, Abstand `gate_margin_lu`; Beschreibung in docs/02, Normalizer)
-und hält Pausen ab dem nächsten Satz auf Abstand, ohne auf die Regelung zu warten; die Regelung
-zieht die Expander-Schwelle anschließend langsam nach (unten). Die Kalibrierung begrenzt
-`max_gain_db` zusätzlich so, dass der Teppich rechnerisch nie auf Sprachlautheit kommen kann.
+**Raumänderung im Betrieb (Beauftragung §6.4), gemessener Ablauf.** Wird der Rauschteppich nach
+der Kalibrierung 8–12 dB lauter, passiert Folgendes: Der Normalizer schätzt seinen Teppich selbst
+(Meter `normalizer.noise_floor_lufs`, wirksames Gate `normalizer.effective_gate_lufs`, Abstand
+`gate_margin_lu`; docs/02, Normalizer) und friert seinen Gain in Pausen sofort ein – eine Pause
+auf Sprachlautheit entsteht nicht, der nächste Satz setzt höchstens +1,5 dB lauter ein. Der
+Pausenabstand ist in den ersten Minuten aber kleiner als kalibriert: Der Expander steht noch auf
+der alten Schwelle und senkt den lauteren Teppich kaum, der Abstandsverlust beträgt bis zu 7 LU
+(Messung docs/02 §7: Pause 1 bei +8 dB 13 LU, bei +12 dB 4,8 LU unter der Sprache). Den vollen
+Abstand ≥ 15 LU gibt es erst, wenn die Regelung die Expander-Schwelle nachgezogen hat (ca. 1,5 min,
+Konvergenzzeit unten). Reicht der Störabstand am Eingang nicht mehr (unter ~16 dB), bleibt die
+Kappe „Sprache − 12" maßgeblich, die Regelung schreibt `low_snr` (§9) und die Statuszeile zeigt
+den Zustand; dann hilft nur der Raum oder eine neue Kalibrierung. Die Begrenzung von
+`max_gain_db` aus der Kalibrierung gilt für den kalibrierten Raum; in einem lauter gewordenen Raum
+begrenzt sie den Gain, hält den Teppich aber nicht automatisch von der Sprachlautheit fern.
 
 **Konvergenzzeit.** 0,5 dB je zwei Intervalle = 0,5 dB je 4 s, dazu ~10 s, bis die 20-s-Historie
 eine Änderung des Raums abbildet. Beispiel: Lüfter geht an, Rauschteppich +10 dB → das Ziel

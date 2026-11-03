@@ -303,6 +303,36 @@ def test_expander_speech_cap_stays_for_a_quiet_speaker_but_not_for_typing():
     assert abs(chain.get_param("expander", "threshold_db") - (-36.0)) <= adaptive.EXPANDER_DEADZONE_DB
 
 
+def test_level_plausibility_has_one_db_hysteresis(tmp_path):
+    """Enter the plausible state inside +-6 dB, leave it only outside +-7 dB: a speaker
+    hovering between 5.9 and 6.5 dB below the reference neither flips track/rest
+    nor floods the log."""
+    log = tmp_path / "hyst.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    # 6.5 dB off at the start: not plausible yet (entry threshold 6 dB).
+    ctrl.update(meters_dict(speech=-26.5, band_peak=-22.0, sib=-4.0), now=LEARN_S)
+    assert not ctrl._level_plausible
+    # 5.9 dB: enters; 6.5 dB: stays (exit threshold 7 dB); 7.2 dB: leaves; 6.5 dB: stays out.
+    levels = [-25.9, -26.5, -26.5, -26.5, -27.2, -26.5, -26.5]
+    expected = [True, True, True, True, False, False, False]
+    for k, (lvl, exp) in enumerate(zip(levels, expected), start=1):
+        ctrl.update(meters_dict(speech=lvl, band_peak=-22.0, sib=-4.0), now=LEARN_S + k * INTERVAL_S)
+        assert ctrl._level_plausible is exp, (lvl, k)
+    ctrl.close()
+    impl = [e for e in events(log) if e.get("event") == "implausible_speech"]
+    assert len(impl) == 1 + 3           # the first interval and the last three
+    # Oscillating around the entry edge after having entered: no track/rest alternation.
+    cfg, chain, ctrl = make()
+    changes = []
+    for k in range(40):
+        lvl = -25.9 if k % 2 == 0 else -26.5
+        changes += ctrl.update(meters_dict(speech=lvl, band_peak=-22.0, sib=-4.0), now=LEARN_S + k * INTERVAL_S)
+    reasons = {c["reason"] for c in changes if c["stage"] in ("deesser", "compressor")}
+    assert "rest" not in reasons
+    comp = [c for c in changes if c["stage"] == "compressor"]
+    assert comp and all(c["new"] - c["old"] == pytest.approx(-STEP_DB) for c in comp)   # one direction only
+
+
 def test_low_snr_event_is_logged_with_hint_and_throttled(tmp_path):
     log = tmp_path / "snr.jsonl"
     cfg, chain, ctrl = make(log_path=log)

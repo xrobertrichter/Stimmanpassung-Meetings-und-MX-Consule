@@ -152,10 +152,13 @@ LOUDNESS_TOLERANCE_LU = 2.0
 #: Sibilance must not get worse by more than this when the de-esser is not
 #: needed (assumption: 1 dB is below audibility for a band-energy ratio).
 SIBILANCE_MAX_INCREASE_DB = 1.0
-#: A voice up to this far above the sibilance reference is a borderline voice:
-#: unproblematic to listen to, the de-esser only keeps it where it is.
-#: Assumption: 3 dB (the spread of the reference estimate itself).
-SIBILANCE_BORDERLINE_DB = 3.0
+#: Above this sibilance ratio a voice clearly has a sibilance problem and the
+#: chain must make it measurably better; voices below it (none or a mild
+#: problem) only must not get worse than SIBILANCE_MAX_INCREASE_DB, because
+#: compressor and normalizer lift the 5-10 kHz band of soft fricatives by
+#: 1-3 dB and the de-esser (>= 4 dB only at the loud sibilants) does not take
+#: all of that back. Assumption: -10 dB (5 dB above the reference).
+SIBILANCE_CLEAR_PROBLEM_DB = -10.0
 #: Difference tolerated between the limiter's internal peak estimate and the
 #: 4x-oversampled true-peak meter (assumption: 0.1 dB).
 TRUE_PEAK_TOLERANCE_DB = 0.1
@@ -323,6 +326,20 @@ def eq_reference_db(freq_hz: float) -> float:
     if freq_hz <= EQ_REFERENCE_KNEE_HIGH_HZ:
         return mid
     return mid + EQ_REFERENCE_SLOPE_HIGH_DB_PER_OCT * math.log2(freq_hz / EQ_REFERENCE_KNEE_HIGH_HZ)
+
+
+def sibilance_criterion_passed(before_db: float, after_db: float) -> bool:
+    """Closed form of the sibilance criterion (docs/00 section 6.3 "Zischanteil ↓").
+
+    Passed when the voice ends up below the reference (no sibilance problem
+    after the chain), or the ratio drops by at least SIBILANCE_MAX_INCREASE_DB,
+    or the voice had no clear problem to begin with (before <=
+    SIBILANCE_CLEAR_PROBLEM_DB) and did not get worse than +SIBILANCE_MAX_INCREASE_DB.
+    """
+    delta = after_db - before_db
+    return bool(after_db <= SIBILANCE_REFERENCE_DB
+                or delta <= -SIBILANCE_MAX_INCREASE_DB
+                or (before_db <= SIBILANCE_CLEAR_PROBLEM_DB and delta <= SIBILANCE_MAX_INCREASE_DB))
 
 
 def normalizer_gate_target(pause_loudness_lufs: float, target_lufs: float) -> float:
@@ -750,37 +767,20 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
 
     sib_delta = after["sibilance_ratio_db"] - before["sibilance_ratio_db"]
     deesser_needed = before["sibilance_ratio_db"] > SIBILANCE_REFERENCE_DB
-    if deesser_needed:
-        # Hysteresis: a clear reduction passes. Compressor and normalizer lift the
-        # 5-10 kHz band of soft fricatives relative to loud vowels by a few dB and
-        # the de-esser takes that back, so a voice may end up where it started.
-        # A borderline voice (at most SIBILANCE_BORDERLINE_DB above the reference)
-        # therefore passes when it is not worse than +1 dB; a clearly sibilant
-        # voice passes with +1 dB only if it ends up below the reference.
-        borderline = before["sibilance_ratio_db"] <= SIBILANCE_REFERENCE_DB + SIBILANCE_BORDERLINE_DB
-        sib_pass = (sib_delta <= -SIBILANCE_MAX_INCREASE_DB
-                    or (sib_delta <= SIBILANCE_MAX_INCREASE_DB
-                        and (borderline or after["sibilance_ratio_db"] <= SIBILANCE_REFERENCE_DB)))
-        note = (f"De-Esser aktiv: Zischanteil muss um ≥ {SIBILANCE_MAX_INCREASE_DB:.0f} dB sinken"
-                + (f" oder (Grenzstimme, höchstens {SIBILANCE_BORDERLINE_DB:.0f} dB über der Referenz) nicht mehr als "
-                   f"+{SIBILANCE_MAX_INCREASE_DB:.0f} dB steigen" if borderline else
-                   f" oder bei höchstens +{SIBILANCE_MAX_INCREASE_DB:.0f} dB unter der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB liegen")
-                + "; Kompressor und Normalizer heben das 5–10-kHz-Band leiser Frikative relativ an, der De-Esser nimmt das zurück.")
-    else:
-        # A clean voice stays clean: the chain may shift the band ratio a little
-        # (compression acts more on the loud voiced peaks than on soft fricatives),
-        # as long as the result stays below the sibilance reference, or it may not
-        # get worse by more than SIBILANCE_MAX_INCREASE_DB.
-        sib_pass = (after["sibilance_ratio_db"] <= SIBILANCE_REFERENCE_DB
-                    or sib_delta <= SIBILANCE_MAX_INCREASE_DB)
-        note = (f"Zischanteil lag mit {before['sibilance_ratio_db']:.1f} dB unter der Referenz "
-                f"{SIBILANCE_REFERENCE_DB:.0f} dB, De-Esser ruht; Kriterium: nachher weiterhin unter der Referenz "
-                f"oder nicht schlechter als +{SIBILANCE_MAX_INCREASE_DB:.0f} dB.")
+    sib_pass = sibilance_criterion_passed(before["sibilance_ratio_db"], after["sibilance_ratio_db"])
+    clearly_sibilant = before["sibilance_ratio_db"] > SIBILANCE_CLEAR_PROBLEM_DB
+    note = ((f"De-Esser aktiv (Zischanteil über der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB). " if deesser_needed
+             else f"De-Esser ruht (Zischanteil unter der Referenz {SIBILANCE_REFERENCE_DB:.0f} dB). ")
+            + (f"Klar zischende Stimme (> {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB): muss um ≥ {SIBILANCE_MAX_INCREASE_DB:.0f} dB "
+               f"sinken oder unter {SIBILANCE_REFERENCE_DB:.0f} dB landen. " if clearly_sibilant else
+               f"Stimme ohne oder mit geringem Zischproblem (≤ {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB): darf um höchstens "
+               f"+{SIBILANCE_MAX_INCREASE_DB:.0f} dB steigen. ")
+            + "Kompressor und Normalizer heben das 5–10-kHz-Band leiser Frikative relativ zu lauten Vokalen um "
+            "1–3 dB an; nur ein klar zischende Stimme muss messbar besser werden.")
     criteria["sibilance_reduced"] = {
         "passed": bool(sib_pass),
-        "target": (f"Zischanteil ↓ ≥ {SIBILANCE_MAX_INCREASE_DB:.0f} dB oder ≤ {SIBILANCE_REFERENCE_DB:.0f} dB "
-                   f"bei ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB" if deesser_needed
-                   else f"Zischanteil ≤ {SIBILANCE_REFERENCE_DB:.0f} dB oder ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB"),
+        "target": (f"nachher ≤ {SIBILANCE_REFERENCE_DB:.0f} dB, oder Δ ≤ −{SIBILANCE_MAX_INCREASE_DB:.0f} dB, oder "
+                   f"(vorher ≤ {SIBILANCE_CLEAR_PROBLEM_DB:.0f} dB und Δ ≤ +{SIBILANCE_MAX_INCREASE_DB:.0f} dB)"),
         "actual": f"{sib_delta:+.1f} dB ({before['sibilance_ratio_db']:.1f} → {after['sibilance_ratio_db']:.1f} dB)",
         "note": note + (f" Zischspitzen im De-Esser-Band {before['sibilant_band_peak_dbfs']:.1f} → "
                         f"{after['sibilant_band_peak_dbfs']:.1f} dBFS."),
@@ -819,8 +819,12 @@ def evaluate(x_in: np.ndarray, x_out: np.ndarray, sample_rate: int, cfg: dict) -
 # Chain processing and I/O
 # --------------------------------------------------------------------------- #
 
-def process_with_chain(x: np.ndarray, cfg: dict) -> np.ndarray:
-    """Run ``x`` block-wise through a fresh ``Chain`` built from ``cfg``."""
+def process_with_chain(x: np.ndarray, cfg: dict, return_chain: bool = False):
+    """Run ``x`` block-wise through a fresh ``Chain`` built from ``cfg``.
+
+    With ``return_chain`` the result is ``(y, chain)`` so the caller can read
+    the chain's final meters (e.g. the normalizer gain at the end of the sample).
+    """
     chain = Chain.from_config(cfg)
     block = int(cfg["block_size"])
     if block <= 0:
@@ -830,7 +834,7 @@ def process_with_chain(x: np.ndarray, cfg: dict) -> np.ndarray:
     for start in range(0, x32.size, block):
         y = chain.process(x32[start:start + block])
         out[start:start + block] = np.asarray(y, dtype=np.float32)[: x32.size - start]
-    return out
+    return (out, chain) if return_chain else out
 
 
 def load_base_config(base_cfg_path) -> dict:
@@ -908,12 +912,17 @@ def run_calibration(wav_path, base_cfg_path, out_cfg_path, report_path, processo
         warnings.append("Keine Sprache erkannt: die Dynamik zwischen leisen und lauten Rahmen ist kleiner als "
                         f"{meters.MIN_SPEECH_SNR_DB:.0f} dB. Alle Sprach-bezogenen Werte sind Schätzungen.")
 
-    def run_chain(cfg: dict) -> np.ndarray:
-        y = processor(x) if processor is not None else process_with_chain(x, cfg)
+    def run_chain(cfg: dict) -> tuple[np.ndarray, dict | None]:
+        """Process the sample; returns the output and the chain's final meters (None with a processor)."""
+        if processor is not None:
+            y, final_meters = processor(x), None
+        else:
+            y, chain = process_with_chain(x, cfg, return_chain=True)
+            final_meters = chain.get_meters()
         y = np.asarray(y, dtype=np.float32)
         if y.shape != x.shape:
             raise ValueError(f"processor returned shape {y.shape}, expected {x.shape}")
-        return y
+        return y, final_meters
 
     cfg_first = recommend(measurements, base_cfg)
     # First pass without the normalizer: the gate and the gain limit are designed
@@ -921,7 +930,7 @@ def run_calibration(wav_path, base_cfg_path, out_cfg_path, report_path, processo
     # lifted by an uncalibrated AGC.
     cfg_probe = copy.deepcopy(cfg_first)
     cfg_probe["chain"]["normalizer"]["enabled"] = False
-    y_first = run_chain(cfg_probe)
+    y_first, _ = run_chain(cfg_probe)
     de = cfg_first["chain"]["deesser"]
     after_first = analyze(y_first, sr, float(de["freq_hz"]), float(de["bandwidth_oct"]))
     if after_first["pause"] is None:
@@ -929,8 +938,14 @@ def run_calibration(wav_path, base_cfg_path, out_cfg_path, report_path, processo
         after_first["pause"] = meters.pause_loudness_lufs(
             y_first, sr, measurements["pause"]["start_s"], measurements["pause"]["end_s"])
     cfg = refine_normalizer(cfg_first, after_first)
-    y = run_chain(cfg)
+    y, final_meters = run_chain(cfg)
     evaluation = evaluate(x, y, sr, cfg)
+    # Gain the normalizer had reached at the end of the evaluation pass: shows
+    # whether the AGC regulated at all (a frozen gain near 0 dB with speech below
+    # target means the normalizer never left its start state).
+    norm_meters = (final_meters or {}).get("normalizer", {})
+    evaluation["info"]["normalizer_gain_end_db"] = (
+        float(norm_meters["gain_db"]) if isinstance(norm_meters, dict) and "gain_db" in norm_meters else None)
     out_path = Path(out_cfg_path)
     save_config(_plain(cfg), out_path)
     rep_path = Path(report_path)
@@ -1079,7 +1094,9 @@ def render_report(wav_path, base_cfg: dict, cfg: dict, measurements: dict,
     lines.append(f"Sprachpegel nach Kette: {info.get('speech_level_after_dbfs', float('nan')):.1f} dBFS "
                  f"(Referenz {REFERENCE_SPEECH_LEVEL_DBFS:.0f} dBFS vor Normalizer; der Normalizer hebt auf "
                  f"die Ziel-Lautheit an). Störabstandsgewinn {info.get('snr_gain_db', float('nan')):+.1f} dB, "
-                 f"absolute Änderung des Pausenpegels {info.get('pause_rms_change_db', float('nan')):+.1f} dB.")
+                 f"absolute Änderung des Pausenpegels {info.get('pause_rms_change_db', float('nan')):+.1f} dB."
+                 + (f" Normalizer-Gain am Ende des Bewertungsdurchlaufs {info['normalizer_gain_end_db']:+.1f} dB."
+                    if info.get("normalizer_gain_end_db") is not None else ""))
     lines.append("")
 
     lines += [REPORT_SECTIONS[3], "", "| Kriterium | Ziel | Ist | Ergebnis | Hinweis |", "|---|---|---|---|---|"]
