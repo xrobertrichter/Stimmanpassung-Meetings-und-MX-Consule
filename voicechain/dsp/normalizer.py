@@ -108,12 +108,13 @@ FLOOR_WINDOW_S = 10.0
 # The estimate follows a louder room at 1 LU/s (a fan that switches on is tracked in
 # ~10-20 s) so that a single mis-detected plateau cannot jump it.
 FLOOR_RISE_LU_PER_S = 1.0
-# A floor less than 15 LU below the speech cannot be gated without cutting speech
-# (Beauftragung 6.4 b): the stage enters the low-SNR state below 15 LU and leaves it
-# above 17 LU (2 LU hysteresis against flicker on a fluctuating floor). The same 15 LU
-# are the pause headroom the gain cap keeps below the target.
-LOW_SNR_ENTER_LU = 15.0
-LOW_SNR_EXIT_LU = 17.0
+# A room whose floor lies 15 LU under the speech meets the acceptance criterion
+# (Beauftragung 6.4 a: pause <= speech - 15 LU) and must therefore never be flagged as
+# "low SNR"; the state is left at 15 LU and entered 2 LU lower (hysteresis against
+# flicker on a fluctuating floor). The 15 LU are also the pause headroom the gain cap
+# keeps below the target.
+LOW_SNR_ENTER_LU = 13.0
+LOW_SNR_EXIT_LU = 15.0
 PAUSE_HEADROOM_LU = 15.0
 # Speech evidence for learning the reference: within 2 s (a word plus a gap, or two
 # syllable groups) the 10 ms interval loudness of speech spans > 7 LU even for the

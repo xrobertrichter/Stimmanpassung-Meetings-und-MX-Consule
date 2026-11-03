@@ -272,12 +272,13 @@ def test_gain_cap_keeps_pause_15_lu_below_target(fs, gen):
 
 
 def test_low_snr_state_with_hysteresis(fs, gen):
-    """Room floor steps -50 -> -36 -> -41 -> -46 -> -50 dBFS under speech with 1.5 s pauses:
-    low_snr enters below 15 LU, stays while 15 <= snr < 17 (hysteresis), leaves above 17.
+    """Room floor steps -50 -> -36 -> -39 -> -41 -> -50 dBFS under speech with 1.5 s pauses:
+    low_snr enters below 13 LU, stays while 13 <= snr < 15 (hysteresis), leaves at 15 LU (a
+    room with 15 LU distance meets Beauftragung 6.4 a and must not be flagged).
     While it is set the reference is not learnt from the room and pauses do not lift the
     gain (learning continues only from intervals >= floor + margin + 5 LU)."""
     parts = []
-    for k, floor in enumerate((-50.0, -36.0, -41.0, -46.0, -50.0)):
+    for k, floor in enumerate((-50.0, -36.0, -39.0, -41.0, -50.0)):
         part, _ = gen.speech_like(-20.0, 30.0, fs, seed=80 + k, noise_rms_dbfs=floor, talk_s=0.6, pause_s=1.5)
         parts.append(part)
     x = np.concatenate(parts)
@@ -292,14 +293,19 @@ def test_low_snr_state_with_hysteresis(fs, gen):
     def at(t):
         return log[int(t * per_s)]
     assert at(25)[0] == 0.0 and at(25)[1] > 20.0                   # quiet room: normal operation
-    assert at(55)[0] == 1.0 and at(55)[1] < 15.0                   # -36 dBFS: entered (measured ~10 LU)
-    assert at(85)[0] == 1.0 and 15.0 <= at(85)[1] < 17.0           # -41 dBFS: inside the hysteresis band
-    assert at(115)[0] == 0.0 and at(115)[1] >= 17.0                # -46 dBFS: left again (~20 LU)
+    assert at(55)[0] == 1.0 and at(55)[1] < 13.0                   # -36 dBFS: entered (measured ~10 LU)
+    assert at(85)[0] == 1.0 and 13.0 <= at(85)[1] < 15.0           # -39 dBFS: inside the hysteresis band (~14 LU)
+    assert at(115)[0] == 0.0 and at(115)[1] >= 15.0                # -41 dBFS: left again (~16 LU)
     gains = np.array([row[2] for row in log])
     refs = np.array([row[3] for row in log])
     low = slice(int(50 * per_s), int(90 * per_s))
-    assert np.max(gains[low]) - gains[int(50 * per_s)] <= 0.5        # pauses of the loud room never lift the gain
-    assert abs(refs[int(89 * per_s)] - refs[int(45 * per_s)]) <= 1.5  # reference not learnt from the room
+    # the gain may still follow the speech reference (learning continues from certain-speech
+    # intervals), but it never exceeds what that reference asks for: pauses cannot lift it
+    assert np.max(gains[low]) <= -18.0 - np.min(refs[low]) + 0.5
+    assert np.max(gains[low]) - gains[int(50 * per_s)] <= 1.0
+    # reference not learnt from the room: it may drift up (only the loud, certain syllables are
+    # learnt now) but never sinks towards the room floor
+    assert refs[int(45 * per_s)] - 1.0 <= refs[int(89 * per_s)] <= refs[int(45 * per_s)] + 2.5
     assert set(stage.meters()) >= {"low_snr", "snr_lu", "noise_floor_lufs", "effective_gate_lufs"}
 
 

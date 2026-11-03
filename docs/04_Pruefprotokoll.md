@@ -177,5 +177,53 @@ Nacharbeit Runde 5 (Commits 9d97843 INT, 4fa57bf KAL, dce171f DSP):
 
 Stand nach Runde 5: 371 Tests grün, 1 übersprungen (Rechte-Test unter root), Selftest 12/12.
 
-## Abschlussreview
-_wird nach der PO-Schlussverifikation Runde 5 ergänzt_
+## PO-Schlussverifikation Runde 5 und letzte Auflagen
+
+PO Runde 5 (`docs/pruefungen/09_product_owner_runde5.md`, Stand dce171f): **abnehmbar mit
+Auflagen.** PO-23, PO-24, PO-26 bis PO-32 behoben; PO-29 auf Systemebene mit 9 Startszenarien
+(Vorlauf 3/10 s, −55/−50/−45 dBFS, weiß und rosa) bestätigt: Gain im Vorlauf 0,00 dB, Lautheit
+−18,3 LUFS. Modulationsbedingung ohne Regression (monoton, lange Vokale, Flüstern werden geregelt;
+Dauerton wird korrekt nicht gelernt). Auflagen: PO-25 Rest (mittel), PO-33 bis PO-36 (niedrig),
+§6.4 a Nachführungszeit, Hördurchlauf mit echter Aufnahme vor Produktivfreigabe.
+
+Umsetzung der Auflagen (Commits 6318dda KAL, nachfolgender Commit DSP):
+
+| Nr | Änderung | Nachweis |
+|----|----------|----------|
+| PO-25 Rest | Ruhezweig: vorher ≤ −15 dB, Δ ≤ +3 dB, nachher ≤ −12 dB | Sweep −18…−10 dB in 1-dB-Schritten mit echter Kette: 9/9 bestanden; −8 dB mit Δ +0,5 weiterhin nicht bestanden |
+| PO-34 | low_snr Eintritt 13 LU / Austritt 15 LU (vorher 15/17) | +8 dB rosa (PO-Messung 15,5–16,5 LU) verlässt den Zustand; +12 dB bleibt; Vorlauf- und Pausentests unverändert |
+| PO-35 | docs/02 §7: Nachführung leiser Sprecher nur ≥ Teppich + 13 LU | — |
+| PO-33 / PO-36 | docs/03 §11: monotone pausenlose Sprache/Dauertöne; dichter Vortrag mit geringer Dynamik | — |
+| §6.4 a | „nach Nachführung (ca. 1,5 min)“ ergänzt | Beauftragung |
+
+## Abschlussreview (Projektleitung, 2026-11-03)
+
+**Ergebnis: Lieferung abnehmbar mit einer verbleibenden Auflage.** Die Auflage ist ein
+Hördurchlauf mit einer echten Rode-NT-USB-Aufnahme auf dem Zielrechner (Kalibrierung, A/B über
+`process`, Live-Betrieb in einem Zoom-Testmeeting). Alle Nachweise in diesem Repository sind
+synthetisch; macOS, CoreAudio, BlackHole, Echtzeit-Dropouts und die Pegelautomatik von Zoom/Teams
+hinter der Kette konnten im Container nicht geprüft werden.
+
+Prüfung gegen die Abnahmekriterien §6:
+
+| Kriterium | Ergebnis |
+|-----------|----------|
+| §6.1 `pytest -q` ohne Audiogeräte | 380 bestanden, 1 übersprungen (Rechte-Test unter root) |
+| §6.2 `selftest` | 12/12 bestanden, Exit 0, 0,43 ms je 256er-Block |
+| §6.3 Kalibrierung verbessert das Sample | Störabstandsgewinn +9…11 dB, Pausenlautheit −44…−48 LUFS (Grenze −38), Zischanteil ↓, −18,1…−18,5 LUFS, True Peak ≤ −1 dBTP |
+| §6.4 Regelung | Lernphase ohne Eingriff, Konvergenz 75–90 s, keine Oszillation, Bounds, Log mit Grund; Raumänderung a/b wie präzisiert erfüllt (PO Runde 5) |
+| §6.5 Einrichtung in 30 min | Blindprüfung Runde 2: eine Lücke (Python-Beschaffung), behoben; README-Schnellstart in 10 Schritten |
+| §6.6 Reihenfolge der Kette | im Code gegen feste Klassenliste getestet; Mutation „Vertauschung“ wird gefangen |
+
+Qualität: Lazy-Coding-Suchlauf leer; Mutationstests 18/18 gefangen (Runde 2); Nebenläufigkeit,
+NaN-Schutz, CLI-Fehlerpfade getestet. Prüfkette eingehalten: drei unabhängige Rollen in zwei
+vollen Runden, danach drei PO-Verifikationsrunden bis zur Abnahme.
+
+Bekannte Grenzen (dokumentiert in docs/02 §7 und docs/03 §11): Störabstand unter ca. 13 LU am
+Normalizer-Eingang → Zustand low_snr (Gain hält, Pausen bleiben hörbarer, Hinweis in Statuszeile
+und Log); Dauertöne und extrem monotone Sprache werden nicht als Sprache gelernt; dichter Vortrag
+mit Dynamik < 15 dB hält De-Esser/Kompressor auf den kalibrierten Werten; kein Pump-Detektor.
+
+Empfehlung für den nächsten Schritt: 60-s-Sample mit `python -m voicechain record` am gewohnten
+Platz aufnehmen, kalibrieren, Bericht lesen, `process`-Ausgabe anhören, dann Live-Test im
+Zoom-Testmeeting mit Kopfhörern. Erst danach produktiv einsetzen.

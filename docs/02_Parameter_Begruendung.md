@@ -254,17 +254,22 @@ Alle 10 ms (absolutes Sampleraster, deshalb blockgrößenunabhängig) wird entsc
    5 LU statt der zunächst vorgesehenen 10 LU: Mit 18 LU Abstand würde das Lernen genau am
    Betriebspunkt eines 5–8 dB lauteren Raums (Sprache 15–17 LU über dem Teppich) enden und ein
    solcher Raum dauerhaft ungeregelt bleiben (gemessen: Raum −45 dBFS, Gain 0,00 statt 2,6 dB).
-4. **Zustand `low_snr` (Störabstand zu gering):** Liegt L_T weniger als 15 LU unter L_s, kann kein
+4. **Zustand `low_snr` (Störabstand zu gering):** Liegt L_T weniger als 13 LU unter L_s, kann kein
    Gate Pausen von Sprache trennen, ohne Sprache abzuschneiden. Der Normalizer hält das Gate auf
    L_T + `gate_margin_lu`, lernt Referenz und Gain weiter – aber ausschließlich aus den sicheren
    Sprachintervallen (Punkt 3 b), Pausen liegen darunter und können den Gain nicht hochziehen –
    und setzt den Pausen-Deckel (Punkt 7) außer Kraft; es gilt nur `max_gain_db`, sonst bliebe die
    Sprache im lauten Raum dauerhaft zu leise. Der Zustand endet mit Hysterese, wenn L_T wieder
-   ≥ 17 LU unter L_s liegt (2 LU gegen Flattern); durch das Weiterlernen ist der Zustand kein
-   Riegel mehr. Meter: `low_snr` (0/1) und `snr_lu` (L_s − L_T, ∞ solange unbekannt); die
+   ≥ 15 LU unter L_s liegt (2 LU gegen Flattern): Ein Raum mit 15 LU Abstand erfüllt §6.4 a und
+   darf nicht als „Störabstand zu gering“ gemeldet werden – mit dem früheren Fenster 15/17 LU
+   rastete der Zustand im +8-dB-Rosa-Raum (15,5–16,5 LU) ein und erzeugte alle 30 s einen
+   Fehlalarm. Durch das Weiterlernen ist der Zustand kein Riegel mehr. Ein leiser gewordener
+   Sprecher wird darin nur so lange nachgeführt, wie seine Sprache ≥ Teppich + 13 LU liegt
+   (Punkt 3 b): im +8-dB-Raum ja bei −6 dB (Ausgang −19,3 LUFS), nein bei −10 dB – dann bleibt
+   der Gain stehen; das ist ein Neukalibrierfall oder ein Fall für einen leiseren Raum. Meter: `low_snr` (0/1) und `snr_lu` (L_s − L_T, ∞ solange unbekannt); die
    Regelung protokolliert daraus das Ereignis „Störabstand zu gering“, die Statuszeile zeigt es.
-   Test: Teppich −50 → −36 → −41 → −46 → −50 dBFS unter Sprache −20 dBFS: Eintritt bei ~10 LU,
-   bleibt bei 15,8 LU (Hysteresefenster), Austritt bei ~20 LU; Pausen heben den Gain nicht
+   Test: Teppich −50 → −36 → −39 → −41 → −50 dBFS unter Sprache −20 dBFS: Eintritt bei ~10 LU,
+   bleibt im Hysteresefenster 13–15 LU, Austritt ab 15 LU; Pausen heben den Gain nicht
    (≤ 0,5 dB), Referenz bleibt innerhalb 1,5 LU der des ruhigen Raums.
 5. **Absolutes Gate:** L_m < G → Pause, der Gain wird eingefroren.
 6. **Relatives Gate (wie BS.1770):** L_m < Sprachlautheit − 10 LU → ebenfalls eingefroren. Die

@@ -367,20 +367,24 @@ def _lufs(sig, fs, a, b, mask=None):
     return -0.691 + 10 * np.log10(np.mean(w ** 2))
 
 
-@pytest.mark.parametrize("floor_dbfs, kind", [
-    (-42.0, "pink"),     # +8 dB, fan-like noise
-    (-42.0, "white"),    # +8 dB white
-    (-38.0, "pink"),     # +12 dB: Beauftragung 6.4 b, after tracking <= 5 LU loss
-    (-38.0, "white"),
+@pytest.mark.parametrize("floor_dbfs, kind, expect_low_snr", [
+    # +8 dB fan-like noise: in this synthetic scenario (speech -26 dBFS) the floor lies only
+    # 12.9 LU under the speech at the normaliser's input -> still flagged; the system measurement
+    # of the product owner (15.5-16.5 LU) clears the state since the exit moved to 15 LU
+    (-42.0, "pink", True),
+    (-42.0, "white", True),    # +8 dB white: ~10 LU
+    (-38.0, "pink", True),     # +12 dB: Beauftragung 6.4 b, after tracking <= 5 LU loss
+    (-38.0, "white", True),
 ])
-def test_room_gets_louder_after_calibration(cfg, fs, gen, floor_dbfs, kind):
+def test_room_gets_louder_after_calibration(cfg, fs, gen, floor_dbfs, kind, expect_low_snr):
     """Beauftragung 6.4 with the thresholds the system really uses. The chain is calibrated
     for a -50 dBFS room; the floor then rises to -42 (+8 dB) or -38 dBFS (+12 dB) while the
     controller tracks the expander to min(floor + 10, speech - 12) = -32 dBFS.
 
     Guaranteed by the normaliser in every case: no gain rise in the 20 s pause beyond 1 dB,
     the next sentence at most 1.5 dB louder, low_snr flagged whenever the floor lies less than
-    15 LU under the speech at its input, and never "pause as loud as speech".
+    13 LU under the speech at its input (and cleared again from 15 LU on), and never "pause as
+    loud as speech".
 
     Distance speech-pause (6.4 b): the input distance shrinks by at most 5 LU after tracking,
     because the compressor (threshold at the speech RMS) lowers the speech by 3-6 dB while the
@@ -400,7 +404,11 @@ def test_room_gets_louder_after_calibration(cfg, fs, gen, floor_dbfs, kind):
     assert rise <= 1.0
     assert onset <= 1.5
     assert distance_out >= distance_in - 5.0
-    assert np.mean(low_snr[int(32 * per_s):int(50 * per_s)]) >= 0.9     # room too loud to gate: flagged
+    flagged = np.mean(low_snr[int(32 * per_s):int(50 * per_s)])
+    if expect_low_snr:
+        assert flagged >= 0.9                                            # room too loud to gate: flagged
+    else:
+        assert flagged <= 0.1                                            # a 6.4 a room is not an alarm
     assert _lufs(y, fs, 32, 49) < _lufs(y, fs, 20, 30) - 1.0            # never "pause as loud as speech"
     assert abs(_lufs(y, fs, 20, 30) + 18.0) <= 2.0                      # speech still on target
 

@@ -20,5 +20,6 @@ Umsetzungs-Agenten erstellt und von drei Prüfrollen abgenommen.
 - Branch: `claude/blackhole-rode-ntusb-config-jdoa16`. Kein Push auf andere Branches.
 
 ## Projektstand (2026-11-03)
-Drei Prüfrunden durchlaufen (Runde 1 und 2 mit PO, Software, Blind; Runde 3 PO-Abschlussprüfung).
-Offene Punkte stehen in `docs/04_Pruefprotokoll.md`, Abschnitt Abschlussreview.
+Abgeschlossen: zwei volle Prüfrunden (PO, Software, Blind) und drei PO-Verifikationsrunden;
+Urteil „abnehmbar mit Auflage Hördurchlauf“. Offene Auflage und Grenzen: `docs/04_Pruefprotokoll.md`,
+Abschnitt Abschlussreview. Nächster Schritt liegt beim Nutzer: echte Aufnahme, Kalibrierung, Hörtest.
