@@ -61,12 +61,17 @@ Python-Pakete (siehe `requirements.txt`): numpy, scipy, soundfile, sounddevice, 
    brew install blackhole-2ch portaudio
    ```
    Danach abmelden und wieder anmelden (oder neu starten), damit macOS den Treiber lädt.
-2. **Repository holen und Umgebung anlegen**
+2. **Python 3.11+ und Repository**: Das mit macOS gelieferte `python3` ist oft älter. Ein
+   aktuelles Python kommt über Homebrew:
    ```bash
+   brew install python@3.12
    git clone <repo-url> voicechain && cd voicechain
-   python3 -m venv .venv && source .venv/bin/activate
+   python3.12 -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
    ```
+   Alternativ erledigen `scripts/run_live.sh` und `scripts/calibrate.sh` das Anlegen der
+   Umgebung selbst; sie prüfen die Python-Version und nennen den Installationsbefehl, wenn sie
+   zu alt ist (`PYTHON_BIN=python3.12 scripts/run_live.sh`, falls `python3` ein älteres ist).
 3. **Rode NT-USB anschließen, Kopfhörer am Mikrofon einstecken.** Mix-Regler am Mikrofon
    mittig, Kopfhörerlautstärke angenehm.
 4. **Samplerate prüfen:** Audio-MIDI-Setup öffnen (Programme → Dienstprogramme), bei
@@ -81,7 +86,8 @@ Python-Pakete (siehe `requirements.txt`): numpy, scipy, soundfile, sounddevice, 
    ```bash
    python -m voicechain selftest
    ```
-   Alle Zeilen müssen „bestanden" zeigen.
+   In der Spalte „bestanden" muss überall „ja" stehen, die letzte Zeile „Ergebnis: … BESTANDEN"
+   (Exit-Code 0).
 7. **Sprachsample aufnehmen** (am gewohnten Platz, mit dem eingebauten Kommando; kein
    zusätzliches Programm nötig)
    ```bash

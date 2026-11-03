@@ -271,6 +271,41 @@ def test_directory_as_input_is_reported(tmp_path, capsys):
     assert code == EXIT_ERROR and "Traceback" not in err
 
 
+def test_calibrate_with_directory_is_reported_as_directory(tmp_path, capsys):
+    folder = tmp_path / "samples"
+    folder.mkdir()
+    code = main(["calibrate", "--wav", str(folder)])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert "is a directory, expected a WAV file" in err and "Traceback" not in err
+
+
+def test_output_path_that_is_a_directory_is_reported(tmp_path, capsys):
+    folder = tmp_path / "existing_dir"
+    folder.mkdir()
+    code = main(["make-sample", "--out", str(folder)])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert "is a directory" in err and ".wav" in err and "Traceback" not in err
+    assert "LibsndfileError" not in err
+
+
+def test_output_path_without_extension_is_reported(tmp_path, capsys):
+    src = tmp_path / "in.wav"
+    _write_wav(src, make_speech_like(2.0, SAMPLE_RATE, seed=5), SAMPLE_RATE)
+    code = main(["process", "--in", str(src), "--out", str(tmp_path / "out" / "processed")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert "must end in .wav" in err and "no extension" in err and "Traceback" not in err
+    assert not (tmp_path / "out").exists()  # nothing is created for a rejected target
+    code = main(["calibrate", "--wav", str(src), "--out", str(tmp_path / "cfg.txt")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and ".yaml" in err
+    code = main(["selftest", "--report", str(tmp_path / "report.wav")])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR and ".md" in err
+
+
 @pytest.mark.parametrize("command", ["process", "make-sample", "selftest-report"])
 def test_unwritable_output_path_is_reported(tmp_path, capsys, command):
     blocker = tmp_path / "blocker"
@@ -344,11 +379,37 @@ def test_record_without_portaudio_reports_error(no_portaudio, tmp_path, capsys):
     assert code == EXIT_ERROR and "PortAudio" in err and "Traceback" not in err
 
 
-def test_record_rejects_non_positive_seconds(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "abc"])
+def test_record_rejects_invalid_seconds_before_creating_anything(monkeypatch, tmp_path, capsys, value):
     monkeypatch.setitem(sys.modules, "sounddevice", _make_fake_sd(0))
-    code = main(["record", "--out", str(tmp_path / "x.wav"), "--seconds", "0"])
-    assert code == EXIT_ERROR
+    out_dir = tmp_path / "never_created"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["record", "--out", str(out_dir / "x.wav"), "--seconds", value])
+    assert excinfo.value.code == 2
     assert "--seconds" in capsys.readouterr().err
+    assert not out_dir.exists()  # argparse rejects the value before the output directory is created
+
+
+def test_record_backend_failure_at_start_is_reported(monkeypatch, tmp_path, capsys):
+    fake_sd = _make_fake_sd(0)
+
+    class PortAudioError(Exception):
+        """Stands in for sounddevice.PortAudioError (a direct Exception subclass)."""
+
+    class FailingInputStream(fake_sd.InputStream):
+        def start(self):
+            raise PortAudioError("Unanticipated host error [PaErrorCode -9999]")
+
+    fake_sd.PortAudioError = PortAudioError
+    fake_sd.InputStream = FailingInputStream
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    code = main(["record", "--out", str(tmp_path / "x.wav"), "--seconds", "1"])
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert "Recording from 'RØDE NT-USB' failed" in err and "-9999" in err
+    assert "Traceback" not in err
+    assert fake_sd.input_stream.closed
+    assert not (tmp_path / "x.wav").exists()
 
 
 # -------------------------------------------------------------------------- selftest
@@ -447,6 +508,37 @@ def test_run_with_fake_stream_processes_blocks_and_stops_on_ctrl_c(monkeypatch, 
     assert "adaptive: on (frozen)" in captured.err
 
 
+def test_run_builds_analyzer_with_deesser_band_of_loaded_config(monkeypatch, tmp_path, capsys):
+    """The live analyzer must measure in the de-esser band of the (calibrated) configuration."""
+    import voicechain.adaptive as adaptive
+
+    created: list[dict] = []
+    real_analyzer = adaptive.LiveAnalyzer
+
+    class RecordingAnalyzer(real_analyzer):
+        def __init__(self, sample_rate, **kwargs):
+            created.append({"sample_rate": sample_rate, **kwargs})
+            super().__init__(sample_rate, **kwargs)
+
+    monkeypatch.setattr(adaptive, "LiveAnalyzer", RecordingAnalyzer)
+    fake_sd = _make_fake_sd(5)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    cfg = load_config(str(default_config_path()))
+    cfg["chain"]["deesser"]["freq_hz"] = 7200.0  # calibrated to a sibilance centroid off the default
+    cfg["chain"]["deesser"]["bandwidth_oct"] = 0.5
+    cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
+    cfg_path = tmp_path / "calibrated.yaml"
+    save_config(cfg, str(cfg_path))
+
+    code = main(["run", "--config", str(cfg_path)])
+    assert code == EXIT_OK, capsys.readouterr().err
+    assert len(created) == 1
+    assert created[0]["sample_rate"] == SAMPLE_RATE
+    assert created[0]["deesser_freq_hz"] == 7200.0
+    assert created[0]["deesser_bandwidth_oct"] == 0.5
+    assert real_analyzer(SAMPLE_RATE, deesser_freq_hz=7200.0, deesser_bandwidth_oct=0.5).band_hz == (7200.0, 0.5)
+
+
 def test_run_with_unknown_device_override_is_reported(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "sounddevice", _make_fake_sd(0))
     code = main(["run", "--no-adaptive", "--input-device", "Shure SM7B"])
@@ -473,11 +565,19 @@ def test_relative_paths_resolve_against_repo_root(tmp_path, monkeypatch):
     assert cli.resolve_input_path("local.wav") == local
     # a missing relative file resolves to the repo root (for the error message)
     assert cli.resolve_input_path("nope.wav") == fake_root / "nope.wav"
-    out = cli.resolve_output_path(str(Path("logs") / "sub" / "x.jsonl"))
+    out = cli.resolve_output_path(str(Path("logs") / "sub" / "x.jsonl"), suffixes=(".jsonl",))
     assert out == fake_root / "logs" / "sub" / "x.jsonl"
     assert out.parent.is_dir()
-    absolute = cli.resolve_output_path(str(tmp_path / "a" / "b.txt"))
+    absolute = cli.resolve_output_path(str(tmp_path / "a" / "b.txt"), suffixes=(".md", ".txt"))
     assert absolute == tmp_path / "a" / "b.txt" and absolute.parent.is_dir()
+    with pytest.raises(ValueError):
+        cli.resolve_output_path(str(tmp_path / "a" / "b.txt"))  # default suffix set is .wav
+
+
+def test_true_peak_tolerance_is_shared_with_calibrate():
+    from voicechain import calibrate
+
+    assert cli.TRUE_PEAK_TOLERANCE_DB is calibrate.TRUE_PEAK_TOLERANCE_DB
 
 
 def test_help_lists_all_commands(capsys):

@@ -7,8 +7,8 @@ Design rules (see docs/00_Beauftragung.md, section 4.3):
   any audio library.
 * The PortAudio callback does nothing but copy, analyze, process and copy back.
   It allocates no large buffers (the mono work buffer is pre-allocated; the
-  chain's small per-block temporaries stay well inside the 1 ms budget, see
-  docs/04 SW-13), never logs and never touches the adaptive controller.
+  chain's small per-block temporaries cost well under the 1 ms block budget),
+  never logs and never touches the adaptive controller.
 * The adaptive controller and the console status line run in a separate
   service thread (``threading``), decoupled from the audio thread. The same
   thread applies a freeze toggle requested by SIGUSR1.
@@ -52,8 +52,8 @@ _ASCII_FOLD = str.maketrans(
 )
 
 # Floor used when converting a zero signal to dB, so the status line never
-# shows "-inf" or raises on log10(0).
-_DB_FLOOR = -120.0
+# shows "-inf" or raises on log10(0); the same floor the stage meters use.
+from voicechain.dsp import DB_FLOOR_DBFS as _DB_FLOOR  # noqa: E402
 
 # How often the console status line is refreshed (seconds). Required by the
 # assignment ("Konsolen-Statuszeile alle 1 s").
@@ -498,6 +498,17 @@ class LiveEngine:
             change_text = self.last_change_text
         nonfinite = meters.get("input", {}).get("nonfinite_blocks")
         nonfinite_text = " | nonfinite {}".format(int(nonfinite)) if nonfinite is not None else ""
+        # Normalizer pause estimate and effective gate; older chains without these
+        # meters simply omit the field (dict.get with default, no exception path).
+        normalizer_meters = meters.get("normalizer", {})
+        floor_lufs = normalizer_meters.get("noise_floor_lufs")
+        gate_lufs = normalizer_meters.get("effective_gate_lufs")
+        gate_text = ""
+        if floor_lufs is not None or gate_lufs is not None:
+            gate_text = " | floor {} gate {} LUFS".format(
+                "{:6.1f}".format(float(floor_lufs)) if floor_lufs is not None else "  -- ",
+                "{:6.1f}".format(float(gate_lufs)) if gate_lufs is not None else "  -- ",
+            )
         if self.controller is None:
             mode = "off"
         elif self.frozen:
@@ -506,7 +517,7 @@ class LiveEngine:
             mode = "on"
         return (
             "in {:6.1f} dBFS (rms {:6.1f}) | out {:6.1f} dBFS | GR exp {} des {} comp {} "
-            "norm {} lim {} | xruns {}{} | blocks {} | adaptive {}: {}"
+            "norm {} lim {}{} | xruns {}{} | blocks {} | adaptive {}: {}"
         ).format(
             _to_dbfs(in_peak),
             _to_dbfs(in_rms),
@@ -516,6 +527,7 @@ class LiveEngine:
             gr("compressor"),
             gr("normalizer", "gain_db"),
             gr("limiter"),
+            gate_text,
             self.xruns,
             nonfinite_text,
             self.blocks_processed,
@@ -603,10 +615,16 @@ class LiveEngine:
                 latency="low",
                 callback=self.audio_callback,
             )
-            self.stream.start()
         except Exception as exc:
             self.stream = None
             raise AudioBackendError("Could not open the audio stream: {}".format(exc)) from exc
+        try:
+            self.stream.start()
+        except Exception as exc:
+            # The PortAudio handle exists: release it, or the device stays busy until GC.
+            stream, self.stream = self.stream, None
+            stream.close()
+            raise AudioBackendError("Could not start the audio stream: {}".format(exc)) from exc
 
         self._service_thread = threading.Thread(
             target=self._service_loop, name="voicechain-service", daemon=True
@@ -777,6 +795,12 @@ def record_wav(
         report_progress()  # final line: remaining 0.0 s and the last peak
     except KeyboardInterrupt:
         stopped_early = True
+    except Exception as exc:
+        # sounddevice.PortAudioError (device vanished, format refused at start) or
+        # any other backend failure: one clear message, no traceback.
+        raise AudioBackendError(
+            "Recording from {!r} failed: {}".format(in_dev["name"], exc)
+        ) from exc
     finally:
         stream.stop()
         stream.close()

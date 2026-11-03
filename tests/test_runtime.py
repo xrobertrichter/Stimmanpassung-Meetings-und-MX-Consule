@@ -483,9 +483,11 @@ def test_status_line_reports_levels_gain_reduction_and_xruns(fake_sd):
     assert "exp   3.0" in line and "comp   2.0" in line and "norm   1.5" in line
     assert "xruns 1" in line
     assert "blocks 1" in line
-    # peak hold is reset after each status line; silence shows the floor, not -inf
+    # peak hold is reset after each status line; silence shows the shared dB floor, not -inf
+    from voicechain.dsp import DB_FLOOR_DBFS
+
     line2 = engine.status_line()
-    assert "in -120.0 dBFS" in line2
+    assert "in {:6.1f} dBFS".format(DB_FLOOR_DBFS) in line2
 
 
 def test_engine_validates_configuration():
@@ -752,3 +754,57 @@ def test_status_line_uses_shared_meters_and_adaptive_tick_accepts_them(fake_sd):
     fresh = LiveEngine(base_cfg(), RecordingChain([]))
     assert "exp   3.0" in fresh.status_line()
     assert fresh.chain.meter_calls == 1
+
+
+def test_start_closes_stream_when_start_fails(fake_sd, monkeypatch):
+    class FailingStartStream(FakeStream):
+        def start(self):
+            raise RuntimeError("Device unavailable [PaErrorCode -9985]")
+
+    monkeypatch.setattr(fake_sd, "Stream", FailingStartStream)
+    engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
+    with pytest.raises(AudioBackendError) as excinfo:
+        engine.start()
+    assert "Could not start the audio stream" in str(excinfo.value)
+    assert "-9985" in str(excinfo.value)
+    stream = FakeStream.instances[-1]
+    assert stream.closed  # the PortAudio handle is released, the device is not left busy
+    assert engine.stream is None
+    assert engine._service_thread is None
+
+
+def test_record_wav_backend_error_during_start_becomes_audio_backend_error(fake_sd_record, tmp_path):
+    class FailingInputStream(FakeInputStream):
+        def start(self):
+            raise RuntimeError("Unanticipated host error")
+
+    fake_sd_record.InputStream = FailingInputStream
+    out = tmp_path / "x.wav"
+    with pytest.raises(AudioBackendError) as excinfo:
+        runtime.record_wav(base_cfg(), out, 1.0)
+    assert "Recording from 'RØDE NT-USB' failed" in str(excinfo.value)
+    assert FakeInputStream.instances[-1].closed
+    assert not out.exists()
+
+
+def test_status_line_shows_normalizer_floor_and_gate_when_available(fake_sd):
+    chain = RecordingChain([])
+    base = chain.get_meters
+
+    def meters_with_gate():
+        meters = base()
+        meters["normalizer"] = {"gain_db": 1.5, "noise_floor_lufs": -47.2, "effective_gate_lufs": -37.2}
+        return meters
+
+    chain.get_meters = meters_with_gate
+    line = LiveEngine(base_cfg(), chain).status_line()
+    assert "floor  -47.2 gate  -37.2 LUFS" in line
+    # chains without these meters omit the field instead of failing
+    assert "floor" not in LiveEngine(base_cfg(), RecordingChain([])).status_line()
+
+
+def test_db_floor_matches_stage_meters():
+    from voicechain.dsp import DB_FLOOR_DBFS
+
+    engine = LiveEngine(base_cfg(), RecordingChain([]))
+    assert "in {:6.1f} dBFS".format(DB_FLOOR_DBFS) in engine.status_line()

@@ -76,7 +76,7 @@ wird), nicht Python selbst.
 - Nachträglich prüfen/ändern: Systemeinstellungen → Datenschutz & Sicherheit → Mikrofon →
   Schalter bei „Terminal" (bzw. dem verwendeten Terminalprogramm) einschalten.
 - Ohne diese Berechtigung liefert das Rode nur Stille (kein Fehler!). Die Statuszeile zeigt dann
-  dauerhaft `in -120.0 dBFS`.
+  dauerhaft `in -150.0 dBFS`.
 
 ## 3. Audio-MIDI-Setup: Zwei Varianten
 
@@ -140,9 +140,10 @@ input:  {device: "Rode+BlackHole", channel: 2}   # Rode-Mikrofon liegt hinter de
 output: {device: "Rode+BlackHole", channels: 2}  # die ersten 2 Ausgangskanäle sind BlackHole
 ```
 
-Alternativ ohne Änderung der YAML:
-`python -m voicechain run --input-device "Rode+BlackHole" --output-device "Rode+BlackHole"`
-(dann muss `input.channel` in der YAML trotzdem 2 sein). voicechain erkennt den gleichen Index
+Die Gerätenamen lassen sich auch beim Start übergeben:
+`python -m voicechain run --input-device "Rode+BlackHole" --output-device "Rode+BlackHole"`;
+`input.channel: 2` muss aber in jedem Fall in der YAML stehen, weil es dafür keine Option gibt.
+voicechain erkennt den gleichen Index
 für Ein- und Ausgang und öffnet einen einzigen Duplex-Stream auf dem Aggregat. Steht das Rode in
 der Liste oben, wäre `channel: 0` richtig und die BlackHole-Ausgänge lägen auf 2–3 – deshalb die
 Empfehlung, BlackHole nach oben zu ziehen.
@@ -242,8 +243,9 @@ Details zur Auswertung: `docs/03_Betrieb_und_Kalibrierung.md`.
 Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
 
 1. Rode anschließen, Kopfhörer einstecken, Terminal öffnen.
-2. `python -m voicechain selftest` – alle Zeilen „bestanden". Das prüft die Kette an
-   synthetischen Signalen und braucht kein Mikrofon.
+2. `python -m voicechain selftest` – in der Spalte „bestanden" steht überall „ja", die
+   Ergebniszeile sagt „BESTANDEN". Das prüft die Kette an synthetischen Signalen und braucht
+   kein Mikrofon.
 3. `python -m voicechain run --config config/chain.calibrated.yaml` starten. In der Statuszeile
    muss beim Sprechen `in` sichtbar ausschlagen (typisch −30 … −15 dBFS) und `out` um −20 … −6
    dBFS liegen; `xruns` und `nonfinite` bleiben 0, `adaptive on` (bzw. `FROZEN`, wenn
@@ -267,11 +269,11 @@ Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
 | Symptom | Ursache | Maßnahme |
 |---------|---------|----------|
 | `python -m voicechain devices` meldet „PortAudio is not available" | PortAudio-Bibliothek fehlt | `brew install portaudio`, danach `pip install --force-reinstall sounddevice` |
-| „BlackHole 2ch" fehlt in der Geräteliste | Treiber noch nicht geladen oder nicht erlaubt | Ab- und wieder anmelden bzw. Neustart; Systemeinstellungen → Datenschutz & Sicherheit → Treiber erlauben; `brew reinstall blackhole-2ch` |
+| „BlackHole 2ch" fehlt in der Geräteliste | HAL-Plug-in noch nicht geladen (Installation wurde nicht abgeschlossen oder keine Neuanmeldung) | Prüfen, ob die Installation das Mac-Passwort bekommen hat; ab- und wieder anmelden bzw. Neustart, danach ist das Gerät in Audio-MIDI-Setup sichtbar; sonst `brew reinstall blackhole-2ch`. Ein Sicherheitsdialog ist nicht nötig |
 | „RØDE NT-USB" fehlt | USB-Kabel/Hub, Mikrofon nicht erkannt | Direkt am Mac anschließen (kein passiver Hub), Kabel tauschen, Systeminformationen → USB prüfen |
 | `run` meldet „No input device matches …" | Name in YAML passt nicht | `python -m voicechain devices` aufrufen, Namensteil oder Index übernehmen (`--input-device 3`) |
 | `run` meldet „2 input devices match …" | Mehrere Geräte enthalten den Teilstring (z. B. Aggregat und Einzelgerät) | Längeren Namen oder Index verwenden |
-| Statuszeile zeigt dauerhaft `in -120.0 dBFS` | Keine Mikrofonberechtigung für das Terminal, oder falscher Eingangskanal | Systemeinstellungen → Datenschutz & Sicherheit → Mikrofon → Terminal erlauben; bei Aggregat `input.channel` prüfen (Abschnitt 3, Variante B) |
+| Statuszeile zeigt dauerhaft `in -150.0 dBFS` | Keine Mikrofonberechtigung für das Terminal, oder falscher Eingangskanal | Systemeinstellungen → Datenschutz & Sicherheit → Mikrofon → Terminal erlauben; bei Aggregat `input.channel` prüfen (Abschnitt 3, Variante B) |
 | In Zoom/Teams kommt Stille an | voicechain läuft nicht, oder Mikrofon in Zoom/Teams ist nicht BlackHole | Prozess starten; Mikrofonauswahl prüfen; in macOS Systemeinstellungen → Ton darf BlackHole **nicht** als Standardausgabe gewählt sein (sonst landet Systemton im Meeting) |
 | `xruns` zählt hoch, Knackser, Aussetzer (Dropouts) | Blockgröße zu klein, Samplerate-Mismatch, CPU-Last, Energiesparmodus | `block_size: 512` in der YAML; beide Geräte auf 48 kHz; Variante B (Aggregate mit Drift-Korrektur) nutzen; Browser-Tabs/Video schließen; Netzteil anschließen |
 | Ton klingt „unter Wasser", stark verzerrt oder zu tief/hoch | Samplerate der Geräte ≠ 48 kHz (CoreAudio resampelt oder Takt stimmt nicht) | In Audio-MIDI-Setup Rode und BlackHole auf 48.000 Hz; `run` neu starten |

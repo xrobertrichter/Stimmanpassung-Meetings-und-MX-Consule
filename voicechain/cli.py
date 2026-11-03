@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from voicechain.calibrate import TRUE_PEAK_TOLERANCE_DB  # one tolerance for calibrate, selftest and tests
 from voicechain.runtime import (
     AudioBackendError,
     DeviceNotFoundError,
@@ -67,7 +68,6 @@ SELFTEST_SEED = 20261102  # fixed seed: the self-test must be reproducible
 # quiet recording as a whole; the absolute values are reported alongside.
 # The remaining criteria below come from section 4.3 (runtime behaviour of the chain).
 SPEECH_ABOVE_FLOOR_MIN_DB = 6.0  # speech must stay clearly measurable above the floor after processing
-TRUE_PEAK_TOLERANCE_DB = 0.1  # inter-sample measurement vs. sample-domain limiter action
 COMPUTE_BUDGET_MS = 1.0  # "48 kHz Block 256 muss in < 1 ms rechnen"
 COMPUTE_BUDGET_BLOCK = 256  # block size the budget refers to
 SILENCE_LIMIT_DBFS = -100.0  # "Stille rein -> Stille raus": anything below is numerically silent
@@ -96,6 +96,7 @@ SELFTEST_ROWS = (
 # A block containing NaN must be counted, muted and must not poison the chain:
 # after this many clean silent blocks the output has to be silent again.
 NAN_RECOVERY_BLOCKS = 200  # ~1 s at 256/48 kHz, longer than every release time
+NAN_PROBE_CLEAN_BLOCKS = 200  # ~1 s of clean speech before the NaN block: enough to prove "0"
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -113,11 +114,25 @@ def resolve_input_path(path_str: str) -> Path:
     return repo_candidate
 
 
-def resolve_output_path(path_str: str) -> Path:
-    """Resolve an output path (absolute as-is, else repo root) and create its directory."""
+def resolve_output_path(path_str: str, suffixes: tuple[str, ...] = (".wav",)) -> Path:
+    """Resolve an output path (absolute as-is, else repo root) and create its directory.
+
+    The target must be a file name with one of ``suffixes`` (libsndfile and the
+    YAML/Markdown writers derive the format from the extension and otherwise fail
+    with messages that do not name the cause), and it must not be an existing
+    directory.
+    """
     path = Path(path_str).expanduser()
     if not path.is_absolute():
         path = REPO_ROOT / path
+    if path.is_dir():
+        raise IsADirectoryError("{} is a directory; give a file name ending in {}".format(path, " or ".join(suffixes)))
+    if path.suffix.lower() not in suffixes:
+        raise ValueError(
+            "{}: output file name must end in {} (got {!r})".format(
+                path, " or ".join(suffixes), path.suffix or "no extension"
+            )
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -152,22 +167,6 @@ def read_input_wav(path: Path, expected_sr: int) -> np.ndarray:
         raise IsADirectoryError("{} is a directory, not a WAV file".format(path))
     mono, _ = read_mono_wav(str(path), expected_sr=expected_sr, channel=None)
     return mono
-
-
-def process_blockwise(chain, x: np.ndarray, block_size: int) -> np.ndarray:
-    """Feed ``x`` through ``chain`` in blocks of ``block_size``; output has the same length."""
-    n = int(x.shape[0])
-    out = np.zeros(n, dtype=np.float32)
-    for start in range(0, n, block_size):
-        stop = min(start + block_size, n)
-        if stop - start == block_size:
-            block = x[start:stop]
-        else:
-            block = np.zeros(block_size, dtype=np.float32)
-            block[: stop - start] = x[start:stop]
-        y = np.asarray(chain.process(block), dtype=np.float32)
-        out[start:stop] = y[: stop - start]
-    return out
 
 
 def basic_measurements(x: np.ndarray, sample_rate: int) -> dict:
@@ -230,9 +229,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         log_path = adaptive_cfg.get("log_path")
         if log_path:
-            log_path = str(resolve_output_path(str(log_path)))
+            log_path = str(resolve_output_path(str(log_path), suffixes=(".jsonl", ".log", ".txt")))
         controller = AdaptiveController(cfg, chain, log_path=log_path)
-        analyzer = LiveAnalyzer(int(cfg["sample_rate"]))
+        deesser_cfg = cfg["chain"]["deesser"]
+        analyzer = LiveAnalyzer(
+            int(cfg["sample_rate"]),
+            deesser_freq_hz=float(deesser_cfg["freq_hz"]),
+            deesser_bandwidth_oct=float(deesser_cfg["bandwidth_oct"]),
+        )
         if args.freeze:
             controller.freeze(True)
     engine = LiveEngine(
@@ -273,9 +277,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     from voicechain.runtime import RECORD_CLIP_WARN_DBFS, record_wav
 
     cfg, _ = _load_config(args.config)
-    out_path = resolve_output_path(args.out)
-    if args.seconds <= 0:
-        raise ValueError("--seconds must be > 0")
+    out_path = resolve_output_path(args.out)  # --seconds was already validated by argparse
     print(RECORD_INSTRUCTIONS, file=sys.stderr)
     print(
         "recording {:.0f} s at {} Hz mono from {!r} -> {} (Ctrl-C stops early and keeps the recording)".format(
@@ -318,13 +320,15 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     from voicechain.calibrate import run_calibration
 
     wav_path = resolve_input_path(args.wav)
+    if wav_path.is_dir():
+        raise IsADirectoryError("{} is a directory, expected a WAV file".format(wav_path))
     if not wav_path.exists():
         raise FileNotFoundError("WAV file not found: {}".format(wav_path))
     base_cfg_path = _config_path(args.config)
     if not base_cfg_path.exists():
         raise FileNotFoundError("configuration file not found: {}".format(base_cfg_path))
-    out_cfg_path = resolve_output_path(args.out or str(DEFAULT_CALIBRATED_CONFIG))
-    report_path = resolve_output_path(args.report or str(DEFAULT_CALIBRATION_REPORT))
+    out_cfg_path = resolve_output_path(args.out or str(DEFAULT_CALIBRATED_CONFIG), suffixes=(".yaml", ".yml"))
+    report_path = resolve_output_path(args.report or str(DEFAULT_CALIBRATION_REPORT), suffixes=(".md", ".txt"))
 
     result = run_calibration(str(wav_path), str(base_cfg_path), str(out_cfg_path), str(report_path))
     for warning in result.get("warnings", []):
@@ -344,18 +348,17 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
 
 def cmd_process(args: argparse.Namespace) -> int:
-    from voicechain.dsp.chain import Chain
+    from voicechain.calibrate import process_with_chain
 
     cfg, _ = _load_config(args.config)
     in_path = resolve_input_path(args.infile)
     out_path = resolve_output_path(args.outfile)
     rate = int(cfg["sample_rate"])
     x = read_input_wav(in_path, rate)
-    chain = Chain.from_config(cfg)
     block_size = int(cfg["block_size"])
 
     t0 = time.perf_counter()
-    y = process_blockwise(chain, x, block_size)
+    y = process_with_chain(x, cfg)  # same block handling as calibrate
     elapsed = time.perf_counter() - t0
 
     import soundfile as sf
@@ -438,12 +441,11 @@ def run_selftest(cfg: dict) -> list[dict]:
     # (section 6.3 is formulated for the calibrated chain). ``cfg`` supplies the
     # base: bounds, enabled flags, EQ, normalizer and limiter settings. The
     # section 6.3 criteria are then judged by ``calibrate.evaluate`` itself.
-    from voicechain.calibrate import analyze, evaluate, recommend
+    from voicechain.calibrate import analyze, evaluate, process_with_chain, recommend
 
     x = _selftest_speech_signal(sample_rate)
     fitted_cfg = recommend(analyze(x, sample_rate), cfg)
-    chain = Chain.from_config(fitted_cfg)
-    y = process_blockwise(chain, x, block_size)
+    y = process_with_chain(x, fitted_cfg)
     evaluation = evaluate(x, y, sample_rate, fitted_cfg)
     before = evaluation["before"]
     after = evaluation["after"]
@@ -490,11 +492,20 @@ def run_selftest(cfg: dict) -> list[dict]:
         "{} (vorher {:.2f} dBTP)".format(true_peak["actual"], before["true_peak_dbtp"]),
         true_peak["passed"],
     )
-    nonfinite_speech = int(chain.get_meters()["input"]["nonfinite_blocks"])
-    add(SELFTEST_ROWS[6], "0", str(nonfinite_speech), nonfinite_speech == 0)
-
-    # --- one NaN block must be counted and muted, the chain must recover -----------
+    # --- non-finite counter: clean speech must not count, one NaN block must ------
+    # The same chain first sees NAN_PROBE_CLEAN_BLOCKS blocks of the speech signal
+    # (counter must stay 0), then one NaN block (counter 1, output muted), then
+    # silence (it must recover).
     chain_nan = Chain.from_config(cfg)
+    for start in range(0, NAN_PROBE_CLEAN_BLOCKS * block_size, block_size):
+        chain_nan.process(x[start : start + block_size])
+    nonfinite_speech = int(chain_nan.get_meters()["input"]["nonfinite_blocks"])
+    add(
+        SELFTEST_ROWS[6],
+        "0 nach {} Bloecken".format(NAN_PROBE_CLEAN_BLOCKS),
+        str(nonfinite_speech),
+        nonfinite_speech == 0 and bool(np.all(np.isfinite(x))),
+    )
     nan_block = np.full(block_size, np.nan, dtype=np.float32)
     y_nan = np.asarray(chain_nan.process(nan_block), dtype=np.float32)
     silent_block = np.zeros(block_size, dtype=np.float32)
@@ -537,8 +548,7 @@ def run_selftest(cfg: dict) -> list[dict]:
     n_sine = int(SINE_DURATION_S * sample_rate)
     t = np.arange(n_sine, dtype=np.float64) / sample_rate
     sine = (10.0 ** (SINE_LEVEL_DBFS / 20.0) * np.sin(2.0 * math.pi * SINE_FREQ_HZ * t)).astype(np.float32)
-    chain_sine = Chain.from_config(cfg)
-    y_sine = process_blockwise(chain_sine, sine, block_size)
+    y_sine = process_with_chain(sine, cfg)
     tp_sine = float(m.true_peak_dbfs(y_sine, sample_rate))
     add(
         SELFTEST_ROWS[9],
@@ -553,8 +563,7 @@ def run_selftest(cfg: dict) -> list[dict]:
     period = int(IMPULSE_PERIOD_S * sample_rate)
     for k in range(IMPULSE_COUNT):
         impulses[k * period + period // 2] = 1.0
-    chain_imp = Chain.from_config(cfg)
-    y_imp = process_blockwise(chain_imp, impulses, block_size)
+    y_imp = process_with_chain(impulses, cfg)
     tp_imp = float(m.true_peak_dbfs(y_imp, sample_rate))
     add(
         SELFTEST_ROWS[10],
@@ -565,8 +574,7 @@ def run_selftest(cfg: dict) -> list[dict]:
 
     # --- silence in -> silence out ---------------------------------------------------
     silence = np.zeros(int(SILENCE_DURATION_S * sample_rate), dtype=np.float32)
-    chain_sil = Chain.from_config(cfg)
-    y_sil = process_blockwise(chain_sil, silence, block_size)
+    y_sil = process_with_chain(silence, cfg)
     finite = bool(np.all(np.isfinite(y_sil)))
     peak = float(np.max(np.abs(y_sil))) if finite else float("inf")
     peak_dbfs = 20.0 * math.log10(peak) if peak > 0.0 else -float("inf")
@@ -622,7 +630,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     table = format_selftest_table(rows, cfg_path)
     print(table)
     if args.report:
-        report_path = resolve_output_path(args.report)
+        report_path = resolve_output_path(args.report, suffixes=(".md", ".txt"))
         report_path.write_text(table + "\n", encoding="utf-8")
         print("report written: {}".format(report_path))
     return EXIT_OK if all(r["passed"] for r in rows) else EXIT_FAILED
@@ -638,6 +646,17 @@ def cmd_make_sample(args: argparse.Namespace) -> int:
 
 
 # ------------------------------------------------------------------------------ parser
+def positive_seconds(text: str) -> float:
+    """argparse type for --seconds: a finite number > 0, rejected before anything is created."""
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--seconds must be a number, got {!r}".format(text)) from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("--seconds must be > 0, got {}".format(text))
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m voicechain",
@@ -660,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rec = sub.add_parser("record", help="record a calibration sample (raw microphone, 48 kHz mono, 24-bit WAV)")
     p_rec.add_argument("--out", required=True, help="output WAV path")
-    p_rec.add_argument("--seconds", type=float, default=60.0, help="recording length in seconds (default 60)")
+    p_rec.add_argument("--seconds", type=positive_seconds, default=60.0, help="recording length in seconds (default 60)")
     p_rec.add_argument("--input-device", help="input device name substring or index (overrides config)")
     p_rec.add_argument("--config", help="YAML configuration (default: config/chain.default.yaml)")
     p_rec.set_defaults(func=cmd_record)
@@ -717,6 +736,15 @@ def main(argv: list[str] | None = None) -> int:
         # soundfile.LibsndfileError (unreadable audio file) or a failed audio callback.
         print("error: {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
         return EXIT_ERROR
+    except Exception as exc:
+        # sounddevice.PortAudioError derives directly from Exception; report it like
+        # the other backend errors, let anything unexpected surface as a traceback.
+        sd = sys.modules.get("sounddevice")
+        portaudio_error = getattr(sd, "PortAudioError", None) if sd is not None else None
+        if portaudio_error is not None and isinstance(exc, portaudio_error):
+            print("error: PortAudio: {}".format(exc), file=sys.stderr)
+            return EXIT_ERROR
+        raise
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return EXIT_ERROR
