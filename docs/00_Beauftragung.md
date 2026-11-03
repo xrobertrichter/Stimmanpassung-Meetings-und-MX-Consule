@@ -56,7 +56,12 @@ in der Dokumentation nur als Option erwähnt.
 
 - `calibrate`: Nutzer spielt ein Sprachsample (WAV, 30–120 s, Sprache mit Pausen) ein. Das Skript
   misst Rauschteppich, Sprachpegel, Zischanteil, spektrale Neigung, Spitzen und leitet daraus
-  **alle** Parameter ab (mit Grenzen). Es schreibt eine neue YAML und einen Bericht
+  **alle signalabhängigen** Parameter ab (mit Grenzen): Input Trim, Expander-Schwelle,
+  De-Esser-Frequenz und -Schwelle, EQ-Gains, Kompressor-Schwelle und Makeup, Normalizer-Gate
+  und -Maximalgewinn. Zeitkonstanten, Ratios, Knie, Filterordnung und Limiter-Ceiling sind
+  Designkonstanten und bleiben fest; ihre Begründung steht in docs/02.
+  _Präzisierung 2026-11-03 (Blindprüfung Runde 2, BL-2): „alle Parameter" war wörtlich nicht
+  sinnvoll, da Zeitkonstanten nicht aus einem Sample ableitbar sind._ Es schreibt eine neue YAML und einen Bericht
   (Messwerte vorher/nachher, Akzeptanzkriterien bestanden/nicht bestanden).
 - Adaptive Regelung (`adaptive.py`): im Live-Betrieb werden Meter alle N Sekunden ausgewertet;
   Parameter werden langsam, in kleinen Schritten, mit Hysterese und innerhalb harter Grenzen
@@ -195,14 +200,18 @@ class AdaptiveController:
 2. `python -m voicechain selftest` gibt einen Bericht mit messbaren Prüfwerten aus, alle bestanden.
 3. `python -m voicechain calibrate --wav <sample>` erzeugt YAML + Bericht; die Kette verbessert das
    Sample messbar: Störabstandsgewinn (Sprachpegel minus Rauschteppich, nachher minus vorher)
-   ≥ 6 dB **und** Pausenlautheit nach der Kette ≤ Ziel-Lautheit − 20 LU (gemessen in einer
-   Pause ≥ 5 s), Zischanteil ↓, Lautheit innerhalb Ziel ± 2 LU, True Peak ≤ Ceiling.
-   Das Sample muss mindestens eine Pause ≥ 5 s enthalten.
+   ≥ 6 dB **und** Pausenlautheit nach der Kette ≤ Ziel-Lautheit − 20 LU (Mindestabstand; im
+   ruhigen Raum werden ca. 30 LU erreicht), gemessen in einer Sprechpause ≥ 5 s **nach** dem
+   ersten Satz (Vorlaufstille zählt nicht), Zischanteil ↓, Lautheit innerhalb Ziel ± 2 LU,
+   True Peak ≤ Ceiling. Das Sample muss mindestens eine solche Pause enthalten.
    _Änderung 2026-11-03 (Blindprüfung BL-1, PO-8): ursprünglich "Rauschteppich ↓ ≥ 6 dB"
    absolut; ein absoluter Wert ist bei Lautheitsnormalisierung nicht sinnvoll, daher relativ
    plus absolute Pausenobergrenze._
 4. Adaptive Regelung: in Simulation konvergiert sie innerhalb der Grenzen, oszilliert nicht,
-   greift in der Lernphase nicht ein, protokolliert jede Änderung mit Grund.
+   greift in der Lernphase nicht ein, protokolliert jede Änderung mit Grund. **Raumänderung im
+   Betrieb:** Wird der Rauschteppich nach der Kalibrierung um 8–12 dB lauter (Lüfter, Fenster),
+   darf die Pausenlautheit nach der Kette die Sprachlautheit − 15 LU nicht überschreiten und der
+   nächste Satz nicht lauter als +1,5 dB einsetzen (Ergänzung 2026-11-03, PO Runde 2).
 5. Dokumentation ermöglicht einer technisch versierten Person ohne Audio-Vorwissen die
    Einrichtung auf dem Mac in unter 30 Minuten.
 6. Die Reihenfolge der Kette entspricht dem Ausgangsbild.

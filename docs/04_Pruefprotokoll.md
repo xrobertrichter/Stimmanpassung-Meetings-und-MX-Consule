@@ -82,8 +82,41 @@ Ausgang ≤ Eingang − 6 dB“ ist bei gleichzeitiger Anhebung der Sprache um 8
 geprüft wird stattdessen Störabstandsgewinn ≥ 6 dB und Pausenlautheit ≤ Ziel − 20 LU (§6.3 neu).
 Zur Bestätigung an den PO in Runde 2.
 
-## Prüfung der Nacharbeit (Runde 2)
-_wird nach Abschluss ergänzt_
+## Prüfung der Nacharbeit (Runde 2, 2026-11-03)
+
+Berichte: `docs/pruefungen/04_product_owner_runde2.md`, `05_software_runde2.md`, `06_blind_runde2.md`.
+
+| Prüfung | Urteil | Status Runde-1-Befunde | neu hoch | neu mittel | neu niedrig |
+|---------|--------|------------------------|----------|------------|-------------|
+| Product Owner | abnehmbar mit Auflagen | PO-1…PO-3 per Simulation bestätigt; 12 behoben, 2 teilweise (Doku) | 1 | 1 | 6 |
+| Software | abnehmbar mit Auflagen | 14 behoben, 2 teilweise; Mutationen 18/18 gefangen (vorher 15/18) | 0 | 3 | 5 |
+| Blind | abnehmbar mit Auflagen | alle §6-Kriterien eigenständig bestätigt | 0 | 2 | 9 |
+
+### Entscheidungen Projektleitung für Runde 3
+
+| Nr | Schwere | Befund (Kurzform) | Entscheidung | Zuordnung |
+|----|---------|-------------------|--------------|-----------|
+| PO-15 | hoch | Raum wird nach Kalibrierung lauter: Gate/Max-Gain nicht nachgeführt, relatives Gate kollabiert, Pause auf Sprachlautheit | Normalizer erhält internen Teppich-Schätzer (Minimum-Statistik auf Momentary-Lautheit); wirksames Gate = max(gate_lufs, Teppich + 8 LU); Gain-Deckel so, dass Teppich + Gain ≤ Ziel − 15 LU; Test nach §6.4 neu | DSP |
+| SW-17 | mittel | Relative Gate-Referenz kann nie sinken; leiser werdender Sprecher bleibt eingefroren | Referenz klingt bei nur relativ gesperrten Intervallen langsam ab (z. B. 1 LU/s); Test Sprung −20 dB | DSP |
+| SW-20 | niedrig | NaN-Reset wirft Normalizer-Gain weg (15 s Erholung) | Gain und Lernzustand beim Reset behalten | DSP |
+| SW-15 Rest | niedrig | Budget-Test 1,07 ms ohne Median | Median < 1 ms, p99 < 2 ms | DSP |
+| PO-17 | niedrig | Bounds-Obergrenze De-Esser −15 klemmt | Obergrenze −10 dBFS in YAML und docs | DSP |
+| BL-4 | niedrig | HPF-Ordnungswechsel nicht knackfrei | Dokumentieren wie lookahead_ms; nicht im adaptiven Pfad | DSP |
+| BL-7 | niedrig | Regelung setzt normalizer.max_gain_db ohne Bounds-Eintrag | Bounds-Eintrag in YAML, docs/02 korrigieren | DSP, KAL |
+| PO-16 | mittel | Ohne Zischproblem bleibt Standardschwelle −30 → De-Esser greift auf fast jedem Laut | Ruheschwelle = Bandspitze p95 + 2 dB, auch als rest-Wert | KAL |
+| SW-19 | mittel | Vorlaufstille zählt als Pause für das Pausenkriterium | Rückfall entfernen, nur Pause nach erstem Satz; Fehlermeldung mit Hinweis | KAL |
+| PO-19 / BL-1 | niedrig/mittel | speech_cut-Fehlalarm an Intervallgrenzen und über Lernphase akkumuliert | Akkumulator am Ende der Lernphase leeren; Regel nur, wenn Intervall vollständig sprachaktiv war und das Maximum nicht in den ersten 200 ms liegt oder zwei Intervalle in Folge; Test mit Pausenende im Intervall | KAL |
+| PO-20 | niedrig | Bei implausiblem Pegel entfällt Kappe Sprache − 12 | Kappe bleibt aktiv, solange überhaupt Sprache erkannt ist | KAL |
+| PO-18 | niedrig | High-Shelf nach Kalibrierung stets am Limit −4 dB | Messband 7–14 kHz nur auf nicht-zischenden Rahmen, Begrenzung −3 dB | KAL |
+| PO-21 | niedrig | Zweiter Kalibrierdurchlauf im Grenzfall max_gain 0 | Erster Durchlauf mit Normalizer deaktiviert messen | KAL |
+| SW-23 | niedrig | Dubletten: dB-Boden in runtime, zwei Blockverarbeitungen, True-Peak-Toleranz, Bandspitze offline/streaming | KAL exportiert Toleranz und eine Bandspitzen-Funktion; INT nutzt DB_FLOOR_DBFS und calibrate.process_with_chain | KAL, INT |
+| BL-2 | mittel | „alle Parameter" nicht wörtlich erfüllt | Beauftragung §3.2 präzisiert (signalabhängige Parameter), keine Codeänderung | PL (erledigt) |
+| BL-3 | niedrig | update() braucht „analysis"-Schlüssel, nicht in §4.2 | §4.2 im Code-Docstring und docs/03 ist maßgeblich; Vertrag ergänzt durch Verweis | KAL (docs/03) |
+| BL-5 | niedrig | Kein Pump-Detektor | Nicht umgesetzt; als bekannte Grenze in docs/03 §11 dokumentieren | KAL |
+| SW-18 | mittel | CLI übergibt kalibriertes De-Esser-Band nicht an LiveAnalyzer | Übergeben, Test | INT |
+| SW-21 / SW-22 / SW-24 | niedrig | record: PortAudioError nicht gefangen, Verzeichnis vor Prüfung angelegt; Stream-Leak bei Startfehler; CLI-Meldungen ohne Kontext | Beheben, Tests | INT |
+| PO-22 / PO-10 Rest / BL-6 / BL-8 / BL-9 | niedrig | Doku-Reste (docs/01:270 Treiber-Dialog, SIGUSR1 in docs/03, „bestanden" vs. „ja", −6/−3 dBFS, Ratio-Bereich, Python-Beschaffung im README, interne Prüfnummern in Code-Kommentaren) | Bereinigen; Prüfnummern in Kommentaren durch fachliche Begründung ersetzen | INT, KAL, DSP |
+| §6.3/§6.4 | — | PO-Klarstellungen (20 LU Mindestwert, Raumänderung im Betrieb) | Beauftragung ergänzt | PL (erledigt) |
 
 ## Abschlussreview
 _wird nach Abschluss ergänzt_
