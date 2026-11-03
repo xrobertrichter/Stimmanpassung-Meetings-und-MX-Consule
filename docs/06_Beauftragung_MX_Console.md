@@ -78,7 +78,7 @@ Pausen im Lüfterraum für ~1 min lauter; Lautheits-Obergrenze −14 LUFS reicht
   Grenzen, Reset, Freeze, Relearn, Snapshot, Marker, Status. `hooks` = {"mute": fn(bool), "bypass": fn(bool)}
   für Funktionen, die außerhalb der Regelung liegen.
 - `voicechain/control.py` (INT): Steuerkanal als Unix-Domain-Socket (Pfad `cfg.control.socket_path`,
-  Default `logs/control.sock`), JSON-Zeilen-Protokoll, Server im Service-Thread der Runtime
+  Default `/tmp/voicechain-<user>.sock` (geändert nach SW2-2: macOS-Limit 103 Byte für Socketpfade)), JSON-Zeilen-Protokoll, Server im Service-Thread der Runtime
   (nicht blockierend, `selectors`), Client-Funktion `send_command(cmd, socket_path, timeout)`.
 - CLI `python -m voicechain ctl <kommando> [--value X] [--text ...] [--notify] [--socket PFAD]`
   (INT): Kommandos siehe §4; `--notify` zeigt die Antwort als macOS-Mitteilung (osascript), Exit 0/1/2.
