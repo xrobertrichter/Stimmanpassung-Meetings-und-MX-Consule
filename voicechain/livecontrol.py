@@ -22,8 +22,12 @@ Every command is answered with a dict (docs/06 section 4): ``{"ok": True,
 the audio stream and must not take it down.
 
 ``state`` keys: offsets (dict of the five offsets), target_lufs, frozen, muted,
-bypass, low_snr, snr_lu, loudness_lufs, adaptive_enabled, learning, tilt_db,
-expander_threshold_db, deesser_threshold_db, compressor_threshold_db.
+bypass, processing, low_snr, snr_lu, loudness_lufs, adaptive_enabled, learning,
+tilt_db, expander_threshold_db, deesser_threshold_db, compressor_threshold_db.
+
+Hooks (all ``fn(bool)``, provided by the runtime): ``mute`` (30 ms output fade),
+``bypass`` (``Chain.set_bypass``), ``processing`` (kill switch:
+``Chain.set_processing`` plus pausing analyzer and regulation).
 """
 from __future__ import annotations
 
@@ -69,6 +73,7 @@ COMMANDS: dict[str, set[str]] = {
     "snapshot": {"path"},
     "marker": {"text"},
     "status": set(),
+    "processing": {"on"},
 }
 
 OFFSET_LABELS = {
@@ -113,6 +118,11 @@ class LiveControl:
         self.offsets: dict[str, float] = {name: 0.0 for name in OFFSETS}
         self.muted = False
         self.bypass = False
+        #: Kill switch state (hook "processing"): False = only input trim and limiter run.
+        self.processing = True
+        #: Freeze state of the controller before the kill switch turned processing off,
+        #: restored when it is turned on again (None = processing is on).
+        self._frozen_before_off: bool | None = None
 
     # ------------------------------------------------------------------ public
     def handle(self, cmd: dict) -> dict:
@@ -133,6 +143,7 @@ class LiveControl:
             "frozen": bool(controller.frozen) if controller is not None else False,
             "muted": self.muted,
             "bypass": self.bypass,
+            "processing": self.processing,
             "low_snr": bool(norm.get("low_snr", 0.0)),
             "snr_lu": self._float_or_none(norm.get("snr_lu")),
             "loudness_lufs": self._float_or_none(norm.get("loudness_lufs")),
@@ -214,6 +225,8 @@ class LiveControl:
                 "intensity": f"Intensität {int(value):+d} ({'dichter' if value > 0 else 'natürlicher' if value < 0 else 'neutral'}, "
                              f"Kompressor {_fmt(self.chain.get_param('compressor', 'threshold_db'), 'dBFS', signed=False)})",
             }[name]
+        if not self.processing:
+            text += " – Verarbeitung AUS: wirkt beim Einschalten"
         return self._ok(text)
 
     def _loudness_target(self) -> float:
@@ -247,7 +260,46 @@ class LiveControl:
         if self.controller is not None:
             self.controller.set_user_offsets(offsets)
 
+    def _cmd_processing(self, cmd: dict) -> dict:
+        on = self._resolve_toggle(cmd.get("on"), self.processing)
+        self._set_processing(on)
+        if on:
+            return self._ok("Verarbeitung AN: Kette aktiv" + self._restored_hint())
+        return self._ok("Verarbeitung AUS (nur Trim + Limiter, Prozessorlast gesenkt)")
+
+    def _set_processing(self, on: bool) -> None:
+        """Kill switch: hook first (the runtime switches the chain and pauses analyzer and
+        regulation); with a controller its freeze state is parked while off and restored
+        when on again - without a new learning phase, the calibrated values stay."""
+        if on == self.processing:
+            self._call_hook("processing", on, required=True)
+            return
+        if not on:
+            if self.controller is not None:
+                self._frozen_before_off = bool(self.controller.frozen)
+                self.controller.freeze(True)
+            self._call_hook("processing", False, required=True)
+            return
+        self._call_hook("processing", True, required=True)
+        # Offsets taken while off are stored in the chain parameters already; re-send
+        # the absolute ones so a stage reset on power-up cannot have dropped them.
+        self.chain.set_param("normalizer", "target_lufs", self._loudness_target())
+        if self._tilt_or_none() is not None:
+            self.chain.set_param("eq", "tilt_db", clamp(self.base["tilt_db"] + self.offsets["tone_db"], *TILT_BOUNDS_DB))
+        if self.controller is not None:
+            self.controller.set_user_offsets(self.threshold_offsets())
+            if self._frozen_before_off is not None:
+                self.controller.freeze(self._frozen_before_off)
+        self._frozen_before_off = None
+
+    def _restored_hint(self) -> str:
+        if self.controller is None:
+            return ""
+        return ", Regelung eingefroren (FROZEN)" if self.controller.frozen else ", Regelung läuft weiter"
+
     def _cmd_reset(self, cmd: dict) -> dict:
+        if not self.processing:
+            self._set_processing(True)
         self.offsets = {name: 0.0 for name in OFFSETS}
         self._applied_threshold_offsets = {k: 0.0 for k in self.threshold_offsets()}
         self.chain.set_param("normalizer", "target_lufs", self.base["target_lufs"])
@@ -267,6 +319,13 @@ class LiveControl:
     def _cmd_freeze(self, cmd: dict) -> dict:
         if self.controller is None:
             return self._error("Adaptive Regelung ist nicht aktiv; Freeze hat keine Wirkung")
+        if not self.processing:
+            # While the kill switch is off the controller stays frozen; the wish is
+            # remembered and becomes the state restored on power-up.
+            on = self._resolve_toggle(cmd.get("on"), bool(self._frozen_before_off))
+            self._frozen_before_off = on
+            return self._ok(("Regelung eingefroren (FROZEN)" if on else "Regelung läuft weiter")
+                            + " – Verarbeitung AUS: wirkt beim Einschalten")
         on = self._resolve_toggle(cmd.get("on"), self.controller.frozen)
         self.controller.freeze(on)
         return self._ok("Regelung eingefroren (FROZEN)" if on else "Regelung läuft weiter")
@@ -343,8 +402,8 @@ class LiveControl:
             + (" SNR-LOW" if st["low_snr"] else ""),
             "Offsets: " + (", ".join(active) if active else "keine"),
         ]
-        flags = [f for f, on in (("FROZEN", st["frozen"]), ("MUTE", st["muted"]), ("BYPASS", st["bypass"]),
-                                 ("LERNPHASE", st["learning"])) if on]
+        flags = [f for f, on in (("OFF", not st["processing"]), ("FROZEN", st["frozen"]), ("MUTE", st["muted"]),
+                                 ("BYPASS", st["bypass"]), ("LERNPHASE", st["learning"])) if on]
         if flags:
             parts.append(" ".join(flags))
         if not st["adaptive_enabled"]:
@@ -371,6 +430,8 @@ class LiveControl:
             self.muted = bool(on)
         elif name == "bypass":
             self.bypass = bool(on)
+        elif name == "processing":
+            self.processing = bool(on)
 
     def _tilt_or_none(self) -> float | None:
         try:

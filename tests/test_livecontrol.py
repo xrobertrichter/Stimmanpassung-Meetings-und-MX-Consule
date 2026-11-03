@@ -14,9 +14,9 @@ from voicechain.livecontrol import (
 from test_adaptive import FakeChain, LEARN_S, INTERVAL_S, STEP_DB, meters_dict, events
 
 SR = 48000
-STATE_KEYS = {"offsets", "target_lufs", "frozen", "muted", "bypass", "low_snr", "snr_lu", "loudness_lufs",
-              "adaptive_enabled", "learning", "tilt_db", "expander_threshold_db", "deesser_threshold_db",
-              "compressor_threshold_db"}
+STATE_KEYS = {"offsets", "target_lufs", "frozen", "muted", "bypass", "processing", "low_snr", "snr_lu",
+              "loudness_lufs", "adaptive_enabled", "learning", "tilt_db", "expander_threshold_db",
+              "deesser_threshold_db", "compressor_threshold_db"}
 
 
 @pytest.fixture(scope="module")
@@ -30,7 +30,8 @@ class HookLog:
 
     def hooks(self):
         return {"mute": lambda on: self.calls.append(("mute", on)),
-                "bypass": lambda on: self.calls.append(("bypass", on))}
+                "bypass": lambda on: self.calls.append(("bypass", on)),
+                "processing": lambda on: self.calls.append(("processing", on))}
 
 
 def fake_setup(with_controller=True, hooks=True, log_path=None):
@@ -248,6 +249,96 @@ def test_relearn_restarts_the_learning_phase_and_keeps_offsets():
     assert la.snapshot()["frames"] == 0
     assert ctrl.update(meters_dict(floor=-70.0), now=41.0) == []            # learning again
     assert len(ctrl.update(meters_dict(floor=-70.0), now=40.0 + LEARN_S)) >= 1
+
+
+def test_processing_kill_switch_toggle_on_off_hook_and_state():
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    assert lc.state()["processing"] is True
+    r = lc.handle({"cmd": "processing"})                       # missing on = toggle -> off
+    assert r["ok"] and r["state"]["processing"] is False
+    assert "Verarbeitung AUS" in r["message"] and "Prozessorlast" in r["message"]
+    assert hl.calls[-1] == ("processing", False)
+    assert "OFF" in lc.handle({"cmd": "status"})["message"]
+    r = lc.handle({"cmd": "processing", "on": "toggle"})
+    assert r["state"]["processing"] is True and "Verarbeitung AN" in r["message"]
+    assert hl.calls[-1] == ("processing", True)
+    assert lc.handle({"cmd": "processing", "on": False})["state"]["processing"] is False
+    assert lc.handle({"cmd": "processing", "on": True})["state"]["processing"] is True
+    assert lc.handle({"cmd": "processing", "on": "maybe"})["ok"] is False
+    # Without the hook the command is refused and the state stays.
+    cfg, chain, ctrl, lc, hl = fake_setup(hooks=False)
+    r = lc.handle({"cmd": "processing", "on": False})
+    assert r["ok"] is False and "processing" in r["error"]
+    assert lc.state()["processing"] is True
+
+
+def test_processing_off_parks_the_freeze_state_and_restores_it_without_relearn():
+    for frozen_before in (False, True):
+        cfg, chain, ctrl, lc, hl = fake_setup()
+        for k in range(16):
+            ctrl.update(meters_dict(floor=-60.0), now=k * INTERVAL_S)        # learning phase over at 30 s
+        ctrl.clock = lambda: 32.0
+        t_start = ctrl._t_start
+        if frozen_before:
+            lc.handle({"cmd": "freeze", "on": True})
+        lc.handle({"cmd": "processing", "on": False})
+        assert ctrl.frozen is True                                            # regulation parked while off
+        assert ctrl.update(meters_dict(floor=-70.0), now=34.0) == []
+        r = lc.handle({"cmd": "processing", "on": True})
+        assert ctrl.frozen is frozen_before, frozen_before                    # previous state restored
+        assert ("FROZEN" in r["message"]) is frozen_before
+        assert ctrl._t_start == t_start and ctrl.learning is False           # no new learning phase
+        assert ctrl.user_offsets == {"expander.threshold_db": 0.0, "deesser.threshold_db": 0.0,
+                                     "compressor.threshold_db": 0.0}
+    # A freeze wish given while off becomes the state restored on power-up.
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    lc.handle({"cmd": "processing", "on": False})
+    r = lc.handle({"cmd": "freeze", "on": True})
+    assert r["ok"] and "wirkt beim Einschalten" in r["message"]
+    lc.handle({"cmd": "processing", "on": True})
+    assert ctrl.frozen is True
+
+
+def test_offsets_taken_while_off_are_in_effect_when_switched_on():
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    lc.handle({"cmd": "processing", "on": False})
+    r = lc.handle({"cmd": "offset", "name": "loudness_lu", "delta": 0.5})
+    assert r["ok"] and "wirkt beim Einschalten" in r["message"]
+    assert lc.handle({"cmd": "offset", "name": "room_db", "delta": 2})["ok"]
+    assert lc.handle({"cmd": "offset", "name": "tone_db", "delta": -1})["ok"]
+    assert lc.handle({"cmd": "offset", "name": "intensity", "delta": 1})["ok"]
+    assert lc.offsets == {"loudness_lu": 0.5, "room_db": 2.0, "deess_db": 0.0, "tone_db": -1.0, "intensity": 1.0}
+    # Simulate a stage reset on power-up that lost the absolute values.
+    chain.params[("normalizer", "target_lufs")] = -18.0
+    chain.params[("eq", "tilt_db")] = 0.0
+    r = lc.handle({"cmd": "processing", "on": True})
+    assert r["ok"] and "wirkt beim Einschalten" not in r["message"]
+    assert chain.get_param("normalizer", "target_lufs") == pytest.approx(-17.5)
+    assert chain.get_param("eq", "tilt_db") == pytest.approx(-1.0)
+    assert chain.get_param("expander", "threshold_db") == pytest.approx(cfg["chain"]["expander"]["threshold_db"] + 2.0)
+    assert chain.get_param("compressor", "threshold_db") == pytest.approx(cfg["chain"]["compressor"]["threshold_db"] - 2.0)
+    assert ctrl.user_offsets["expander.threshold_db"] == 2.0
+    # Without a controller the same holds.
+    cfg, chain, ctrl, lc, hl = fake_setup(with_controller=False)
+    lc.handle({"cmd": "processing", "on": False})
+    lc.handle({"cmd": "set_offset", "name": "deess_db", "value": -4.0})
+    lc.handle({"cmd": "processing", "on": True})
+    assert chain.get_param("deesser", "threshold_db") == pytest.approx(cfg["chain"]["deesser"]["threshold_db"] - 4.0)
+
+
+def test_reset_switches_processing_on_again():
+    cfg, chain, ctrl, lc, hl = fake_setup()
+    lc.handle({"cmd": "freeze", "on": True})
+    lc.handle({"cmd": "processing", "on": False})
+    lc.handle({"cmd": "offset", "name": "room_db", "delta": 2})
+    hl.calls.clear()
+    r = lc.handle({"cmd": "reset"})
+    assert r["ok"] and r["state"]["processing"] is True
+    assert hl.calls == [("processing", True), ("mute", False), ("bypass", False)]
+    assert r["state"]["offsets"]["room_db"] == 0.0
+    assert chain.get_param("expander", "threshold_db") == cfg["chain"]["expander"]["threshold_db"]
+    assert ctrl.frozen is True                     # reset restores the parked freeze state, it does not unfreeze
+    assert ctrl.learning is True
 
 
 # --------------------------------------------------------------------------- snapshot / marker

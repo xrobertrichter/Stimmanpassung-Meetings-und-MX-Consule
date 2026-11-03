@@ -406,6 +406,15 @@ Lernphase läuft nicht neu. **Neu lernen** startet nur die Lernphase und leert d
 die Offsets bleiben (Platzwechsel im selben Meeting). **Freeze** friert die Regelung ein (wie
 SIGUSR1). **Marker** schreibt `{"event": "marker", "text": …}` ins JSONL-Log.
 
+**Kill-Switch (Verarbeitung an/aus).** Das Kommando `processing` (Ebene 2, K4; CLI `power`)
+schaltet die Kette über den Hook `processing` der Runtime wirklich ab: nur Input Trim und Limiter
+werden gerechnet (`Chain.set_processing`), Analyzer und Regelung pausieren, die Prozessorlast
+sinkt; die Statuszeile zeigt OFF. Im Aus-Zustand werden Offset-Kommandos angenommen und
+gespeichert (die Antwort sagt „wirkt beim Einschalten"); mit Regelung wird deren Freeze-Zustand
+gemerkt, die Regelung eingefroren und beim Einschalten der vorherige Zustand wiederhergestellt –
+ohne neue Lernphase, die Kalibrierwerte bleiben. Reset schaltet die Verarbeitung wieder ein und
+setzt danach wie beschrieben zurück.
+
 **Warum Offsets nicht persistiert werden.** Ein Offset ist eine Sitzungskorrektur („heute
 zischt es, heute ist der Lüfter an"); die Kalibrierung bleibt die Referenz, zu der Reset
 zurückführt. Wer eine Korrektur behalten will, nutzt **Snapshot**: er schreibt die geladene
