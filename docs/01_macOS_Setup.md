@@ -254,7 +254,12 @@ Reihenfolge, jedes Mal vor einem Termin (dauert 3 Minuten):
    Die Kette schützt dann vor dem Hochziehen der Pausen (die Sprache wird nicht weiter
    angehoben), die Pausen bleiben aber hörbarer. Maßnahme: Raum verbessern (Lüfter aus, näher
    ans Mikrofon, Popschutz) oder mit einem neuen Sample neu kalibrieren.
-   Freeze im laufenden Betrieb umschalten (zweites Terminal): `kill -USR1 $(pgrep -f "voicechain run")`.
+   Freeze im laufenden Betrieb umschalten (zweites Terminal): `kill -USR1 $(pgrep -f "voicechain run")`
+   oder `python -m voicechain ctl freeze`. Mit aktivem Steuerkanal (Standard) zeigt die Zeile
+   außerdem `MUTE` (Ausgang stumm, Dial-Druck bzw. `ctl mute`), `BYPASS` (Kette umgangen, nur
+   Input Trim + Limiter) und die Live-Offsets in Kurzform `off L+1.0 R+2 S-2 T0 I+1` (L Lautheit
+   LU, R Raum dB, S Zischen dB, T Tilt dB, I Intensität) sowie `target -17.0 LUFS`; alles 0 und
+   `target` = Kalibrierwert heißt „keine Live-Korrektur aktiv" (`docs/05_MX_Creative_Console.md`).
    Hinweis zum Nachmessen: Das Ziel −18 LUFS gilt für die **Mono**-Messung; voicechain legt das
    Mono-Signal identisch auf beide BlackHole-Kanäle (Dual-Mono). Ein Stereo-Lautheitsmesser in
    einem anderen Programm (z. B. auf einer Meeting-Aufzeichnung) zeigt nach BS.1770 daher etwa

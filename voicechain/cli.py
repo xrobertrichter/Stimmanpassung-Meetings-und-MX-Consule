@@ -23,16 +23,21 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
+from voicechain.control import ControlError, send_command, socket_path_from_config
 
-from voicechain.calibrate import TRUE_PEAK_TOLERANCE_DB  # one tolerance for calibrate, selftest and tests
-from voicechain.runtime import (
-    AudioBackendError,
-    DeviceNotFoundError,
-    LiveEngine,
-    format_device_table,
-    list_devices,
-)
+# numpy, scipy, the DSP chain and the runtime are imported inside the commands that
+# need them: ``python -m voicechain ctl`` must answer a console key press in well
+# under 300 ms including interpreter start (docs/06 section 5), and importing
+# scipy.signal alone costs several hundred milliseconds.
+
+
+def __getattr__(name: str):
+    """Module attribute ``TRUE_PEAK_TOLERANCE_DB`` is the one from calibrate, loaded lazily."""
+    if name == "TRUE_PEAK_TOLERANCE_DB":
+        from voicechain.calibrate import TRUE_PEAK_TOLERANCE_DB
+
+        return TRUE_PEAK_TOLERANCE_DB
+    raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -207,6 +212,8 @@ def format_analysis_line(label: str, meas: dict) -> str:
 
 # ---------------------------------------------------------------------------- commands
 def cmd_devices(args: argparse.Namespace) -> int:
+    from voicechain.runtime import format_device_table, list_devices
+
     devices = list_devices()
     if not devices:
         print("No audio devices found.", file=sys.stderr)
@@ -216,6 +223,7 @@ def cmd_devices(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    from voicechain.runtime import LiveEngine
     from voicechain.dsp.chain import Chain
 
     cfg, cfg_path = _load_config(args.config)
@@ -247,6 +255,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         input_device=args.input_device,
         output_device=args.output_device,
     )
+    if not args.no_control:
+        from voicechain.livecontrol import LiveControl
+
+        # analyzer: ``relearn`` also clears the analyzer history, otherwise the new
+        # learning phase would start from the old room's statistics.
+        live_control = LiveControl(
+            cfg, chain, controller=controller, hooks=engine.control_hooks(), analyzer=analyzer
+        )
+        engine.attach_control(live_control, socket_path_from_config(cfg, REPO_ROOT))
     print(
         "config: {} | adaptive: {}{}".format(
             cfg_path,
@@ -390,6 +407,8 @@ def cmd_process(args: argparse.Namespace) -> int:
 
 
 def _selftest_speech_signal(sample_rate: int) -> np.ndarray:
+    import numpy as np
+
     from voicechain.synth import make_speech_like
 
     x = make_speech_like(
@@ -407,6 +426,8 @@ def _selftest_speech_signal(sample_rate: int) -> np.ndarray:
 
 def _time_per_block_ms(chain, sample_rate: int, block_size: int) -> float:
     """Median wall time of chain.process() for one block of speech-like noise."""
+    import numpy as np
+
     rng = np.random.default_rng(SELFTEST_SEED)
     # 0.1 full-scale noise is loud enough to exercise every dynamics stage.
     blocks = rng.standard_normal((200, block_size)).astype(np.float32) * 0.1
@@ -422,6 +443,9 @@ def _time_per_block_ms(chain, sample_rate: int, block_size: int) -> float:
 
 def run_selftest(cfg: dict) -> list[dict]:
     """Run all self-test checks and return rows {name, target, actual, passed}."""
+    import numpy as np
+
+    from voicechain.calibrate import TRUE_PEAK_TOLERANCE_DB
     from voicechain import meters as m
     from voicechain.dsp.chain import Chain
 
@@ -645,6 +669,155 @@ def cmd_make_sample(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --------------------------------------------------------------------------------- ctl
+# Console keys -> control commands (docs/06 section 4). Offsets: (name, default delta);
+# the sign encodes the direction of the key, ``--value`` only changes the magnitude.
+CTL_OFFSET_KEYS = {
+    "louder": ("loudness_lu", +0.5),
+    "quieter": ("loudness_lu", -0.5),
+    "room-less": ("room_db", +2.0),
+    "room-more": ("room_db", -2.0),
+    "deess-more": ("deess_db", -2.0),  # less sibilance = de-esser threshold lower
+    "deess-less": ("deess_db", +2.0),
+    "natural": ("intensity", -1.0),
+    "dense": ("intensity", +1.0),
+    "warmer": ("tone_db", -1.0),
+    "brighter": ("tone_db", +1.0),
+}
+CTL_TOGGLE_KEYS = {"mute": "mute", "freeze": "freeze", "bypass": "bypass"}
+CTL_PLAIN_KEYS = {"reset": "reset", "status": "status", "relearn": "relearn"}
+CTL_COMMANDS = (
+    "louder", "quieter", "mute", "room-less", "room-more", "deess-more", "deess-less", "natural",
+    "dense", "freeze", "reset", "status", "warmer", "brighter", "loudness-reset", "relearn",
+    "snapshot", "bypass", "marker",
+)
+# Default text of a marker when the key gives none: time of day is what one looks for later.
+MARKER_TEXT_FORMAT = "Marker %H:%M:%S"
+NOTIFY_TITLE = "voicechain"
+
+
+def build_control_command(name: str, value: str | None = None, text: str | None = None, path: str | None = None) -> dict:
+    """Translate a console key name into the JSON command of docs/06 section 4."""
+    if name in CTL_OFFSET_KEYS:
+        offset_name, default_delta = CTL_OFFSET_KEYS[name]
+        delta = default_delta
+        if value is not None:
+            magnitude = abs(_parse_number(value, name))
+            delta = math.copysign(magnitude, default_delta)
+        return {"cmd": "offset", "name": offset_name, "delta": delta}
+    if name == "loudness-reset":
+        return {"cmd": "set_offset", "name": "loudness_lu", "value": _parse_number(value, name) if value is not None else 0.0}
+    if name in CTL_TOGGLE_KEYS:
+        return {"cmd": CTL_TOGGLE_KEYS[name], "on": _parse_switch(value, name)}
+    if name in CTL_PLAIN_KEYS:
+        return {"cmd": CTL_PLAIN_KEYS[name]}
+    if name == "snapshot":
+        cmd = {"cmd": "snapshot"}
+        if path:
+            cmd["path"] = str(resolve_output_path(path, suffixes=(".yaml", ".yml")))
+        return cmd
+    if name == "marker":
+        return {"cmd": "marker", "text": text if text else time.strftime(MARKER_TEXT_FORMAT)}
+    raise ValueError("unknown control command {!r}".format(name))
+
+
+def _parse_number(value: str, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--value for {} must be a number, got {!r}".format(name, value)) from exc
+    if not math.isfinite(number):
+        raise ValueError("--value for {} must be finite, got {!r}".format(name, value))
+    return number
+
+
+def _parse_switch(value: str | None, name: str):
+    """on/off/toggle for mute, freeze, bypass; default toggle (one key = one flip)."""
+    if value is None:
+        return "toggle"
+    lowered = str(value).strip().lower()
+    if lowered in ("on", "1", "true", "an", "ein"):
+        return True
+    if lowered in ("off", "0", "false", "aus"):
+        return False
+    if lowered == "toggle":
+        return "toggle"
+    raise ValueError("--value for {} must be on, off or toggle, got {!r}".format(name, value))
+
+
+def _ctl_socket_path(config_arg: str | None) -> Path:
+    """Socket path for ctl without importing the DSP stack: read only ``control.socket_path``
+    from the YAML (PyYAML only). A missing or unreadable file falls back to the default."""
+    import yaml
+
+    path = _config_path(config_arg)
+    cfg: dict = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as fh:
+            try:
+                loaded = yaml.safe_load(fh)
+            except yaml.YAMLError as exc:
+                raise ValueError("{}: YAML syntax error: {}".format(path, exc)) from exc
+        if isinstance(loaded, dict):
+            cfg = loaded
+    elif config_arg is not None:
+        raise FileNotFoundError("configuration file not found: {}".format(path))
+    return socket_path_from_config(cfg, REPO_ROOT)
+
+
+def notify(message: str, title: str = NOTIFY_TITLE) -> bool:
+    """Show a macOS notification via osascript; returns False (console only) when
+    osascript is missing or fails. Never raises: the key press already did its job."""
+    import shutil
+    import subprocess
+
+    osascript = shutil.which("osascript")
+    if osascript is None:
+        return False
+    script = 'display notification "{}" with title "{}"'.format(
+        _applescript_quote(message), _applescript_quote(title)
+    )
+    try:
+        completed = subprocess.run([osascript, "-e", script], capture_output=True, text=True, timeout=5.0, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print("note: notification failed: {}".format(exc), file=sys.stderr)
+        return False
+    if completed.returncode != 0:
+        print("note: notification failed: {}".format(completed.stderr.strip()), file=sys.stderr)
+        return False
+    return True
+
+
+def _applescript_quote(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def cmd_ctl(args: argparse.Namespace) -> int:
+    command = build_control_command(args.name, value=args.value, text=args.text, path=args.path)
+    socket_path = Path(args.socket).expanduser() if args.socket else _ctl_socket_path(args.config)
+    if args.socket and not socket_path.is_absolute():
+        socket_path = REPO_ROOT / socket_path
+    try:
+        response = send_command(command, socket_path, timeout=args.timeout)
+    except ControlError as exc:
+        line = "voicechain: {}".format(exc)
+        print(line, file=sys.stderr)
+        if args.notify:
+            notify(str(exc))
+        return EXIT_ERROR
+    if response.get("ok"):
+        line = str(response.get("message") or "ok")
+        print(line)
+        if args.notify:
+            notify(line)
+        return EXIT_OK
+    line = "abgelehnt: {}".format(response.get("error", "unbekannter Fehler"))
+    print(line, file=sys.stderr)
+    if args.notify:
+        notify(line)
+    return EXIT_FAILED
+
+
 # ------------------------------------------------------------------------------ parser
 def positive_seconds(text: str) -> float:
     """argparse type for --seconds: a finite number > 0, rejected before anything is created."""
@@ -675,6 +848,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--output-device", help="output device name substring or index (overrides config)")
     p_run.add_argument("--no-adaptive", action="store_true", help="disable the adaptive controller")
     p_run.add_argument("--freeze", action="store_true", help="run the adaptive controller frozen (log only, no changes)")
+    p_run.add_argument("--no-control", action="store_true", help="do not open the control socket (no 'ctl' / console keys)")
     p_run.set_defaults(func=cmd_run)
 
     p_rec = sub.add_parser("record", help="record a calibration sample (raw microphone, 48 kHz mono, 24-bit WAV)")
@@ -702,6 +876,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_self.add_argument("--report", help="also write the table to this file")
     p_self.set_defaults(func=cmd_selftest)
 
+    p_ctl = sub.add_parser("ctl", help="steer the running chain (console keys): one command, one answer line")
+    p_ctl.add_argument("name", choices=CTL_COMMANDS, metavar="COMMAND", help="one of: " + ", ".join(CTL_COMMANDS))
+    p_ctl.add_argument("--value", help="step size for offset keys, on/off/toggle for mute, freeze, bypass")
+    p_ctl.add_argument("--text", help="marker text (default: time of day)")
+    p_ctl.add_argument("--path", help="snapshot: target YAML (default chosen by the chain)")
+    p_ctl.add_argument("--socket", help="control socket (default: control.socket_path of the config, logs/control.sock)")
+    p_ctl.add_argument("--config", help="YAML whose control.socket_path is used (default: config/chain.default.yaml)")
+    p_ctl.add_argument("--timeout", type=float, default=1.0, help="seconds to wait for the answer (default 1.0)")
+    p_ctl.add_argument("--notify", action="store_true", help="also show the answer as a macOS notification (osascript)")
+    p_ctl.set_defaults(func=cmd_ctl)
+
     p_mk = sub.add_parser("make-sample", help="write a synthetic speech-like WAV (48 kHz) to rehearse calibration")
     p_mk.add_argument("--out", required=True, help="output WAV path")
     p_mk.set_defaults(func=cmd_make_sample)
@@ -713,10 +898,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except AudioBackendError as exc:
-        print("error: {}".format(exc), file=sys.stderr)
-        return EXIT_ERROR
-    except DeviceNotFoundError as exc:
+    except ControlError as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return EXIT_ERROR
     except OSError as exc:
@@ -732,9 +914,15 @@ def main(argv: list[str] | None = None) -> int:
         # unreadable WAV, or a wrong sample rate.
         print("error: {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
         return EXIT_ERROR
-    except RuntimeError as exc:
-        # soundfile.LibsndfileError (unreadable audio file) or a failed audio callback.
-        print("error: {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
+    except (RuntimeError, LookupError) as exc:
+        # runtime.AudioBackendError (RuntimeError) and runtime.DeviceNotFoundError
+        # (LookupError) carry complete messages; soundfile.LibsndfileError
+        # (RuntimeError) and a failed audio callback are reported with their type.
+        name = type(exc).__name__
+        if name in ("AudioBackendError", "DeviceNotFoundError"):
+            print("error: {}".format(exc), file=sys.stderr)
+        else:
+            print("error: {}: {}".format(name, exc), file=sys.stderr)
         return EXIT_ERROR
     except Exception as exc:
         # sounddevice.PortAudioError derives directly from Exception; report it like

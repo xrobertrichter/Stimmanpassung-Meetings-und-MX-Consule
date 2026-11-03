@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.abc
 import importlib.machinery
+import math
 import sys
 import threading
 import time
@@ -132,6 +133,15 @@ class RecordingChain:
         self.gain = gain
         self.fail = fail
         self.meter_calls = 0
+        self.bypass_calls: list[bool] = []
+        self.target_lufs = -18.0
+
+    def set_bypass(self, on: bool) -> None:
+        self.bypass_calls.append(bool(on))
+
+    def get_param(self, stage: str, name: str) -> float:
+        assert (stage, name) == ("normalizer", "target_lufs"), (stage, name)
+        return self.target_lufs
 
     def process(self, x):
         self.log.append(("chain.process", np.array(x, copy=True)))
@@ -834,3 +844,169 @@ def test_status_line_shows_normalizer_snr_state(fake_sd, normalizer_meters, expe
         assert expected in line
     for text in forbidden:
         assert text not in line  # case-sensitive: "SNR LOW" and "snr" are different states
+
+
+# ----------------------------------------------------------- mute / bypass / control
+def _ramp_blocks(engine: LiveEngine, n_blocks: int, level: float = 0.5) -> list[np.ndarray]:
+    """Run n_blocks of a constant input through the callback, return the mono outputs."""
+    outputs = []
+    indata = np.full((BLOCK, 1), level, dtype=np.float32)
+    for _ in range(n_blocks):
+        outdata = np.zeros((BLOCK, 2), dtype=np.float32)
+        engine.audio_callback(indata, outdata, BLOCK, None, None)
+        outputs.append(outdata[:, 0].copy())
+    return outputs
+
+
+def _block_level_db(block: np.ndarray) -> float:
+    rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+    return 20.0 * math.log10(rms) if rms > 0 else -np.inf
+
+
+def test_mute_is_a_30ms_ramp_without_jumps_and_exact_silence(fake_sd):
+    engine = LiveEngine(base_cfg(), RecordingChain([], gain=1.0))
+    ramp_samples = int(runtime.MUTE_RAMP_S * SAMPLE_RATE)  # 1440 at 48 kHz
+    ramp_blocks = math.ceil(ramp_samples / BLOCK)  # 6 blocks of 256
+
+    steady = _ramp_blocks(engine, 3)
+    assert all(np.all(b == 0.5) for b in steady)  # unmuted: untouched
+
+    assert engine.set_muted(True) is True
+    assert engine.muted
+    during = _ramp_blocks(engine, ramp_blocks)
+    after = _ramp_blocks(engine, 4)
+    # Ramp is monotone, sample-continuous, and ends exactly at zero within 30 ms.
+    joined = np.concatenate(during)
+    assert np.all(np.diff(joined[:ramp_samples]) <= 1e-6)  # never increasing
+    assert abs(joined[0] - 0.5 * (1.0 - 1.0 / ramp_samples)) < 1e-5  # first sample one step down
+    assert np.max(np.abs(np.diff(joined))) < 0.5 / ramp_samples * 1.01  # no step larger than one ramp step
+    assert np.all(joined[ramp_samples:] == 0.0)
+    assert all(np.all(b == 0.0) for b in after)  # exactly zero afterwards, no denormals
+    assert engine._gain_current == 0.0
+
+    # Unmute ramps back up without a jump; outside the ramp the level is constant.
+    assert engine.set_muted(False) is False
+    up = np.concatenate(_ramp_blocks(engine, ramp_blocks))
+    assert np.all(np.diff(up[:ramp_samples]) >= -1e-6)
+    assert np.max(np.abs(np.diff(up))) < 0.5 / ramp_samples * 1.01
+    assert np.all(up[ramp_samples:] == 0.5)
+    settled = _ramp_blocks(engine, 3)
+    levels = [_block_level_db(b) for b in settled]
+    assert max(levels) - min(levels) < 0.5  # outside the ramp: no block-to-block jump > 0.5 dB
+    assert engine._gain_current == 1.0
+
+
+def test_mute_toggle_and_bypass_hooks(fake_sd):
+    chain = RecordingChain([])
+    engine = LiveEngine(base_cfg(), chain)
+    assert engine.set_muted("toggle") is True
+    assert engine.set_muted("toggle") is False
+    assert engine.set_bypass(True) is True
+    assert chain.bypass_calls == [True]
+    assert engine.set_bypass("toggle") is False
+    assert chain.bypass_calls == [True, False]
+    hooks = engine.control_hooks()
+    assert set(hooks) == {"mute", "bypass"}
+    hooks["mute"](True)
+    assert engine.muted and engine._gain_target == 0.0
+    hooks["bypass"](True)
+    assert engine.bypassed and chain.bypass_calls[-1] is True
+
+
+class FakeLiveControl:
+    """Minimal stand-in for voicechain.livecontrol.LiveControl."""
+
+    def __init__(self, hooks=None):
+        self.hooks = hooks or {}
+        self.offsets = {"loudness_lu": 0.0, "room_db": 0.0, "deess_db": 0.0, "tone_db": 0.0, "intensity": 0.0}
+        self.commands: list[dict] = []
+        self.thread_names: list[str] = []
+
+    def handle(self, cmd: dict) -> dict:
+        self.commands.append(cmd)
+        self.thread_names.append(threading.current_thread().name)
+        if cmd.get("cmd") == "offset":
+            self.offsets[cmd["name"]] += float(cmd["delta"])
+            return {"ok": True, "state": {"offsets": dict(self.offsets)}, "message": "offset"}
+        if cmd.get("cmd") == "mute":
+            self.hooks["mute"](True)
+            return {"ok": True, "state": {}, "message": "MUTE an"}
+        if cmd.get("cmd") == "status":
+            return {"ok": True, "state": {"offsets": dict(self.offsets), "target_lufs": -18.0}, "message": "status"}
+        return {"ok": False, "error": "unbekannt"}
+
+
+def test_status_line_shows_mute_bypass_offsets_and_target(fake_sd):
+    chain = RecordingChain([])
+    engine = LiveEngine(base_cfg(), chain)
+    line = engine.status_line()
+    assert "MUTE" not in line and "BYPASS" not in line and "off " not in line and "target" not in line
+
+    control = FakeLiveControl()
+    control.offsets.update({"loudness_lu": 1.0, "room_db": 2.0, "deess_db": -2.0, "tone_db": 0.0, "intensity": 1.0})
+    chain.target_lufs = -17.0
+    engine.attach_control(control, "/tmp/unused.sock")
+    engine.set_muted(True)
+    engine.set_bypass(True)
+    line = engine.status_line()
+    assert "| MUTE" in line and "| BYPASS" in line
+    assert "off L+1.0 R+2 S-2 T0 I+1" in line
+    assert "target -17.0 LUFS" in line
+    # the status line never drains the chain meters through the control object
+    assert control.commands == []
+
+
+def test_frozen_state_follows_controller_flag(fake_sd):
+    controller = RecordingController()
+    controller.frozen = False
+    engine = LiveEngine(base_cfg(), RecordingChain([]), controller=controller)
+    controller.frozen = True  # changed by LiveControl.freeze, not through the engine
+    assert engine.is_frozen()
+    assert "adaptive FROZEN:" in engine.status_line()
+    engine.handle_sigusr1()
+    engine.apply_pending_requests()  # toggles relative to the controller's real state
+    assert controller.frozen is False
+
+
+def test_control_server_runs_in_service_thread_and_socket_lifecycle(fake_sd, tmp_path):
+    from voicechain.control import send_command
+
+    sock_path = tmp_path / "c.sock"
+    cfg = base_cfg(adaptive={"enabled": True, "learn_s": 0.0, "interval_s": 1.0})
+    chain = RecordingChain([])
+    engine = LiveEngine(cfg, chain, controller=RecordingController(), on_status=lambda line: None)
+    control = FakeLiveControl(hooks=engine.control_hooks())
+    engine.attach_control(control, sock_path)
+    engine.start()
+    try:
+        assert sock_path.exists()
+        t0 = time.perf_counter()
+        response = send_command({"cmd": "offset", "name": "room_db", "delta": 2}, sock_path, timeout=2.0)
+        elapsed = time.perf_counter() - t0
+        assert response["ok"] is True
+        assert response["state"]["offsets"]["room_db"] == 2.0
+        assert response["state"]["muted"] is False  # engine view merged into the state
+        assert elapsed < 0.5  # answered from the 20 ms poll loop, not from the 1 s status tick
+        muted = send_command({"cmd": "mute"}, sock_path, timeout=2.0)
+        assert muted["ok"] is True
+        assert engine.muted is True and engine._gain_target == 0.0
+        assert control.thread_names and all(name == "voicechain-service" for name in control.thread_names)
+        assert "off L+0.0 R+2 S0 T0 I0" in engine.status_line()
+        assert "| MUTE" in engine.status_line()
+    finally:
+        engine.stop()
+    assert not sock_path.exists()
+    assert engine.control_server is not None and not engine.control_server.running
+
+
+def test_start_fails_cleanly_when_socket_cannot_be_created(fake_sd, tmp_path):
+    from voicechain.control import ControlError
+
+    blocker = tmp_path / "blocker.sock"
+    blocker.write_text("not a socket", encoding="utf-8")
+    engine = LiveEngine(base_cfg(), RecordingChain([]), on_status=lambda line: None)
+    engine.attach_control(FakeLiveControl(), blocker)
+    with pytest.raises(ControlError):
+        engine.start()
+    assert engine.stream is None
+    assert FakeStream.instances[-1].closed  # the audio stream opened before is released again

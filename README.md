@@ -135,16 +135,34 @@ Python-Pakete (siehe `requirements.txt`): numpy, scipy, soundfile, sounddevice, 
 Beenden mit `Ctrl-C` im Terminal. Danach in Zoom/Teams wieder das Rode-Mikrofon direkt wählen,
 sonst bleibt es still.
 
+## Bedienung im Meeting (MX Creative Console)
+
+Die laufende Kette lässt sich ohne Terminal korrigieren: Drehregler für Lauter/Leiser, Druck für
+Mute, Tasten für weniger/mehr Raum, weniger Zischen, natürlicher/dichter, Freeze, Reset und
+Status, auf einer zweiten Ebene Klangfarbe, Neu lernen, Snapshot, Bypass-Vergleich und Marker.
+Alle Tasten sind Offsets auf die kalibrierten Werte; die adaptive Regelung arbeitet weiter und
+regelt sie nicht zurück. Jede Funktion ist auch im Terminal erreichbar:
+
+```bash
+python -m voicechain ctl room-less --notify   # weniger Raum, Antwort als macOS-Mitteilung
+python -m voicechain ctl status               # Lautheit, Störabstand, Offsets, Freeze/Mute
+python -m voicechain ctl reset                # zurück zum Kalibrierzustand
+```
+
+Konzept, Begründung je Taste und Fehlersuche: `docs/05_MX_Creative_Console.md`; Skripte,
+Manifest und Verdrahtung in Logi Options+: `integrations/mx_console/README.md`.
+
 ## Kommandos im Überblick
 
 | Kommando | Zweck |
 |----------|-------|
 | `python -m voicechain devices` | Audiogeräte mit Index, Kanälen und Samplerate auflisten |
 | `python -m voicechain record --out PFAD [--seconds 60] [--input-device NAME] [--config PFAD]` | Kalibriersample aufnehmen (rohes Mikrofonsignal, 48 kHz mono, 24-Bit-WAV), mit Restzeit und Pegelanzeige |
-| `python -m voicechain run [--config PFAD] [--input-device NAME] [--output-device NAME] [--no-adaptive] [--freeze]` | Live-Betrieb Rode → BlackHole; `kill -USR1 <pid>` schaltet Freeze um |
+| `python -m voicechain run [--config PFAD] [--input-device NAME] [--output-device NAME] [--no-adaptive] [--freeze] [--no-control]` | Live-Betrieb Rode → BlackHole; öffnet den Steuer-Socket für `ctl`/Konsole (`--no-control` lässt ihn weg); `kill -USR1 <pid>` schaltet Freeze um |
 | `python -m voicechain calibrate --wav PFAD [--config BASIS] [--out NEU.yaml] [--report BERICHT.md]` | Sprachsample analysieren → Konfigurationsvorschlag + Bericht |
 | `python -m voicechain process --in PFAD --out PFAD [--config PFAD]` | WAV (48 kHz) offline durch die Kette (A/B-Hören), Messzeilen vorher/nachher |
 | `python -m voicechain selftest [--config PFAD] [--report PFAD]` | Synthetische Signale durch die Kette, Prüftabelle Soll/Ist, Exit-Code 1 bei Nichtbestehen |
+| `python -m voicechain ctl KOMMANDO [--value X] [--text ...] [--path PFAD] [--socket PFAD] [--notify]` | Laufende Kette steuern (19 Kommandos der Konsole, z. B. `louder`, `mute`, `room-less`, `reset`, `status`); Exit 0/1/2 |
 | `python -m voicechain make-sample --out PFAD` | Synthetisches Sprach-WAV erzeugen, um den Kalibrierablauf ohne Mikrofon zu proben |
 
 Relative Pfade werden vom Repository-Wurzelverzeichnis aus aufgelöst; Ausgabeverzeichnisse
@@ -159,6 +177,7 @@ beiden Optionen denselben Namen.
 - `docs/02_Parameter_Begruendung.md` – jeder Parameter mit Startwert, Bereich, Begründung, Hörbild
 - `docs/03_Betrieb_und_Kalibrierung.md` – Kalibrierung, Live-Betrieb, A/B-Vergleich, adaptive Regelung
 - `docs/04_Pruefprotokoll.md` – Ergebnisse der Prüfungen
+- `docs/05_MX_Creative_Console.md` – Live-Bedienung im Meeting (Konsole, `ctl`, Offsets)
 - `docs/00_Beauftragung.md` – Beauftragung und Schnittstellenvertrag
 
 ## Entwicklung und Tests

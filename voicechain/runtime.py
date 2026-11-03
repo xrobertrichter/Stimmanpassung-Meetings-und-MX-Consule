@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import unicodedata
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -58,6 +59,13 @@ from voicechain.dsp import DB_FLOOR_DBFS as _DB_FLOOR  # noqa: E402
 # How often the console status line is refreshed (seconds). Required by the
 # assignment ("Konsolen-Statuszeile alle 1 s").
 STATUS_INTERVAL_S = 1.0
+# How often the service thread polls the control socket while a control channel is
+# attached: a key press on the console must be answered well within the 300 ms budget
+# of docs/06, so the thread wakes every 20 ms instead of once per second.
+CONTROL_POLL_INTERVAL_S = 0.02
+# Length of the output-gain ramp for mute/unmute (docs/06: 30 ms). Linear in
+# amplitude: no audible click, finished within two 256-sample blocks at 48 kHz.
+MUTE_RAMP_S = 0.03
 
 
 class AudioBackendError(RuntimeError):
@@ -301,6 +309,24 @@ class LiveEngine:
         self._signal_handlers_installed = False
         self._last_meters: dict | None = None
 
+        # Mute as an output-gain ramp: the service thread sets the target (0 or 1),
+        # the audio callback walks the current gain towards it with a fixed step per
+        # sample. ``_ramp_index`` and ``_ramp`` are pre-allocated for the callback.
+        self.muted = False
+        self.bypassed = False
+        self._gain_target = 1.0
+        self._gain_current = 1.0
+        self._gain_step = 1.0 / max(1.0, MUTE_RAMP_S * self.sample_rate)
+        self._ramp_index = np.arange(self.block_size, dtype=np.float32)
+        self._ramp = np.zeros(self.block_size, dtype=np.float32)
+
+        # Optional control channel (docs/06): LiveControl handles the commands, the
+        # ControlServer is polled by the service thread.
+        self.control = None
+        self.control_server = None
+        self.control_socket_path: Path | None = None
+        self.control_errors = 0
+
     # ------------------------------------------------------------------ devices
     def resolve_devices(self, devices: list[dict] | None = None) -> tuple[int, int]:
         """Resolve input and output device indices (override > config)."""
@@ -365,6 +391,7 @@ class LiveEngine:
                 self.analyzer.push(x)
             y = self.chain.process(x)
             y = np.asarray(y, dtype=np.float32)
+            self._apply_output_gain(y)
             # Mono -> N channels: broadcast into the output buffer, no new arrays.
             outdata[:, : self.output_channels] = y.reshape(-1, 1)
             if outdata.shape[1] > self.output_channels:
@@ -385,6 +412,92 @@ class LiveEngine:
             if abort is not None:
                 raise abort() from exc
             raise
+
+    def _apply_output_gain(self, y: np.ndarray) -> None:
+        """Mute/unmute ramp, in place on the mono block, without allocation.
+
+        ``_gain_current`` moves towards ``_gain_target`` by ``_gain_step`` per sample
+        (30 ms from 1 to 0). While the gain is steady at 1 nothing is touched; at 0
+        the block is zeroed; in between a pre-allocated linear ramp is multiplied in.
+        """
+        target = self._gain_target
+        current = self._gain_current
+        frames = y.shape[0]
+        if current == target:
+            if target == 0.0:
+                y.fill(0.0)
+            return
+        if frames > self._ramp_index.shape[0]:
+            # PortAudio ignored the requested block size (see audio_callback): one
+            # rare allocation keeps the ramp correct instead of truncating it.
+            self._ramp_index = np.arange(frames, dtype=np.float32)
+            self._ramp = np.zeros(frames, dtype=np.float32)
+        ramp = self._ramp[:frames]
+        step = self._gain_step if target > current else -self._gain_step
+        np.multiply(self._ramp_index[:frames], step, out=ramp)
+        ramp += current + step  # first sample already moves one step
+        np.clip(ramp, 0.0, 1.0, out=ramp)
+        y *= ramp
+        end = current + step * frames
+        self._gain_current = float(min(max(end, 0.0), 1.0))
+        if (step > 0 and self._gain_current >= target) or (step < 0 and self._gain_current <= target):
+            self._gain_current = target
+
+    # ------------------------------------------------------------- mute / bypass
+    def set_muted(self, on) -> bool:
+        """Hook for LiveControl: start the 30 ms ramp towards silence (True) or back."""
+        if on == "toggle":
+            on = not self.muted
+        self.muted = bool(on)
+        self._gain_target = 0.0 if self.muted else 1.0
+        return self.muted
+
+    def set_bypass(self, on) -> bool:
+        """Hook for LiveControl: bypass the chain (input trim + limiter only) via Chain.set_bypass."""
+        if on == "toggle":
+            on = not self.bypassed
+        self.bypassed = bool(on)
+        self.chain.set_bypass(self.bypassed)
+        return self.bypassed
+
+    def control_hooks(self) -> dict:
+        """The ``hooks`` dict LiveControl expects: functions outside the adaptive controller."""
+        return {"mute": self.set_muted, "bypass": self.set_bypass}
+
+    def attach_control(self, live_control, socket_path) -> None:
+        """Attach a LiveControl instance; the socket server is started with the stream."""
+        from voicechain.control import ControlServer
+
+        self.control = live_control
+        self.control_socket_path = Path(socket_path)
+        self.control_server = ControlServer(self.control_socket_path, self.handle_control_command)
+
+    def handle_control_command(self, cmd: dict) -> dict:
+        """Server handler (service thread): LiveControl.handle plus the engine's own view."""
+        if self.control is None:
+            return {"ok": False, "error": "no live control attached"}
+        response = self.control.handle(cmd)
+        if isinstance(response, dict) and response.get("ok"):
+            state = response.get("state")
+            if isinstance(state, dict):
+                state.setdefault("muted", self.muted)
+                state.setdefault("bypass", self.bypassed)
+        return response
+
+    def control_state(self) -> dict | None:
+        """Offsets and loudness target for the status line (None without control channel).
+
+        Reads ``LiveControl.offsets`` and the chain parameter directly: the full
+        ``status`` command would call ``Chain.get_meters()`` and drain the gain
+        reduction statistics the controller relies on (see :meth:`read_meters`).
+        """
+        if self.control is None:
+            return None
+        offsets = getattr(self.control, "offsets", None)
+        state = {"offsets": dict(offsets) if isinstance(offsets, dict) else {}}
+        if hasattr(self.chain, "get_param"):
+            state["target_lufs"] = float(self.chain.get_param("normalizer", "target_lufs"))
+        return state
 
     # ------------------------------------------------------------------ freeze
     def handle_sigusr1(self, signum=None, frame=None) -> None:
@@ -417,7 +530,7 @@ class LiveEngine:
         if count:
             self._freeze_toggle_requests -= count
             if count % 2 == 1:
-                self.set_frozen(not self.frozen)
+                self.set_frozen(not self.is_frozen())
         return count
 
     # ----------------------------------------------------------------- service
@@ -524,17 +637,23 @@ class LiveEngine:
         gate_text += snr_text
         if self.controller is None:
             mode = "off"
-        elif self.frozen:
+        elif self.is_frozen():
             mode = "FROZEN"
         else:
             mode = "on"
+        flags = ""
+        if self.muted:
+            flags += " | MUTE"
+        if self.bypassed:
+            flags += " | BYPASS"
         return (
-            "in {:6.1f} dBFS (rms {:6.1f}) | out {:6.1f} dBFS | GR exp {} des {} comp {} "
-            "norm {} lim {}{} | xruns {}{} | blocks {} | adaptive {}: {}"
+            "in {:6.1f} dBFS (rms {:6.1f}) | out {:6.1f} dBFS{} | GR exp {} des {} comp {} "
+            "norm {} lim {}{} | xruns {}{} | blocks {} | adaptive {}: {}{}"
         ).format(
             _to_dbfs(in_peak),
             _to_dbfs(in_rms),
             _to_dbfs(out_peak),
+            flags,
             gr("expander"),
             gr("deesser"),
             gr("compressor"),
@@ -546,7 +665,43 @@ class LiveEngine:
             self.blocks_processed,
             mode,
             change_text,
+            self._offsets_text(),
         )
+
+    #: Order and one-letter labels of the live offsets in the status line.
+    OFFSET_LABELS = (("loudness_lu", "L"), ("room_db", "R"), ("deess_db", "S"), ("tone_db", "T"), ("intensity", "I"))
+
+    def _offsets_text(self) -> str:
+        """Short form of the live offsets and the loudness target, e.g.
+        `` | off L+1.0 R+2 S-2 T0 I+1 | target -17.0 LUFS``; empty without control channel."""
+        state = self.control_state()
+        if state is None:
+            return ""
+        offsets = state.get("offsets") or {}
+        parts = []
+        for name, label in self.OFFSET_LABELS:
+            value = offsets.get(name)
+            if value is None:
+                continue
+            value = float(value)
+            if name == "loudness_lu":
+                parts.append("{}{:+.1f}".format(label, value))
+            elif value == 0.0:
+                parts.append("{}0".format(label))
+            else:
+                parts.append("{}{:+g}".format(label, value))
+        text = " | off {}".format(" ".join(parts)) if parts else ""
+        target = state.get("target_lufs")
+        if target is not None:
+            text += " | target {:.1f} LUFS".format(float(target))
+        return text
+
+    def is_frozen(self) -> bool:
+        """Freeze state: the controller's own flag when it has one (LiveControl may
+        change it without going through the engine), else the engine's copy."""
+        if self.controller is not None and hasattr(self.controller, "frozen"):
+            return bool(self.controller.frozen)
+        return self.frozen
 
     @staticmethod
     def _print_status(line: str) -> None:
@@ -557,9 +712,12 @@ class LiveEngine:
         now = time.monotonic()
         next_adaptive = now + self.adaptive_interval_s
         next_status = now + STATUS_INTERVAL_S
+        server = self.control_server
         while not self._stop_event.is_set():
             now = time.monotonic()
             wait_s = min(next_adaptive, next_status) - now
+            if server is not None:
+                wait_s = min(wait_s, CONTROL_POLL_INTERVAL_S)
             if wait_s > 0 and self._stop_event.wait(wait_s):
                 break
             now = time.monotonic()
@@ -567,6 +725,12 @@ class LiveEngine:
                 self.apply_pending_requests()
             except Exception as exc:  # noqa: BLE001 - report, keep audio running
                 print("freeze toggle error: {!r}".format(exc), file=sys.stderr, flush=True)
+            if server is not None:
+                try:
+                    server.poll()
+                except Exception as exc:  # noqa: BLE001 - a broken client must not stop audio
+                    self.control_errors += 1
+                    print("control socket error: {!r}".format(exc), file=sys.stderr, flush=True)
             # One meter reading per wake-up, shared by controller and status line.
             # With a controller the chain is read only at adaptive ticks, so its
             # mean/max statistics cover the whole interval; without one the status
@@ -639,6 +803,15 @@ class LiveEngine:
             stream.close()
             raise AudioBackendError("Could not start the audio stream: {}".format(exc)) from exc
 
+        if self.control_server is not None:
+            try:
+                self.control_server.start()
+            except Exception:
+                stream, self.stream = self.stream, None
+                stream.stop()
+                stream.close()
+                raise
+
         self._service_thread = threading.Thread(
             target=self._service_loop, name="voicechain-service", daemon=True
         )
@@ -651,6 +824,8 @@ class LiveEngine:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, 2.0 * self.adaptive_interval_s))
         self._service_thread = None
+        if self.control_server is not None:
+            self.control_server.stop()
         stream = self.stream
         self.stream = None
         if stream is not None:
@@ -687,7 +862,12 @@ class LiveEngine:
                     self.output_channels,
                     self.sample_rate,
                     self.latency_info(),
-                    " Send SIGUSR1 to toggle freeze (kill -USR1 {}).".format(os.getpid()) if signals_ok else "",
+                    (" Send SIGUSR1 to toggle freeze (kill -USR1 {}).".format(os.getpid()) if signals_ok else "")
+                    + (
+                        " Control socket: {} (python -m voicechain ctl ...).".format(self.control_socket_path)
+                        if self.control_server is not None
+                        else ""
+                    ),
                 ),
                 file=sys.stderr,
                 flush=True,

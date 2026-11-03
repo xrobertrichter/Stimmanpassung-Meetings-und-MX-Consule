@@ -12,6 +12,7 @@ import os
 import importlib.machinery
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -66,6 +67,7 @@ def _make_fake_sd(blocks_to_feed: int) -> types.ModuleType:
     module.check_output_settings = lambda **kwargs: None
     module.CallbackAbort = type("CallbackAbort", (Exception,), {})
     module.fed_outputs: list[np.ndarray] = []
+    module.block_delay_s = 0.0  # tests that need the stream to stay open set a per-block pause
 
     class Stream:
         def __init__(self, **kwargs):
@@ -85,6 +87,8 @@ def _make_fake_sd(blocks_to_feed: int) -> types.ModuleType:
                     outdata = np.zeros((block, self.kwargs["channels"][1]), dtype=np.float32)
                     self.kwargs["callback"](indata, outdata, block, None, None)
                     module.fed_outputs.append(outdata.copy())
+                    if module.block_delay_s:
+                        time.sleep(module.block_delay_s)
                 _thread.interrupt_main()  # like the user pressing Ctrl-C
 
             threading.Thread(target=feeder, daemon=True).start()
@@ -587,3 +591,262 @@ def test_help_lists_all_commands(capsys):
     out = capsys.readouterr().out
     for command in ("devices", "record", "run", "calibrate", "process", "selftest", "make-sample"):
         assert command in out
+
+
+# ------------------------------------------------------------------------------- ctl
+from voicechain.control import ControlServer  # noqa: E402
+
+
+class _PolledControlServer:
+    """ControlServer polled from a thread, with a recording handler."""
+
+    def __init__(self, sock_path: Path, responder=None):
+        self.commands: list[dict] = []
+        self.responder = responder or (lambda cmd: {"ok": True, "state": {}, "message": "ok {}".format(cmd["cmd"])})
+        self.server = ControlServer(sock_path, self._handle)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _handle(self, cmd):
+        self.commands.append(cmd)
+        return self.responder(cmd)
+
+    def __enter__(self):
+        self.server.start()
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self.server.stop()
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.server.poll()
+            time.sleep(0.005)
+
+
+def test_ctl_parser_knows_all_19_console_commands():
+    parser = cli.build_parser()
+    for name in cli.CTL_COMMANDS:
+        args = parser.parse_args(["ctl", name])
+        assert args.name == name and args.func is cli.cmd_ctl
+    assert len(cli.CTL_COMMANDS) == 19
+    with pytest.raises(SystemExit):
+        parser.parse_args(["ctl", "explode"])
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("louder", {"cmd": "offset", "name": "loudness_lu", "delta": 0.5}),
+        ("quieter", {"cmd": "offset", "name": "loudness_lu", "delta": -0.5}),
+        ("room-less", {"cmd": "offset", "name": "room_db", "delta": 2.0}),
+        ("room-more", {"cmd": "offset", "name": "room_db", "delta": -2.0}),
+        ("deess-more", {"cmd": "offset", "name": "deess_db", "delta": -2.0}),
+        ("deess-less", {"cmd": "offset", "name": "deess_db", "delta": 2.0}),
+        ("natural", {"cmd": "offset", "name": "intensity", "delta": -1.0}),
+        ("dense", {"cmd": "offset", "name": "intensity", "delta": 1.0}),
+        ("warmer", {"cmd": "offset", "name": "tone_db", "delta": -1.0}),
+        ("brighter", {"cmd": "offset", "name": "tone_db", "delta": 1.0}),
+        ("loudness-reset", {"cmd": "set_offset", "name": "loudness_lu", "value": 0.0}),
+        ("mute", {"cmd": "mute", "on": "toggle"}),
+        ("freeze", {"cmd": "freeze", "on": "toggle"}),
+        ("bypass", {"cmd": "bypass", "on": "toggle"}),
+        ("reset", {"cmd": "reset"}),
+        ("status", {"cmd": "status"}),
+        ("relearn", {"cmd": "relearn"}),
+        ("snapshot", {"cmd": "snapshot"}),
+    ],
+)
+def test_build_control_command_maps_keys_to_protocol(name, expected):
+    assert cli.build_control_command(name) == expected
+
+
+def test_build_control_command_options():
+    # --value changes the magnitude only, the key keeps its direction
+    assert cli.build_control_command("quieter", value="1")["delta"] == -1.0
+    assert cli.build_control_command("room-less", value="-4")["delta"] == 4.0
+    assert cli.build_control_command("mute", value="on") == {"cmd": "mute", "on": True}
+    assert cli.build_control_command("freeze", value="aus") == {"cmd": "freeze", "on": False}
+    assert cli.build_control_command("bypass", value="toggle") == {"cmd": "bypass", "on": "toggle"}
+    marker = cli.build_control_command("marker", text="Rückfrage Folie 3")
+    assert marker == {"cmd": "marker", "text": "Rückfrage Folie 3"}
+    default_marker = cli.build_control_command("marker")
+    assert default_marker["cmd"] == "marker" and default_marker["text"].startswith("Marker ")
+    snap = cli.build_control_command("snapshot", path="config/chain.live.yaml")
+    assert snap["path"].endswith("chain.live.yaml") and Path(snap["path"]).is_absolute()
+    with pytest.raises(ValueError):
+        cli.build_control_command("louder", value="loud")
+    with pytest.raises(ValueError):
+        cli.build_control_command("mute", value="maybe")
+    with pytest.raises(ValueError):
+        cli.build_control_command("snapshot", path="notes.txt")
+    with pytest.raises(ValueError):
+        cli.build_control_command("unknown-key")
+
+
+def test_ctl_round_trip_exit_codes_and_single_line_output(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "notify", lambda message, title="voicechain": False)
+    sock = tmp_path / "c.sock"
+
+    def responder(cmd):
+        if cmd["cmd"] == "reset":
+            return {"ok": False, "error": "nicht jetzt"}
+        return {"ok": True, "state": {"offsets": {}}, "message": "Raum +2 dB"}
+
+    with _PolledControlServer(sock, responder) as server:
+        assert main(["ctl", "room-less", "--socket", str(sock)]) == EXIT_OK
+        out = capsys.readouterr()
+        assert out.out == "Raum +2 dB\n" and out.err == ""
+        assert server.commands[-1] == {"cmd": "offset", "name": "room_db", "delta": 2.0}
+
+        assert main(["ctl", "reset", "--socket", str(sock), "--notify"]) == EXIT_FAILED
+        out = capsys.readouterr()
+        assert out.err.strip() == "abgelehnt: nicht jetzt" and out.out == ""
+
+        assert main(["ctl", "marker", "--text", "Folie 3", "--socket", str(sock)]) == EXIT_OK
+        assert server.commands[-1] == {"cmd": "marker", "text": "Folie 3"}
+        capsys.readouterr()
+
+    assert main(["ctl", "status", "--socket", str(sock)]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "voicechain run läuft nicht" in err and "Traceback" not in err
+
+
+def test_ctl_default_socket_path_comes_from_config(tmp_path, monkeypatch, capsys):
+    cfg_path = tmp_path / "ctl.yaml"
+    sock = tmp_path / "x.sock"
+    cfg_path.write_text("control:\n  socket_path: {}\n".format(sock), encoding="utf-8")
+    assert cli._ctl_socket_path(str(cfg_path)) == sock
+    # default config -> logs/control.sock under the repository root
+    assert cli._ctl_socket_path(None) == cli.REPO_ROOT / "logs" / "control.sock"
+    with _PolledControlServer(sock) as server:
+        assert main(["ctl", "status", "--config", str(cfg_path)]) == EXIT_OK
+        assert server.commands == [{"cmd": "status"}]
+    capsys.readouterr()
+    assert main(["ctl", "status", "--config", str(tmp_path / "missing.yaml")]) == EXIT_ERROR
+    assert "not found" in capsys.readouterr().err
+
+
+def test_ctl_notify_without_osascript_is_console_only(tmp_path, monkeypatch, capsys):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert cli.notify("hallo") is False
+    sock = tmp_path / "c.sock"
+    with _PolledControlServer(sock):
+        assert main(["ctl", "louder", "--socket", str(sock), "--notify"]) == EXIT_OK
+    out = capsys.readouterr()
+    assert out.out == "ok offset\n" and out.err == ""
+
+
+def test_ctl_notify_uses_osascript_when_present(monkeypatch, tmp_path):
+    import shutil
+    import subprocess
+
+    calls = []
+    fake = tmp_path / "osascript"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(shutil, "which", lambda name: str(fake) if name == "osascript" else None)
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert cli.notify('Raum +2 dB "ok"') is True
+    assert calls[0][0] == str(fake) and calls[0][1] == "-e"
+    assert 'display notification "Raum +2 dB \\"ok\\"" with title "voicechain"' == calls[0][2]
+
+
+def test_ctl_import_path_stays_light():
+    """ctl must answer in < 300 ms including interpreter start: importing the CLI
+    module must not pull in numpy/scipy (they are loaded lazily by the heavy commands)."""
+    import subprocess
+
+    code = (
+        "import sys, time; t=time.perf_counter(); import voicechain.cli; "
+        "heavy=[m for m in sys.modules if m.split('.')[0] in ('numpy','scipy','soundfile','sounddevice')]; "
+        "print(heavy, int(1000*(time.perf_counter()-t)))"
+    )
+    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=str(cli.REPO_ROOT))
+    heavy, millis = completed.stdout.rsplit(" ", 1)
+    assert heavy.strip() == "[]", heavy
+    assert int(millis) < 500  # generous bound for slow CI; measured 13 ms
+
+
+def test_run_opens_control_socket_and_answers_a_live_command(monkeypatch, tmp_path, capsys):
+    """End to end: run with the real LiveControl, a console command arrives while audio runs."""
+    from voicechain.control import send_command
+
+    blocks = 60
+    fake_sd = _make_fake_sd(blocks)
+    sock = tmp_path / "live.sock"
+    cfg = load_config(str(default_config_path()))
+    cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
+    cfg["control"] = {"socket_path": str(sock)}
+    cfg_path = tmp_path / "run.yaml"
+    save_config(cfg, str(cfg_path))
+
+    answers: list[dict] = []
+    fake_sd.block_delay_s = 0.03  # 60 blocks * 30 ms: the stream stays open ~1.8 s for the client
+
+    # Spy on the live analyzer: ``relearn`` must clear its history (LiveControl gets
+    # the analyzer from cmd_run), so count reset() calls and remember the instance.
+    import voicechain.adaptive as adaptive
+
+    analyzers: list = []
+    real_analyzer = adaptive.LiveAnalyzer
+
+    class SpyAnalyzer(real_analyzer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.reset_calls = 0
+            analyzers.append(self)
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+            super().reset()
+
+    monkeypatch.setattr(adaptive, "LiveAnalyzer", SpyAnalyzer)
+
+    def client():
+        deadline = time.monotonic() + 5.0
+        while not sock.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        answers.append(send_command({"cmd": "offset", "name": "room_db", "delta": 2}, sock, timeout=3.0))
+        answers.append(send_command({"cmd": "status"}, sock, timeout=3.0))
+        answers.append(send_command({"cmd": "relearn"}, sock, timeout=3.0))
+
+    threading.Thread(target=client, daemon=True).start()
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    code = main(["run", "--config", str(cfg_path)])
+    captured = capsys.readouterr()
+    assert code == EXIT_OK, captured.err
+    assert "Control socket: {}".format(sock) in captured.err
+    assert len(answers) == 3, captured.err
+    assert answers[0]["ok"] is True and answers[0]["state"]["offsets"]["room_db"] == 2.0
+    assert answers[1]["ok"] is True and "Offsets:" in answers[1]["message"]
+    assert answers[1]["state"]["adaptive_enabled"] is True
+    assert answers[2]["ok"] is True and "Lernphase neu gestartet" in answers[2]["message"]
+    assert len(analyzers) == 1  # the one analyzer of cmd_run was handed to LiveControl ...
+    assert analyzers[0].reset_calls == 1  # ... and relearn cleared its history
+    assert answers[2]["state"]["learning"] is True
+    assert not sock.exists()  # removed at stop
+
+
+def test_run_no_control_skips_the_socket(monkeypatch, tmp_path, capsys):
+    fake_sd = _make_fake_sd(10)
+    sock = tmp_path / "none.sock"
+    cfg = load_config(str(default_config_path()))
+    cfg["adaptive"]["log_path"] = str(tmp_path / "logs" / "adaptive.jsonl")
+    cfg["control"] = {"socket_path": str(sock)}
+    cfg_path = tmp_path / "run.yaml"
+    save_config(cfg, str(cfg_path))
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    assert main(["run", "--config", str(cfg_path), "--no-control"]) == EXIT_OK
+    assert "Control socket" not in capsys.readouterr().err
+    assert not sock.exists()
