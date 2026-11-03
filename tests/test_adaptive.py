@@ -333,6 +333,35 @@ def test_level_plausibility_has_one_db_hysteresis(tmp_path):
     assert comp and all(c["new"] - c["old"] == pytest.approx(-STEP_DB) for c in comp)   # one direction only
 
 
+def test_user_offsets_api_validation_rest_and_log_event(tmp_path):
+    log = tmp_path / "offs.jsonl"
+    cfg, chain, ctrl = make(log_path=log)
+    with pytest.raises(ValueError, match="stage.param"):
+        ctrl.set_user_offsets({"expander": 1.0})
+    with pytest.raises(ValueError, match="not a tracked parameter"):
+        ctrl.set_user_offsets({"normalizer.target_lufs": 1.0})
+    ctrl.set_user_offsets({"expander.threshold_db": 4.0})
+    assert ctrl.user_offsets == {"expander.threshold_db": 4.0}
+    # Rest values + offset, applied at once (not in 0.5 dB steps), inside the bounds.
+    chain.set_param("expander", "threshold_db", -60.0)
+    chain.set_param("compressor", "threshold_db", -30.0)
+    changes = ctrl.apply_rest_values()
+    assert chain.get_param("expander", "threshold_db") == pytest.approx(-45.0 + 4.0)
+    assert chain.get_param("compressor", "threshold_db") == pytest.approx(-20.0)
+    assert {c["reason"] for c in changes} == {"reset"} and len(changes) == 2
+    # An offset beyond the bounds is clipped by the bounds, never applied raw.
+    ctrl.set_user_offsets({"expander.threshold_db": 40.0})
+    ctrl.apply_rest_values()
+    assert chain.get_param("expander", "threshold_db") == cfg["adaptive"]["bounds"]["expander.threshold_db"][1]
+    with pytest.raises(ValueError, match="event"):
+        ctrl.log_event({"text": "x"})
+    ctrl.log_event({"event": "marker", "text": "x"})
+    ctrl.close()
+    evs = events(log)
+    assert [e for e in evs if e.get("event") == "marker"] == [{"t": 0.0, "event": "marker", "text": "x"}]
+    assert any(e.get("event") == "user_offsets" for e in evs)
+
+
 def test_low_snr_event_is_logged_with_hint_and_throttled(tmp_path):
     log = tmp_path / "snr.jsonl"
     cfg, chain, ctrl = make(log_path=log)

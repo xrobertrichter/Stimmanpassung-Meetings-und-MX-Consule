@@ -369,7 +369,52 @@ nicht mehr mit der Kalibrierung überein (neu kalibrieren).
 
 ---
 
-## 11. Grenzen des Verfahrens
+## 11. Live-Offsets und Konsole
+
+Im Meeting korrigiert man Symptome, nicht Parameter (docs/06, Beauftragung 2). Die Tasten der
+Logi MX Creative Console (oder `python -m voicechain ctl …`) erreichen über den Steuerkanal die
+Klasse `LiveControl` in `voicechain/livecontrol.py`. Sie hält **Offsets** auf die kalibrierten
+Werte der geladenen Konfiguration:
+
+| Offset | Bereich / Schritt | Wirkung |
+|---|---|---|
+| `loudness_lu` | −6…+6 LU, 0,5 je Rastung | `normalizer.target_lufs` = Kalibrierwert + Offset, geklemmt auf −24…−12 LUFS |
+| `room_db` | −6…+6 dB, 2 je Druck | Expander-Schwelle = Sollwert + Offset (positiv = weniger Raum = Schwelle höher); die Sprach-Kappe „Sprache − 12" und die `bounds` gelten weiter |
+| `deess_db` | −6…+6 dB, 2 je Druck | De-Esser-Schwelle = Sollwert + Offset (negativ = weniger Zischen) |
+| `intensity` | −3…+3 Stufen, 1 je Druck | Kompressor-Schwelle −2 dB je Stufe, De-Esser-Schwelle −1 dB je Stufe (kumulativ mit `deess_db`) |
+| `tone_db` | −3…+3 dB, 1 je Druck | `eq.tilt_db` (positiv = heller; zwei Shelves 250 Hz / 4 kHz, docs/02) |
+
+Ein Tastendruck bewegt einen Offset um höchstens eine Schrittweite und nie über den Bereich
+hinaus; `set_offset` setzt ihn direkt (geklemmt). Jede Antwort enthält `state` (Offsets,
+Ziel-Lautheit, Freeze/Mute/Bypass, Lautheit, Störabstand, `low_snr`, Lernphase, aktuelle
+Schwellen) und eine kurze deutsche `message` für die macOS-Mitteilung; Fehler kommen als
+`ok: false` mit Text zurück, nie als Ausnahme.
+
+**Zusammenspiel mit der Regelung.** Mit laufender Regelung gehen die Schwellen-Offsets in die
+Sollwerte des Controllers (`AdaptiveController.set_user_offsets`): das Ziel bleibt
+min(Rauschteppich + 10, Sprache − 12) bzw. Zischspitze ± Overshoot bzw. Sprachpegel, der
+Offset wird addiert, die `bounds` gelten danach. Weil der Offset Teil des Sollwerts ist, regelt
+die Regelung ihn nicht zurück (Simulation 300 s mit Raum +4: Expander bleibt Ziel + 4 ± Totzone,
+kein Schritt nach unten). Damit ein Tastendruck sofort hörbar ist, wird die Änderung des Offsets
+zusätzlich direkt auf den Parameter angewandt; die Regelung hält den neuen Sollwert ab dem
+nächsten Intervall. Auch die Ruhewerte (`rest`) erhalten den Offset. Ohne Regelung
+(`--no-adaptive`) wirken die Offsets unmittelbar auf die Kalibrierwerte.
+
+**Reset** setzt alle Offsets auf 0, die Ziel-Lautheit und den Tilt auf den Kalibrierwert, die drei
+Schwellen sofort (nicht in Schritten) auf die kalibrierten Ruhewerte, Mute und Bypass aus; die
+Lernphase läuft nicht neu. **Neu lernen** startet nur die Lernphase und leert die Analyzer-Historie,
+die Offsets bleiben (Platzwechsel im selben Meeting). **Freeze** friert die Regelung ein (wie
+SIGUSR1). **Marker** schreibt `{"event": "marker", "text": …}` ins JSONL-Log.
+
+**Warum Offsets nicht persistiert werden.** Ein Offset ist eine Sitzungskorrektur („heute
+zischt es, heute ist der Lüfter an"); die Kalibrierung bleibt die Referenz, zu der Reset
+zurückführt. Wer eine Korrektur behalten will, nutzt **Snapshot**: er schreibt die geladene
+Konfiguration mit eingerechneten Offsets (Basiswerte + Offsets, geklemmt) über
+`voicechain.config.save_config` nach `config/chain.live.yaml` (oder `path`), zusätzlich den
+Metadaten-Block `_live: {created, offsets}`; die Datei lässt sich mit `run --config` laden und ist
+dann die neue Basis (Offsets wieder 0).
+
+## 12. Grenzen des Verfahrens
 
 - **Ein Sample, ein Raum.** Die Kalibrierung gilt für die Aufnahmesituation. Anderer Raum,
   anderer Abstand oder anderes Mikrofon-Gain: neu kalibrieren. Die Regelung gleicht nur

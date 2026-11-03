@@ -386,6 +386,7 @@ class AdaptiveController:
         #: the calibration engaged the de-esser and above it when it rests).
         self._deesser_engaged: bool | None = None
         self._level_plausible = False
+        self._user_offsets: dict[tuple[str, str], float] = {}
         self._acc_limiter: list[float] = []
         self._acc_expander_speech: list[float] = []
         self._acc_normalizer: list[float] = []
@@ -408,6 +409,72 @@ class AdaptiveController:
         """Stop (True) or resume (False) applying changes; logging continues."""
         self._frozen = bool(on)
         self._log({"t": self._now(None), "event": "freeze", "on": self._frozen})
+
+    @property
+    def learning(self) -> bool:
+        """True while the learning phase (measured from start or the last relearn) runs."""
+        return float(self.clock()) - self._t_start < self.learn_s - EPS
+
+    @property
+    def user_offsets(self) -> dict[str, float]:
+        """Live offsets per tracked parameter as ``{"stage.name": dB}`` (see set_user_offsets)."""
+        return {f"{stage}.{name}": value for (stage, name), value in self._user_offsets.items()}
+
+    def set_user_offsets(self, offsets: dict[str, float]) -> None:
+        """Set the live offsets the controller adds to its targets (and to the rest
+        values): ``{"expander.threshold_db": +4.0, ...}``. Keys must name tracked
+        parameters; a missing key means 0 dB. Bounds still apply after the offset,
+        so an offset can never push a parameter outside ``adaptive.bounds``.
+        """
+        parsed: dict[tuple[str, str], float] = {}
+        for key, value in offsets.items():
+            if "." not in key:
+                raise ValueError(f"offset key '{key}' must look like 'stage.param'")
+            stage, name = key.split(".", 1)
+            if (stage, name) not in TRACKED:
+                raise ValueError(f"'{key}' is not a tracked parameter; tracked: "
+                                 + ", ".join(f"{s}.{n}" for s, n in TRACKED))
+            parsed[(stage, name)] = float(value)
+        self._user_offsets = parsed
+        self._log({"t": self._now(None), "event": "user_offsets", "offsets": self.user_offsets})
+
+    def apply_rest_values(self, reason: str = "reset") -> list[dict]:
+        """Put every tracked parameter back on its calibrated value plus the current
+        live offset, immediately (not in steps), inside the bounds; returns the changes."""
+        now = self._now(None)
+        changes = []
+        for key in TRACKED:
+            lo, hi = self._bounds(*key)
+            target = clamp(self.rest_values[key] + self._user_offsets.get(key, 0.0), lo, hi)
+            old = float(self.chain.get_param(*key))
+            if abs(target - old) <= EPS:
+                continue
+            self.chain.set_param(key[0], key[1], target)
+            self._last_change_t[key] = now
+            entry = {"t": now, "stage": key[0], "name": key[1], "old": old, "new": target, "reason": reason}
+            self._log(entry)
+            changes.append(entry)
+        return changes
+
+    def relearn(self, now: float | None = None) -> None:
+        """Restart the learning phase (after a change of seat or room); offsets stay."""
+        now = self._now(now)
+        self._t_start = now
+        self._last_decision_t = now - self.interval_s
+        self._last_plausible_t = now
+        self._last_learning_log_t = None
+        self._learn_done_logged = False
+        self._speech_cut_streak = 0
+        self._deesser_engaged = None
+        self._level_plausible = False
+        self._drain()
+        self._log({"t": now, "event": "relearn", "learn_s": self.learn_s})
+
+    def log_event(self, entry: dict) -> None:
+        """Write an informational JSONL entry (``event`` key) with the current time."""
+        if "event" not in entry:
+            raise ValueError("log_event needs an 'event' key")
+        self._log({"t": self._now(None), **entry})
 
     def close(self) -> None:
         if self._log_fh is not None:
@@ -506,7 +573,9 @@ class AdaptiveController:
     def _track(self, stage: str, name: str, target: float, deadzone: float,
                reason: str, block_increase: bool = False) -> dict | None:
         lo, hi = self._bounds(stage, name)
-        target = clamp(target, lo, hi)
+        # Live offsets (console) shift the setpoint; the controller never regulates
+        # them away because they are part of the target itself.
+        target = clamp(target + self._user_offsets.get((stage, name), 0.0), lo, hi)
         current = float(self.chain.get_param(stage, name))
         error = target - current
         if abs(error) <= deadzone:
