@@ -23,3 +23,8 @@ Umsetzungs-Agenten erstellt und von drei Prüfrollen abgenommen.
 Abgeschlossen: zwei volle Prüfrunden (PO, Software, Blind) und drei PO-Verifikationsrunden;
 Urteil „abnehmbar mit Auflage Hördurchlauf“. Offene Auflage und Grenzen: `docs/04_Pruefprotokoll.md`,
 Abschnitt Abschlussreview. Nächster Schritt liegt beim Nutzer: echte Aufnahme, Kalibrierung, Hörtest.
+
+## Projektstand Beauftragung 2 (2026-11-03)
+MX-Console-Bedienung abgenommen (PO abnehmbar, Software abnahmefähig, Blind abnehmbar mit Auflagen,
+alle Auflagen umgesetzt). Auflage für den Nutzer: Bedientest der Konsole im Zoom-Testmeeting und
+Hördurchlauf mit echter Aufnahme. Entwicklerlauf `pytest -q -m "not slow"`, Abnahmelauf `pytest -q`.

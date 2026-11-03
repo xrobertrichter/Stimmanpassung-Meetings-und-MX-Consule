@@ -262,3 +262,37 @@ Berichte: `docs/pruefungen/10_b2_product_owner.md`, `11_b2_software.md`, `12_b2_
 | Laufzeit | — | Suite 574 s | Marker `slow`, Kürzungen nach SW-Vorschlag, Standardlauf < 5 min | alle |
 | BL2-4 | niedrig | `--value` wird auf Schrittweite geklemmt | Dokumentieren (bewusst: ein Druck = ein Schritt) | INT |
 | BL2-10 | info | docs/02 Meterliste ohne processing | Ergänzen | DSP |
+
+## Prüfrunde 2 (Zweitprüfung, 2026-11-03)
+
+| Prüfung | Stand | Urteil | Ergebnis |
+|---|---|---|---|
+| Product Owner (`13_b2_product_owner_runde2.md`) | ae522ec | **abnehmbar** | alle 13 Befunde behoben; 10-min-Meeting-Simulation: Pausenabstand nach Reset 30,3 dB (vorher 22,1), Kappe eingehalten (−37,24 bei Kappe −37), Lautheit −18,2…−18,3 LUFS; drei neue niedrige Befunde (PO2-15 Dial-Druck in Neutralstellung, PO2-16 Kappen-Totzone, PO2-17 Doku-Sätze) |
+| Software (`14_b2_software_runde2.md`) | ae522ec | **abnahmefähig** | 14 von 15 Befunden behoben, 1 Hinweis offen (Client-Timeout je Operation); Mutationen 10/11 gefangen (N1a maskiert durch speech_cap, Testschärfung SW2-16); Standardsuite 270 s, slow 249 s; `ctl` 59 ms |
+
+Nacharbeit nach Runde 2 (Commits 87f36af, b8efd3c, a536f59): PO2-15 (`set_offset` auf aktiven Wert
+antwortet „unverändert“), PO2-16 (speech_cap mit Totzone 0,5 dB, Mindestschritt, Offset-
+Rücksynchronisation; Test: ±0,1 dB Sprachpegel → 0 Einträge), PO2-17 (Socketpfad-Sätze, Kappen-
+Hinweis), SW2-18 (allow_nan im Protokoll, nicht-finite Anfragen abgelehnt), SW2-19 (SIGTERM-Test
+ohne echtes Signal), SW2-20 (Testläufe dokumentiert).
+
+## Abschlussreview Beauftragung 2 (Projektleitung, 2026-11-03)
+
+**Ergebnis: abnehmbar.** Dieselbe Auflage wie bei Beauftragung 1 gilt weiter: Hördurchlauf auf dem
+Zielrechner mit echter Aufnahme, dazu ein Bedientest der Konsole in einem Zoom-Testmeeting
+(Options+-Verdrahtung, Mitteilungen, Antwortzeit auf dem Mac).
+
+| Abnahmekriterium docs/06 §6 | Ergebnis |
+|---|---|
+| 6.1 `pytest -q` grün, Selftest 12/12 | Standard 491 bestanden (1 Skip root), slow 23 bestanden; Selftest 12/12 |
+| 6.2 Jede Funktion über `ctl`, Skript, AppleScript, Manifest, Doku, Test | 20 Kommandos, Manifest-Konsistenztest; Blindprüfung hat alle 20 über den Socket ausgeführt |
+| 6.3 Offsets messbar | Lautheit ±1,00 LU; Raum ±4 → Pausen-RMS −5,6/+6,0 dB; Zischen −4 → De-Esser-GR ×1,9; Tilt ±2 → ±0,96 dB bei 8 kHz; Intensität +2 → Kompressor-GR +1,6 dB |
+| 6.4 Regelung regelt Offsets nicht zurück | 300 s, Raum +4: Endwert +4,00, 0 Abwärtsschritte; Sprach-Kappe gilt nach dem Offset |
+| 6.5 Reset = Bedienzustand zurück | alle get_params identisch mit Konfiguration (ohne Regelung); mit Regelung bleiben nachgeführte Schwellen, Freeze/Mute/Bypass/Kill-Switch aus, Normalizer-Deckel zurück |
+| 6.6 / 6.6a Mute, Bypass, Kill-Switch knackfrei; Kill-Switch spart Last | Blocksprung außerhalb der 30-ms-Rampe ≤ 0,20 dB; Rechenzeit aus 15–16 % des Normalbetriebs; Regelung und Lernuhr pausieren |
+| 6.7 Prüfkette | PO, Software, Blind in Runde 1; PO und Software in Runde 2 |
+
+Bekannte Grenzen: Sprach-Kappe begrenzt „Wenig Raum“ bei Sprecher auf Kalibrierpegel oft schon
+nach einem bis zwei Schritten (Antwort nennt das); ohne Regelung oder in der Lernphase gelten für
+den Offset zunächst nur die Bounds; Intensitätsstufen erzeugen einen Pegelbuckel von ±1,5 dB für
+etwa 1 s; Mac-Antwortzeit von `ctl` ist geschätzt (< 300 ms), im Container 59–80 ms.
